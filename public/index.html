@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Login com Google One Tap</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 2rem;
+      background: #f4f4f4;
+    }
+    #output {
+      margin-top: 2rem;
+      padding: 1rem;
+      background: #fff;
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔐 Login com Google One Tap</h1>
+
+  <div id="g_id_onload"
+       data-client_id="775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com"
+       data-callback="handleCredentialResponse"
+       data-auto_prompt="true"
+       data-context="signin"
+       data-itp_support="true">
+  </div>
+
+  <div class="g_id_signin"
+       data-type="standard"
+       data-size="large"
+       data-theme="outline"
+       data-text="signin_with"
+       data-shape="rectangular"
+       data-logo_alignment="left">
+  </div>
+
+  <div id="output">
+    <strong>Status:</strong> Aguardando login...
+  </div>
+
+  <script>
+    // Garantir anon_id se não existir
+    if (!localStorage.getItem("anon_id")) {
+      const newAnon = `anon_${Math.random().toString(36).slice(2, 12)}`;
+      localStorage.setItem("anon_id", newAnon);
+      console.log("[📌 anon_id criado]", newAnon);
+    }
+
+    async function handleCredentialResponse(response) {
+      const idToken = response.credential;
+      const anonId = localStorage.getItem("anon_id");
+
+      document.getElementById('output').innerHTML =
+        "<strong>⏳ Enviando token para backend...</strong>";
+
+      try {
+        const res = await fetch("http://localhost:3000/auth/google", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idToken, anonId })
+        });
+
+        const data = await res.json();
+
+        if (data.success) {
+          const userId = data.user_id;
+          localStorage.setItem("user_id", userId);
+
+          document.getElementById('output').innerHTML = `
+            ✅ <strong>Login bem-sucedido!</strong><br>
+            <strong>user_id:</strong> ${userId}<br>
+            <strong>Nome:</strong> ${data.name}<br>
+            <strong>Email:</strong> ${data.email}<br>
+            <strong>anon_id:</strong> ${anonId}
+          `;
+
+          // Push para GA4 via GTM
+          window.dataLayer = window.dataLayer || [];
+          window.dataLayer.push({
+            event: "user_authenticated",
+            user_id: userId,
+            anon_id: anonId
+          });
+
+        } else {
+          document.getElementById('output').innerHTML =
+            `<strong>❌ Erro:</strong> ${data.error}`;
+        }
+
+      } catch (err) {
+        console.error(err);
+        document.getElementById('output').innerHTML =
+          "<strong>❌ Erro ao conectar com o servidor backend.</strong>";
+      }
+    }
+  </script>
+</body>
+</html>

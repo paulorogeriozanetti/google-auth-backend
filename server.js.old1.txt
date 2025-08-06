@@ -1,0 +1,61 @@
+const express = require('express');
+const cors = require('cors');
+const { OAuth2Client } = require('google-auth-library');
+const bodyParser = require('body-parser');
+const path = require('path'); // 👈 necessário para servir arquivos estáticos
+
+const app = express();
+const PORT = 3000;
+
+// 🔐 CORS (em produção, substitua pelo domínio real)
+app.use(cors());
+
+// 📦 Interpreta JSON nas requisições
+app.use(bodyParser.json());
+
+// 📂 Servir arquivos estáticos da pasta "public"
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 🧩 Google OAuth config
+const CLIENT_ID = '775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com';
+const client = new OAuth2Client(CLIENT_ID);
+
+// 🛠️ Endpoint para validar o ID Token recebido do One Tap
+app.post('/auth/google', async (req, res) => {
+  const { idToken } = req.body;
+
+  if (!idToken) {
+    return res.status(400).json({ success: false, error: 'Missing token' });
+  }
+
+  try {
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: CLIENT_ID
+    });
+
+    const payload = ticket.getPayload();
+    const googleId = payload.sub;
+    const email = payload.email || '';
+    const name = payload.name || '';
+    const userId = `usr_${googleId.slice(-10)}`; // Gera ID interno com base no Google ID
+
+    console.log(`[✔️ Login] ${email} | ID: ${googleId}`);
+
+    res.json({
+      success: true,
+      user_id: userId,
+      name,
+      email
+    });
+
+  } catch (error) {
+    console.error('[❌ Auth Error]', error);
+    res.status(401).json({ success: false, error: 'Invalid token' });
+  }
+});
+
+// 🚀 Iniciar o servidor
+app.listen(PORT, () => {
+  console.log(`🚀 Auth server running on http://localhost:${PORT}`);
+});

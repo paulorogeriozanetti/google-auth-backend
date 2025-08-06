@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Login com Google One Tap</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 2rem;
+      background: #f4f4f4;
+    }
+    #output {
+      margin-top: 2rem;
+      padding: 1rem;
+      background: #fff;
+      border: 1px solid #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔐 Login com Google One Tap</h1>
+
+  <div id="g_id_onload"
+       data-client_id="775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com"
+       data-callback="handleCredentialResponse"
+       data-auto_prompt="true"
+       data-context="signin">
+  </div>
+
+  <div class="g_id_signin"
+       data-type="standard"
+       data-size="large"
+       data-theme="outline"
+       data-text="signin_with"
+       data-shape="rectangular"
+       data-logo_alignment="left">
+  </div>
+
+  <div id="output">
+    <strong>Status:</strong> Aguardando login...
+  </div>
+
+  <script>
+    async function handleCredentialResponse(response) {
+      const idToken = response.credential;
+
+      document.getElementById('output').innerHTML =
+        "<strong>⏳ Enviando token para backend...</strong>";
+
+      try {
+        const res = await fetch("http://localhost:3000/auth/google", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idToken })
+        });
+
+        const data = await res.json();
+
+        if (data.success) {
+          document.getElementById('output').innerHTML = `
+            ✅ <strong>Login bem-sucedido!</strong><br>
+            <strong>user_id:</strong> ${data.user_id}<br>
+            <strong>Nome:</strong> ${data.name}<br>
+            <strong>Email:</strong> ${data.email}
+          `;
+
+          // Opcional: salvar localmente
+          localStorage.setItem("user_id", data.user_id);
+
+          // GTM ou GA4
+          window.dataLayer = window.dataLayer || [];
+          window.dataLayer.push({
+            event: "user_authenticated",
+            user_id: data.user_id
+          });
+
+        } else {
+          document.getElementById('output').innerHTML =
+            `<strong>❌ Erro:</strong> ${data.error}`;
+        }
+
+      } catch (err) {
+        console.error(err);
+        document.getElementById('output').innerHTML =
+          "<strong>❌ Erro ao conectar com o servidor backend.</strong>";
+      }
+    }
+  </script>
+</body>
+</html>
