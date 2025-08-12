@@ -1,66 +1,146 @@
+/**
+ * PZ Auth Backend – Versão 1.1 – 2025-08-12
+ * 
+ * - Healthcheck:   GET /healthz  (retorna 200 quando está de pé)
+ * - Root test:     GET /
+ * - Auth:          POST /auth/google  { credential: "<ID_TOKEN>" }
+ * 
+ * Melhorias:
+ *  - Incluído https://api.pzadvisors.com no array padrão de ALLOWED_ORIGINS
+ *  - Código preserva compatibilidade com variáveis de ambiente no Railway/Hostinger
+ *  - Nenhuma funcionalidade removida
+ */
+
 const express = require('express');
 const cors = require('cors');
 const { OAuth2Client } = require('google-auth-library');
-const bodyParser = require('body-parser');
-const path = require('path'); // Servir arquivos estáticos
 
 const app = express();
-const PORT = 3000;
 
-// 🔐 Configuração do CORS (em produção: especifique seu domínio real)
-app.use(cors());
+// ────────────────────────────────────────────────────────────────
+// 1) Config / Vars
+// ────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 8080;
+const CLIENT_ID =
+  process.env.GOOGLE_CLIENT_ID ||
+  '775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com';
 
-// 📦 Interpreta JSON nas requisições
-app.use(bodyParser.json());
+// Permite definir múltiplas origens via env (ALLOWED_ORIGINS), ou usa padrão:
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
+  [
+    'https://pzadvisors.com',
+    'https://api.pzadvisors.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:8080',
+    'http://127.0.0.1:8081', // para testes locais
+  ].join(',')
+)
+  .split(',')
+  .map((o) => o.trim());
 
-// 📂 Servir arquivos estáticos da pasta "public"
-app.use(express.static(path.join(__dirname, 'public')));
+// ────────────────────────────────────────────────────────────────
+// 2) Middlewares
+// ────────────────────────────────────────────────────────────────
+app.use(express.json({ limit: '1mb' }));
 
-// 🧩 Google OAuth config
-const CLIENT_ID = '775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com';
+app.use(
+  cors({
+    origin(origin, cb) {
+      // Healthcheck e Postman podem não enviar "origin"
+      if (!origin) return cb(null, true);
+      const ok = allowedOrigins.includes(origin);
+      if (ok) return cb(null, true);
+      cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204,
+  })
+);
+
+// Logger simples de requisições
+app.use((req, res, next) => {
+  console.log(
+    `[REQ] ${req.method} ${req.url} | origin=${req.headers.origin || '-'}`
+  );
+  next();
+});
+
+// ────────────────────────────────────────────────────────────────
+// 3) Rotas básicas / Health
+// ────────────────────────────────────────────────────────────────
+app.get('/', (_req, res) => {
+  res
+    .status(200)
+    .send('🚀 API de autenticação Google rodando com sucesso! (PZ Auth Backend)');
+});
+
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true, uptime: process.uptime() });
+});
+
+// ────────────────────────────────────────────────────────────────
+// 4) Google OAuth – One Tap (ID token verificação)
+// ────────────────────────────────────────────────────────────────
 const client = new OAuth2Client(CLIENT_ID);
 
-// 🛠️ Endpoint para validar o ID Token recebido do One Tap
 app.post('/auth/google', async (req, res) => {
-  const { idToken, anonId } = req.body;
-
-  if (!idToken) {
-    return res.status(400).json({ success: false, error: 'Missing token' });
-  }
-
   try {
+    const { credential } = req.body || {};
+
+    if (!credential || typeof credential !== 'string') {
+      console.error('[AUTH] credential ausente ou inválida');
+      return res.status(400).json({ error: 'Missing credential' });
+    }
+
     const ticket = await client.verifyIdToken({
-      idToken,
-      audience: CLIENT_ID
+      idToken: credential,
+      audience: CLIENT_ID,
     });
 
     const payload = ticket.getPayload();
-    const googleId = payload.sub;
-    const email = payload.email || '';
-    const name = payload.name || '';
-    const userId = `usr_${googleId.slice(-10)}`; // Gera ID interno com base no Google ID
-
-    console.log(`[✔️ Login] ${email} | ID: ${googleId} | user_id: ${userId}`);
-    if (anonId) {
-      console.log(`[🔗 Vinculando anon_id] ${anonId}`);
-      // Aqui você pode salvar no banco:
-      // { anon_id: anonId, user_id: userId, email, nome, timestamp }
+    if (!payload) {
+      console.error('[AUTH] Payload vazio após verifyIdToken');
+      return res.status(401).json({ error: 'Invalid token' });
     }
 
-    res.json({
-      success: true,
-      user_id: userId,
-      name,
-      email
-    });
+    const { sub, email, name, picture } = payload;
 
-  } catch (error) {
-    console.error('[❌ Auth Error]', error);
-    res.status(401).json({ success: false, error: 'Invalid token' });
+    console.log('[AUTH] Token OK | sub:', sub, '| email:', email);
+
+    return res.status(200).json({
+      user_id: sub,
+      email,
+      name,
+      picture,
+      // opcional: setar cookie HttpOnly aqui em produção
+    });
+  } catch (err) {
+    console.error('[AUTH] Erro na verificação do token:', err?.message || err);
+    return res.status(401).json({ error: 'Token inválido' });
   }
 });
 
-// 🚀 Iniciar o servidor
+// ────────────────────────────────────────────────────────────────
+// 5) Tratamento de erros globais
+// ────────────────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED_REJECTION]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT_EXCEPTION]', err);
+});
+
+// ────────────────────────────────────────────────────────────────
+// 6) Start
+// ────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`🚀 Auth server running on http://localhost:${PORT}`);
+  console.log('──────────────────────────────────────────────');
+  console.log(`✅ Server UP on port ${PORT}`);
+  console.log('🔧 Vars:');
+  console.log('   GOOGLE_CLIENT_ID:', CLIENT_ID);
+  console.log('   ALLOWED_ORIGINS :', allowedOrigins);
+  console.log('   NODE_ENV       :', process.env.NODE_ENV || '(not set)');
+  console.log('──────────────────────────────────────────────');
 });

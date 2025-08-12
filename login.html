@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <title>Login com Google</title>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;margin:24px}
+    #buttonDiv{margin-top:12px}
+  </style>
+  <script>
+    const BACKEND = 'https://pz-auth-backend-270930304722.us-central1.run.app/auth/google';
+    const CLIENT_ID = '775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com';
+
+    function sendToBackend(idToken) {
+      return fetch(BACKEND, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential: idToken })
+      }).then(r => r.json());
+    }
+
+    function handleCredentialResponse(resp) {
+      console.log('🔐 One Tap/Btn cred:', resp);
+      if (!resp || !resp.credential) {
+        alert('Token ausente!');
+        return;
+      }
+      sendToBackend(resp.credential)
+        .then(data => {
+          console.log('✅ Backend:', data);
+          if (data && data.user_id) {
+            alert('✅ Login efetuado com sucesso!');
+          } else {
+            alert('⚠️ Resposta inesperada do backend. Veja o console.');
+          }
+        })
+        .catch(err => {
+          console.error('❌ Erro backend:', err);
+          alert('❌ Erro ao enviar para o backend (veja o console).');
+        });
+    }
+
+    window.onload = () => {
+      google.accounts.id.initialize({
+        client_id: CLIENT_ID,
+        callback: handleCredentialResponse,
+      });
+
+      // Botão de fallback (sempre visível)
+      google.accounts.id.renderButton(
+        document.getElementById('buttonDiv'),
+        { theme: 'outline', size: 'large' }
+      );
+
+      // Tenta o One Tap e loga o motivo se não abrir
+      google.accounts.id.prompt(notification => {
+        const r = notification.getMomentType && notification.getMomentType();
+        const dismissed = notification.getDismissedReason && notification.getDismissedReason();
+        const notDisplayed = notification.getNotDisplayedReason && notification.getNotDisplayedReason();
+        console.log('[OneTap] moment=', r, ' dismissed=', dismissed, ' notDisplayed=', notDisplayed);
+        // Exemplos comuns: notDisplayed=browser_not_supported, third_party_cookies_blocked, unknown_reason
+      });
+    };
+  </script>
+</head>
+<body>
+  <h2>Fazer Login com o Google</h2>
+  <div id="buttonDiv"></div>
+</body>
+</html>
