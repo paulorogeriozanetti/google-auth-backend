@@ -1,14 +1,16 @@
 /**
- * PZ Auth Backend – Versão 1.1 – 2025-08-12
- * 
+ * PZ Auth Backend – Versão 1.2 – 2025-08-12
+ *
  * - Healthcheck:   GET /healthz  (retorna 200 quando está de pé)
  * - Root test:     GET /
  * - Auth:          POST /auth/google  { credential: "<ID_TOKEN>" }
- * 
- * Melhorias:
- *  - Incluído https://api.pzadvisors.com no array padrão de ALLOWED_ORIGINS
- *  - Código preserva compatibilidade com variáveis de ambiente no Railway/Hostinger
- *  - Nenhuma funcionalidade removida
+ *
+ * Melhorias nesta versão:
+ *  - trust proxy habilitado (Railway/CDN)
+ *  - OPTIONS /auth/google para preflight CORS (204)
+ *  - Cabeçalhos no-store no endpoint de auth (evita cache intermediário)
+ *  - Checagem leve do emissor (iss) do token Google (log informativo)
+ *  - Nenhuma funcionalidade removida ou alterada
  */
 
 const express = require('express');
@@ -39,6 +41,9 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
   .split(',')
   .map((o) => o.trim());
 
+// Em ambientes com proxy (Railway/Cloud), confia no proxy para IP/cookies seguros
+app.set('trust proxy', true);
+
 // ────────────────────────────────────────────────────────────────
 // 2) Middlewares
 // ────────────────────────────────────────────────────────────────
@@ -60,9 +65,11 @@ app.use(
 );
 
 // Logger simples de requisições
-app.use((req, res, next) => {
+app.use((req, _res, next) => {
   console.log(
-    `[REQ] ${req.method} ${req.url} | origin=${req.headers.origin || '-'}`
+    `[REQ] ${req.method} ${req.url} | origin=${req.headers.origin || '-'} | ip=${
+      req.ip
+    }`
   );
   next();
 });
@@ -85,6 +92,9 @@ app.get('/healthz', (_req, res) => {
 // ────────────────────────────────────────────────────────────────
 const client = new OAuth2Client(CLIENT_ID);
 
+// Preflight mais rápido para o endpoint de auth
+app.options('/auth/google', (_req, res) => res.sendStatus(204));
+
 app.post('/auth/google', async (req, res) => {
   try {
     const { credential } = req.body || {};
@@ -93,6 +103,13 @@ app.post('/auth/google', async (req, res) => {
       console.error('[AUTH] credential ausente ou inválida');
       return res.status(400).json({ error: 'Missing credential' });
     }
+
+    // Evita cache intermediário da resposta
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+      Pragma: 'no-cache',
+      Expires: '0',
+    });
 
     const ticket = await client.verifyIdToken({
       idToken: credential,
@@ -103,6 +120,12 @@ app.post('/auth/google', async (req, res) => {
     if (!payload) {
       console.error('[AUTH] Payload vazio após verifyIdToken');
       return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // Checagem leve do emissor (apenas log informativo)
+    if (payload.iss && !/accounts\.google\.com$/.test(payload.iss)) {
+      console.warn('[AUTH] Token com emissor inesperado:', payload.iss);
+      // NÃO falhamos aqui para evitar falsos positivos — apenas log
     }
 
     const { sub, email, name, picture } = payload;
