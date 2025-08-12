@@ -1,16 +1,17 @@
 /**
- * PZ Auth Backend – Versão 1.2 – 2025-08-12
+ * PZ Auth Backend – Versão 1.2.1 – 2025-08-12
  *
  * - Healthcheck:   GET /healthz  (retorna 200 quando está de pé)
  * - Root test:     GET /
  * - Auth:          POST /auth/google  { credential: "<ID_TOKEN>" }
  *
  * Melhorias nesta versão:
+ *  - CORS: permitido header custom "X-PZ-Version" (e variação minúscula)
  *  - trust proxy habilitado (Railway/CDN)
  *  - OPTIONS /auth/google para preflight CORS (204)
  *  - Cabeçalhos no-store no endpoint de auth (evita cache intermediário)
  *  - Checagem leve do emissor (iss) do token Google (log informativo)
- *  - Nenhuma funcionalidade removida ou alterada
+ *  - Nenhuma funcionalidade removida
  */
 
 const express = require('express');
@@ -59,7 +60,8 @@ app.use(
       cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    // ✅ libera o header custom usado no frontend
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-PZ-Version', 'x-pz-version'],
     optionsSuccessStatus: 204,
   })
 );
@@ -67,9 +69,7 @@ app.use(
 // Logger simples de requisições
 app.use((req, _res, next) => {
   console.log(
-    `[REQ] ${req.method} ${req.url} | origin=${req.headers.origin || '-'} | ip=${
-      req.ip
-    }`
+    `[REQ] ${req.method} ${req.url} | origin=${req.headers.origin || '-'} | ip=${req.ip}`
   );
   next();
 });
