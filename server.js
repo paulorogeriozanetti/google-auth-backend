@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.4.1 – 2025-08-28
+ * PZ Auth+API Backend – Versão 1.4.2 – 2025-08-28
  *
  * Endpoints:
  * - Healthcheck:        GET  /healthz            (alias: GET /api/healthz)
@@ -10,11 +10,10 @@
  * - Echo (debug leve):  POST /api/echo           { ... }  -> devolve payload (sem persistir)
  * - Track (opcional):   POST /api/track          { event, payload? }  -> grava em auth_events (se habilitado)
  *
- * Novidades v1.4.1:
- *  - 🔐 Firestore com credenciais explícitas via ENV:
- *      FIREBASE_SERVICE_ACCOUNT_JSON (JSON)  OU  FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 (base64)
- *    (corrige "\n" da private_key automaticamente; fallback para ADC quando não setado)
- *  - ✅ Demais funcionalidades preservadas (CORS, logs, aliases, track, echo…)
+ * Novidades v1.4.2:
+ *  - 🔐 CORS corrigido: não lança erro no callback do cors (evita 500 em preflight)
+ *  - 🌐 Aceita domínio raiz e QUALQUER subdomínio de pzadvisors.com (ex.: auth., api., etc.)
+ *  - ✅ Demais funcionalidades preservadas (aliases, logs, Firestore por ENV/ADC, track, echo…)
  */
 
 const express = require('express');
@@ -27,7 +26,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 const BUILD_DATE = '2025-08-28';
 
 const PORT = process.env.PORT || 8080;
@@ -36,7 +35,7 @@ const CLIENT_ID =
   process.env.GOOGLE_CLIENT_ID ||
   '775119501851-1qsm8b7sf50k0jar8i75qsffh0hfi0pl.apps.googleusercontent.com';
 
-// Múltiplas origens via env (ALLOWED_ORIGINS) ou default:
+// Múltiplas origens via env (ALLOWED_ORIGINS) ou default (lista explícita)
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
   [
     'https://pzadvisors.com',
@@ -46,7 +45,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:8080',
-    'http://127.0.0.1:8081' // testes locais
+    'http://127.0.0.1:8081'
   ].join(',')
 )
   .split(',')
@@ -66,22 +65,17 @@ app.set('trust proxy', true);
 ─────────────────────────────────────────────────────────────── */
 function loadServiceAccountFromEnv() {
   try {
-    // Preferência: JSON puro
     let raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '';
-
-    // Alternativa: base64
     if (!raw && process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
       raw = Buffer.from(
         process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
         'base64'
       ).toString('utf8');
     }
-
     if (!raw) return null;
 
     const json = JSON.parse(raw);
     if (json.private_key && typeof json.private_key === 'string') {
-      // Corrige quebras de linha escapadas
       json.private_key = json.private_key.replace(/\\n/g, '\n');
     }
     return json;
@@ -101,7 +95,7 @@ const db = sa && sa.client_email && sa.private_key
         private_key: sa.private_key
       }
     })
-  : new Firestore(); // fallback ADC (ex.: Cloud Run com Workload Identity)
+  : new Firestore(); // fallback ADC
 
 const usersCol  = db.collection('users');
 const eventsCol = db.collection('auth_events');
@@ -111,14 +105,42 @@ const eventsCol = db.collection('auth_events');
 ─────────────────────────────────────────────────────────────── */
 app.use(express.json({ limit: '1mb' }));
 
+// Helper: decide se a origem é permitida
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // ferramentas CLI/health não enviam origin
+  try {
+    const { hostname } = new URL(origin.trim());
+    const host = String(hostname || '').toLowerCase();
+
+    // aceita domínio raiz e qualquer subdomínio *.pzadvisors.com
+    if (
+      host === 'pzadvisors.com' ||
+      host === 'www.pzadvisors.com' ||
+      host.endsWith('.pzadvisors.com')
+    ) {
+      return true;
+    }
+
+    // fallback para lista explícita vinda de ENV/default
+    return allowedOrigins.includes(origin.trim());
+  } catch {
+    return false;
+  }
+}
+
 app.use(
   cors({
     origin(origin, cb) {
-      // Healthcheck e ferramentas CLI podem não enviar "origin"
-      if (!origin) return cb(null, true);
-      const ok = allowedOrigins.includes(origin);
-      if (ok) return cb(null, true);
-      cb(new Error(`CORS blocked for origin: ${origin}`));
+      // NÃO lançar erro aqui — retorne true/false
+      const ok = isAllowedOrigin(origin);
+      if (!ok && origin) {
+        try {
+          console.warn(
+            JSON.stringify({ tag: 'cors_denied', origin: origin })
+          );
+        } catch (_) {}
+      }
+      return cb(null, ok);
     },
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: [
@@ -159,7 +181,6 @@ app.use((req, res, next) => {
         })
       );
     } catch (_) {
-      // fallback
       console.log(`[REQ] ${req.method} ${req.url} | rid=${req.rid} | status=${res.statusCode}`);
     }
   });
@@ -189,6 +210,7 @@ app.get('/api/version', (_req, res) => {
     build_date: BUILD_DATE,
     client_id_configured: Boolean(process.env.GOOGLE_CLIENT_ID) || 'default',
     cors_allowed_origins: allowedOrigins,
+    wildcard_pzadvisors: '*.pzadvisors.com',
     track_open: TRACK_OPEN,
     has_track_token: Boolean(TRACK_TOKEN),
     firestore_auth_mode: sa ? 'service-account-env' : 'adc'
@@ -255,7 +277,6 @@ async function handleAuthGoogle(req, res) {
         { merge: true }
       );
     } catch (e) {
-      // Persistência do usuário não deve derrubar o auth; loga e segue
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, warn:'firestore_upsert_failed', error: e.message || String(e) }));
     }
 
@@ -292,7 +313,6 @@ async function handleAuthGoogle(req, res) {
       email: email || null,
       name: name || null,
       picture: picture || null
-      // (Opcional: definir cookie HttpOnly/SameSite aqui)
     });
   } catch (err) {
     console.error(JSON.stringify({
@@ -328,8 +348,6 @@ app.post('/api/echo', (req, res) => {
 });
 
 // Track opcional — grava eventos no Firestore (auth_events)
-// - Se TRACK_OPEN=true, qualquer origem permitida pode gravar
-// - Caso contrário, exige X-Api-Token == TRACK_TOKEN
 app.post('/api/track', async (req, res) => {
   try {
     if (!TRACK_OPEN) {
@@ -377,6 +395,7 @@ app.listen(PORT, () => {
   console.log('🔧 Vars:');
   console.log('   GOOGLE_CLIENT_ID           :', CLIENT_ID);
   console.log('   ALLOWED_ORIGINS            :', allowedOrigins);
+  console.log('   wildcard_pzadvisors        : *.pzadvisors.com');
   console.log('   TRACK_OPEN                 :', TRACK_OPEN);
   console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
   console.log('   FIRESTORE auth mode        :', sa ? 'service-account-env' : 'adc');
