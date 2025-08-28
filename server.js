@@ -1,19 +1,23 @@
 /**
- * PZ Auth+API Backend – Versão 1.4.2 – 2025-08-28
+ * PZ Auth+API Backend – Versão 1.4.3 – 2025-08-28
  *
  * Endpoints:
- * - Healthcheck:        GET  /healthz            (alias: GET /api/healthz)
- * - Root test:          GET  /
- * - Versão/Status:      GET  /api/version
- * - Auth (Google OTP):  POST /auth/google        { credential, context? }
- *                        ALIAS: POST /api/auth/google
- * - Echo (debug leve):  POST /api/echo           { ... }  -> devolve payload (sem persistir)
- * - Track (opcional):   POST /api/track          { event, payload? }  -> grava em auth_events (se habilitado)
+ * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
+ * - Root test:          GET       /
+ * - Versão/Status:      GET       /api/version
+ * - Auth (Google OTP):  POST      /auth/google      { credential, context? }
+ *                        ALIAS:   POST /api/auth/google
+ * - Echo (debug leve):  POST      /api/echo         { ... }  -> devolve payload (sem persistir)
+ * - Track (opcional):   POST      /api/track        { event, payload? } -> grava em auth_events (se habilitado)
+ * - CORS check (diag):  GET       /api/cors-check   -> echo de origin/permitido (sem persistir)
+ * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
  *
- * Novidades v1.4.2:
- *  - 🔐 CORS corrigido: não lança erro no callback do cors (evita 500 em preflight)
- *  - 🌐 Aceita domínio raiz e QUALQUER subdomínio de pzadvisors.com (ex.: auth., api., etc.)
- *  - ✅ Demais funcionalidades preservadas (aliases, logs, Firestore por ENV/ADC, track, echo…)
+ * Novidades v1.4.3:
+ *  - 🌐 CORS ainda mais robusto: wildcard para *.pzadvisors.com + 'Vary' padrão em todas as respostas.
+ *  - 🧰 Diagnóstico rápido: /api/cors-check e /api/debug/ping-fs (guardado por token) p/ validar Firestore on-demand.
+ *  - 🧵 HEAD em /healthz e /api/healthz (uptime em GET; 200 em HEAD).
+ *  - 🧩 Aceita também application/x-www-form-urlencoded no /auth/google (além de JSON).
+ *  - ✅ Demais funcionalidades preservadas (aliases, logs, Firestore por ENV/ADC, track, echo…).
  */
 
 const express = require('express');
@@ -26,7 +30,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.4.2';
+const VERSION = '1.4.3';
 const BUILD_DATE = '2025-08-28';
 
 const PORT = process.env.PORT || 8080;
@@ -52,12 +56,15 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Habilita /api/track sem token só se explicitamente permitido
+// Track aberto? (CUIDADO em produção)
 const TRACK_OPEN = (process.env.TRACK_OPEN || 'false').toLowerCase() === 'true';
-// Caso não esteja aberto, exige X-Api-Token == TRACK_TOKEN para /api/track
+// Caso fechado, exige X-Api-Token
 const TRACK_TOKEN = process.env.TRACK_TOKEN || '';
 
-// Cloud proxies (Railway/Cloud Run) — confia no proxy p/ IP/cookies seguros
+// Debug Firestore ping
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || '';
+
+// Cloud proxies (Railway/Cloud Run)
 app.set('trust proxy', true);
 
 /* ──────────────────────────────────────────────────────────────
@@ -95,7 +102,7 @@ const db = sa && sa.client_email && sa.private_key
         private_key: sa.private_key
       }
     })
-  : new Firestore(); // fallback ADC
+  : new Firestore(); // fallback ADC (ex.: Cloud Run)
 
 const usersCol  = db.collection('users');
 const eventsCol = db.collection('auth_events');
@@ -104,15 +111,21 @@ const eventsCol = db.collection('auth_events');
    2) Middlewares
 ─────────────────────────────────────────────────────────────── */
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false })); // aceita x-www-form-urlencoded
 
-// Helper: decide se a origem é permitida
+// Helper de permissão de origem
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // ferramentas CLI/health não enviam origin
+  if (!origin) return true; // health/CLI
   try {
-    const { hostname } = new URL(origin.trim());
+    const { hostname, protocol } = new URL(origin.trim());
     const host = String(hostname || '').toLowerCase();
+    const isLocal =
+      protocol === 'http:' &&
+      (host === 'localhost' || host === '127.0.0.1');
 
-    // aceita domínio raiz e qualquer subdomínio *.pzadvisors.com
+    if (isLocal) return true;
+
+    // raiz e qualquer subdomínio *.pzadvisors.com
     if (
       host === 'pzadvisors.com' ||
       host === 'www.pzadvisors.com' ||
@@ -121,40 +134,39 @@ function isAllowedOrigin(origin) {
       return true;
     }
 
-    // fallback para lista explícita vinda de ENV/default
+    // fallback lista explícita
     return allowedOrigins.includes(origin.trim());
   } catch {
     return false;
   }
 }
 
+// CORS global (sem lançar erro; define Vary)
 app.use(
   cors({
     origin(origin, cb) {
-      // NÃO lançar erro aqui — retorne true/false
       const ok = isAllowedOrigin(origin);
       if (!ok && origin) {
         try {
-          console.warn(
-            JSON.stringify({ tag: 'cors_denied', origin: origin })
-          );
+          console.warn(JSON.stringify({ tag: 'cors_denied', origin }));
         } catch (_) {}
       }
       return cb(null, ok);
     },
-    methods: ['GET', 'POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
     allowedHeaders: [
       'Content-Type',
       'Authorization',
       'X-PZ-Version', 'x-pz-version',
       'X-Trace-Id',  'x-trace-id',
-      'X-Api-Token', 'x-api-token'
+      'X-Api-Token', 'x-api-token',
+      'X-Debug-Token','x-debug-token'
     ],
     optionsSuccessStatus: 204
   })
 );
 
-// X-Trace-Id + versão em todas as respostas
+// Cabeçalhos padrão em todas as respostas
 app.use((req, res, next) => {
   const rid =
     req.headers['x-trace-id'] ||
@@ -162,6 +174,8 @@ app.use((req, res, next) => {
   req.rid = rid;
   res.setHeader('X-Trace-Id', rid);
   res.setHeader('X-PZ-Version', `PZ Auth+API Backend v${VERSION} (${BUILD_DATE})`);
+  // ajuda CDNs/proxies a diferenciar por Origin e headers do preflight
+  res.setHeader('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
   next();
 });
 
@@ -199,9 +213,12 @@ app.get('/', (_req, res) => {
 app.get('/healthz', (_req, res) => {
   res.status(200).json({ ok: true, uptime: process.uptime(), ts: new Date().toISOString() });
 });
+app.head('/healthz', (_req, res) => res.sendStatus(200));
+
 app.get('/api/healthz', (_req, res) => {
   res.status(200).json({ ok: true, uptime: process.uptime(), ts: new Date().toISOString() });
 });
+app.head('/api/healthz', (_req, res) => res.sendStatus(200));
 
 app.get('/api/version', (_req, res) => {
   res.status(200).json({
@@ -213,7 +230,21 @@ app.get('/api/version', (_req, res) => {
     wildcard_pzadvisors: '*.pzadvisors.com',
     track_open: TRACK_OPEN,
     has_track_token: Boolean(TRACK_TOKEN),
+    debug_ping_enabled: Boolean(DEBUG_TOKEN),
     firestore_auth_mode: sa ? 'service-account-env' : 'adc'
+  });
+});
+
+// Diagnóstico CORS simples (não persiste)
+app.get('/api/cors-check', (req, res) => {
+  const origin = req.headers.origin || null;
+  return res.status(200).json({
+    ok: true,
+    rid: req.rid,
+    origin,
+    allowed: isAllowedOrigin(origin),
+    ua: req.headers['user-agent'] || null,
+    ts: new Date().toISOString()
   });
 });
 
@@ -229,7 +260,10 @@ app.options('/api/auth/google', (_req, res) => res.sendStatus(204));
 // Handler compartilhado
 async function handleAuthGoogle(req, res) {
   try {
-    const { credential, context } = req.body || {};
+    const body = req.body || {};
+    const credential = typeof body.credential === 'string' ? body.credential : (req.body && req.body.credential);
+    const context = body.context;
+
     if (!credential || typeof credential !== 'string') {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:false, error:'missing_credential' }));
       return res.status(400).json({ error: 'Missing credential' });
@@ -253,7 +287,7 @@ async function handleAuthGoogle(req, res) {
       return res.status(401).json({ error: 'Invalid token' });
     }
 
-    // Checagem leve do emissor (log informativo — não bloqueia)
+    // Emissor — log informativo
     if (payload.iss && !/accounts\.google\.com$/.test(String(payload.iss))) {
       console.warn(JSON.stringify({ route:'/auth/google', rid:req.rid, warn:'unexpected_issuer', iss: payload.iss }));
     }
@@ -261,7 +295,7 @@ async function handleAuthGoogle(req, res) {
     const { sub, email, name, picture, email_verified } = payload;
     const user_id = String(sub);
 
-    // 2) Persistir/atualizar usuário no Firestore
+    // 2) Upsert do usuário
     try {
       await usersCol.doc(user_id).set(
         {
@@ -280,7 +314,7 @@ async function handleAuthGoogle(req, res) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, warn:'firestore_upsert_failed', error: e.message || String(e) }));
     }
 
-    // 3) Logar evento de autenticação (não bloqueante)
+    // 3) Evento (não bloqueante)
     try {
       const traceId = req.headers['x-trace-id'] || null;
       await eventsCol.add({
@@ -298,7 +332,7 @@ async function handleAuthGoogle(req, res) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, warn:'auth_event_log_failed', error: e.message || String(e) }));
     }
 
-    // 4) Log estruturado OK
+    // 4) Log OK
     console.log(JSON.stringify({
       route: '/auth/google',
       rid: req.rid,
@@ -307,7 +341,7 @@ async function handleAuthGoogle(req, res) {
       email: email || null
     }));
 
-    // 5) Resposta para o frontend
+    // 5) Resposta
     return res.status(200).json({
       user_id,
       email: email || null,
@@ -375,6 +409,27 @@ app.post('/api/track', async (req, res) => {
   }
 });
 
+// Ping Firestore (diagnóstico) — requer X-Debug-Token == DEBUG_TOKEN
+app.post('/api/debug/ping-fs', async (req, res) => {
+  try {
+    const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
+    if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    const rid = req.rid;
+    const ref = await eventsCol.add({
+      type: 'debug_ping_fs',
+      rid,
+      origin: req.headers.origin || null,
+      ts: FieldValue.serverTimestamp()
+    });
+    return res.status(200).json({ ok: true, rid, doc: ref.id });
+  } catch (e) {
+    console.error(JSON.stringify({ route:'/api/debug/ping-fs', rid:req.rid, error: e.message || String(e) }));
+    return res.status(500).json({ ok: false, error: 'ping_failed' });
+  }
+});
+
 /* ──────────────────────────────────────────────────────────────
    6) Tratamento de erros globais
 ─────────────────────────────────────────────────────────────── */
@@ -398,6 +453,7 @@ app.listen(PORT, () => {
   console.log('   wildcard_pzadvisors        : *.pzadvisors.com');
   console.log('   TRACK_OPEN                 :', TRACK_OPEN);
   console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
+  console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
   console.log('   FIRESTORE auth mode        :', sa ? 'service-account-env' : 'adc');
   console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────');

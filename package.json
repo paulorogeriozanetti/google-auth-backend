@@ -1,11 +1,12 @@
 {
   "name": "pz-authapi-backend",
-  "version": "1.4.0-2025-08-28",
-  "description": "PZ Auth+API Backend (Unified Google One Tap AUTH + auxiliary API endpoints) – v1.4.0 – 2025-08-28",
+  "version": "1.4.3-2025-08-28",
+  "description": "PZ Auth+API Backend (Unified Google One Tap AUTH + auxiliary API endpoints) – v1.4.3 – 2025-08-28",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "PORT=8080 node server.js"
+    "dev": "PORT=8080 node server.js",
+    "dev:win": "set PORT=8080&& node server.js"
   },
   "engines": {
     "node": ">=18"
