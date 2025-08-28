@@ -1,17 +1,46 @@
-# Ignora pastas de dependências
+# PZ gitignore – R2 • 2025-08-28
+# Mantém o projeto limpo e evita vazar segredos/artefatos locais.
+
+# ───────────────────────── Dependências ─────────────────────────
 node_modules/
 
-# Ignora variáveis de ambiente (credenciais, senhas, tokens)
+# ───────────────────────── Ambientes/Segredos ───────────────────
+# (.env principal e variações por ambiente; não commitar segredos)
 .env
+.env.*
+!.env.example
 
-# Ignora arquivos de log
+# ───────────────────────── Logs ──────────────────────────────────
 *.log
-
-# Ignora arquivos temporários do sistema
-.DS_Store
-Thumbs.db
-
-# Ignora cache do npm
+logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+
+# ───────────────────────── Artefatos/Cache ──────────────────────
+dist/
+build/
+.tmp/
+.cache/
+coverage/
+.nyc_output/
+
+# ───────────────────────── SO/Editor ─────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ───────────────────────── Credenciais Locais ────────────────────
+# (NUNCA commitar chaves de serviço; no Railway use vars de ambiente)
+serviceAccount*.json
+firebase-adminsdk*.json
+gcp-key.json
+google-credentials.json
+credentials.json
+
+# ───────────────────────── Outros opcionais ──────────────────────
+# Arquivos de ferramenta/host que não fazem parte do app
+*.local
