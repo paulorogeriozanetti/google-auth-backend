@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.4.0 – 2025-08-28
+ * PZ Auth+API Backend – Versão 1.4.1 – 2025-08-28
  *
  * Endpoints:
  * - Healthcheck:        GET  /healthz            (alias: GET /api/healthz)
@@ -10,15 +10,11 @@
  * - Echo (debug leve):  POST /api/echo           { ... }  -> devolve payload (sem persistir)
  * - Track (opcional):   POST /api/track          { event, payload? }  -> grava em auth_events (se habilitado)
  *
- * Melhorias nesta versão:
- *  - 🔀 Unificado p/ servir AUTH e API no mesmo serviço/domínio (compatível com auth.* e api.*)
- *  - 🧩 Alias de rotas (/api/auth/google, /api/healthz) sem quebrar integrações antigas
- *  - 🔎 Logging estruturado + correlation id (X-Trace-Id) por request e X-PZ-Version em todas as respostas
- *  - 🔐 CORS inclui "X-Trace-Id" e "X-PZ-Version"; lista de origens com auth.* e api.*
- *  - 🗃️ Upsert do usuário no Firestore (users/{user_id}) + log de evento em auth_events (contexto opcional)
- *  - 🧪 /api/version e /api/echo p/ diagnóstico rápido; /api/track opcionalmente ativável via ENV
- *  - 🧊 Respostas sensíveis com no-store (evita cache intermediário)
- *  - ✅ Nenhuma funcionalidade removida
+ * Novidades v1.4.1:
+ *  - 🔐 Firestore com credenciais explícitas via ENV:
+ *      FIREBASE_SERVICE_ACCOUNT_JSON (JSON)  OU  FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 (base64)
+ *    (corrige "\n" da private_key automaticamente; fallback para ADC quando não setado)
+ *  - ✅ Demais funcionalidades preservadas (CORS, logs, aliases, track, echo…)
  */
 
 const express = require('express');
@@ -31,7 +27,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const BUILD_DATE = '2025-08-28';
 
 const PORT = process.env.PORT || 8080;
@@ -65,9 +61,49 @@ const TRACK_TOKEN = process.env.TRACK_TOKEN || '';
 // Cloud proxies (Railway/Cloud Run) — confia no proxy p/ IP/cookies seguros
 app.set('trust proxy', true);
 
-// Firestore (usa credenciais padrão do ambiente GCP)
-const db = new Firestore();
-const usersCol = db.collection('users');
+/* ──────────────────────────────────────────────────────────────
+   1.1) Firestore – credenciais via ENV (ou ADC fallback)
+─────────────────────────────────────────────────────────────── */
+function loadServiceAccountFromEnv() {
+  try {
+    // Preferência: JSON puro
+    let raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '';
+
+    // Alternativa: base64
+    if (!raw && process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
+      raw = Buffer.from(
+        process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
+        'base64'
+      ).toString('utf8');
+    }
+
+    if (!raw) return null;
+
+    const json = JSON.parse(raw);
+    if (json.private_key && typeof json.private_key === 'string') {
+      // Corrige quebras de linha escapadas
+      json.private_key = json.private_key.replace(/\\n/g, '\n');
+    }
+    return json;
+  } catch (e) {
+    console.error('[SA_PARSE_ERROR]', e?.message || String(e));
+    return null;
+  }
+}
+
+const sa = loadServiceAccountFromEnv();
+
+const db = sa && sa.client_email && sa.private_key
+  ? new Firestore({
+      projectId: sa.project_id,
+      credentials: {
+        client_email: sa.client_email,
+        private_key: sa.private_key
+      }
+    })
+  : new Firestore(); // fallback ADC (ex.: Cloud Run com Workload Identity)
+
+const usersCol  = db.collection('users');
 const eventsCol = db.collection('auth_events');
 
 /* ──────────────────────────────────────────────────────────────
@@ -154,7 +190,8 @@ app.get('/api/version', (_req, res) => {
     client_id_configured: Boolean(process.env.GOOGLE_CLIENT_ID) || 'default',
     cors_allowed_origins: allowedOrigins,
     track_open: TRACK_OPEN,
-    has_track_token: Boolean(TRACK_TOKEN)
+    has_track_token: Boolean(TRACK_TOKEN),
+    firestore_auth_mode: sa ? 'service-account-env' : 'adc'
   });
 });
 
@@ -338,10 +375,11 @@ app.listen(PORT, () => {
   console.log(`✅ Server UP on port ${PORT}`);
   console.log(`📦 Version: v${VERSION} (${BUILD_DATE})`);
   console.log('🔧 Vars:');
-  console.log('   GOOGLE_CLIENT_ID:', CLIENT_ID);
-  console.log('   ALLOWED_ORIGINS :', allowedOrigins);
-  console.log('   TRACK_OPEN      :', TRACK_OPEN);
-  console.log('   TRACK_TOKEN set :', Boolean(TRACK_TOKEN));
-  console.log('   NODE_ENV        :', process.env.NODE_ENV || '(not set)');
+  console.log('   GOOGLE_CLIENT_ID           :', CLIENT_ID);
+  console.log('   ALLOWED_ORIGINS            :', allowedOrigins);
+  console.log('   TRACK_OPEN                 :', TRACK_OPEN);
+  console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
+  console.log('   FIRESTORE auth mode        :', sa ? 'service-account-env' : 'adc');
+  console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────');
 });
