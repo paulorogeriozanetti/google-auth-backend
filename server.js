@@ -1,22 +1,12 @@
 /**
- * PZ Auth+API Backend – Versão 1.6.1 – 2025-08-29 – “Railway-FS-REST-FIX”
+ * PZ Auth+API Backend – Versão 1.6.3 – 2025-08-29 – “Railway-FS-PathFix+Hardening”
  *
- * Endpoints:
- * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
- * - Root test:          GET       /
- * - Versão/Status:      GET       /api/version
- * - Auth (Google OTP):  POST      /auth/google      { credential, context? }
- *                        ALIAS:   POST /api/auth/google
- * - Echo (debug leve):  POST      /api/echo
- * - Track (opcional):   POST      /api/track
- * - CORS check (diag):  GET       /api/cors-check
- * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
- * - SA env check (diag):GET       /api/debug/env-has-sa
- *
- * Novidades v1.6.1:
- *  - 🔧 Firestore REST: normalização de caminhos para evitar “/documents/documents/...”.
- *  - 🧰 express.json aceita application/*+json e limite ↑ para 2mb.
- *  - ⚙️ Mantidas todas as rotas e CORS da 1.6.0.
+ * Diff funcional vs 1.6.2:
+ *  - 🔧 Firestore REST: caminho unificado (sem "documents/" nos helpers; só no fullName do commit).
+ *  - 🧱 Guard rails SA mantidos (erro claro quando GCP_* faltarem).
+ *  - 🌐 CORS no topo (mesma política).
+ *  - 🧪 Fallback de JSON quando Content-Type vem errado.
+ *  - ⚡ fetch nativo (Node 18+) com fallback para node-fetch@3 (ESM).
  */
 
 const express = require('express');
@@ -26,14 +16,18 @@ try { cookieParser = require('cookie-parser'); }
 catch (_) { console.warn('[BOOT] cookie-parser não encontrado; usando parser leve de header (fallback).'); }
 
 const { OAuth2Client, JWT } = require('google-auth-library');
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
+// fetch robusto (nativo primeiro; fallback ESM)
+const fetch = (typeof globalThis.fetch === 'function')
+  ? globalThis.fetch.bind(globalThis)
+  : ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
 
 const app = express();
 
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.6.1';
+const VERSION = '1.6.3';
 const BUILD_DATE = '2025-08-29';
 const PORT = process.env.PORT || 8080;
 
@@ -66,11 +60,43 @@ const DEBUG_TOKEN = process.env.DEBUG_TOKEN || '';
 app.set('trust proxy', true);
 
 /* ──────────────────────────────────────────────────────────────
-   1.1) Firestore REST (Service Account)
+   1.1) CORS (no topo)
 ─────────────────────────────────────────────────────────────── */
-const GCP_PROJECT_ID      = process.env.GCP_PROJECT_ID || '';
-const GCP_SA_EMAIL        = process.env.GCP_SA_EMAIL || '';
-const GCP_SA_PRIVATE_KEY  = (process.env.GCP_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // server-to-server
+  try {
+    const { hostname, protocol } = new URL(origin.trim());
+    const host = String(hostname || '').toLowerCase();
+    const isLocal = protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1');
+    if (isLocal) return true;
+    if (host === 'pzadvisors.com' || host === 'www.pzadvisors.com' || host.endsWith('.pzadvisors.com')) return true;
+    return allowedOrigins.includes(origin.trim());
+  } catch { return false; }
+}
+
+app.use(cors({
+  origin(origin, cb) {
+    const ok = isAllowedOrigin(origin);
+    if (!ok && origin) { try { console.warn(JSON.stringify({ tag: 'cors_denied', origin })); } catch {} }
+    return cb(null, ok);
+  },
+  methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type','Authorization',
+    'X-PZ-Version','x-pz-version',
+    'X-Trace-Id','x-trace-id',
+    'X-Api-Token','x-api-token',
+    'X-Debug-Token','x-debug-token'
+  ],
+  optionsSuccessStatus: 204
+}));
+
+/* ──────────────────────────────────────────────────────────────
+   1.2) Firestore REST (Service Account)
+─────────────────────────────────────────────────────────────── */
+const GCP_PROJECT_ID     = process.env.GCP_PROJECT_ID || '';
+const GCP_SA_EMAIL       = process.env.GCP_SA_EMAIL || '';
+const GCP_SA_PRIVATE_KEY = (process.env.GCP_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 
 const FS_BASE  = `https://firestore.googleapis.com/v1/projects/${GCP_PROJECT_ID}/databases/(default)`;
 const FS_SCOPE = 'https://www.googleapis.com/auth/datastore';
@@ -80,8 +106,26 @@ function normalizePath(p) {
   return String(p || '').replace(/^\/+|\/+$/g, '').replace(/^documents\//, '');
 }
 
+// Gera o "full document name" para APIs que exigem (ex.: transforms)
+function makeDocFullName(collectionPath, id) {
+  const col = normalizePath(collectionPath);
+  return `${FS_BASE}/documents/${col}/${encodeURIComponent(String(id))}`;
+}
+
+function ensureSA() {
+  if (!GCP_PROJECT_ID || !GCP_SA_EMAIL || !GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY')) {
+    const miss = {
+      project: !!GCP_PROJECT_ID, email: !!GCP_SA_EMAIL, key: !!GCP_SA_PRIVATE_KEY
+    };
+    const msg = `[FS] Service Account config incompleta: ${JSON.stringify(miss)}`;
+    console.error(msg);
+    throw Object.assign(new Error('sa_not_configured'), { code: 'sa_not_configured', meta: miss });
+  }
+}
+
 // Gera access token via Service Account
 async function getSAToken() {
+  ensureSA();
   const client = new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
   const { token } = await client.authorize();
   return token;
@@ -104,7 +148,7 @@ function fsVal(v) {
 // Create (auto-id): POST /documents/{collection}
 async function fsCreate(collectionPath, data) {
   const token = await getSAToken();
-  const col = normalizePath(collectionPath); // e.g., "auth_events"
+  const col = normalizePath(collectionPath);
   const url = `${FS_BASE}/documents/${col}`;
   const body = { fields: {} };
   for (const k of Object.keys(data)) body.fields[k] = fsVal(data[k]);
@@ -116,7 +160,7 @@ async function fsCreate(collectionPath, data) {
 // Upsert (merge): PATCH /documents/{docPath}?allowMissing=true&updateMask.fieldPaths=...
 async function fsUpsert(docPath, data) {
   const token = await getSAToken();
-  const doc = normalizePath(docPath); // e.g., "users/USER_ID"
+  const doc = normalizePath(docPath);
   const url = new URL(`${FS_BASE}/documents/${doc}`);
   url.searchParams.set('allowMissing', 'true');
   const fields = Object.keys(data);
@@ -133,7 +177,12 @@ async function fsCommitTransforms(docFullName, fieldPaths = []) {
   if (!fieldPaths.length) return;
   const token = await getSAToken();
   const url = `${FS_BASE}/documents:commit`;
-  const writes = [{ transform: { document: docFullName, fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' })) } }];
+  const writes = [{
+    transform: {
+      document: docFullName,
+      fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' }))
+    }
+  }];
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ writes }) });
   if (!r.ok) throw new Error(`fsCommitTransforms failed: ${r.status} ${await r.text()}`);
   return r.json();
@@ -162,34 +211,21 @@ if (cookieParser) {
 app.use(express.json({ limit: '2mb', type: ['application/json', 'application/*+json'] }));
 app.use(express.urlencoded({ extended: true }));
 
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  try {
-    const { hostname, protocol } = new URL(origin.trim());
-    const host = String(hostname || '').toLowerCase();
-    const isLocal = protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1');
-    if (isLocal) return true;
-    if (host === 'pzadvisors.com' || host === 'www.pzadvisors.com' || host.endsWith('.pzadvisors.com')) return true;
-    return allowedOrigins.includes(origin.trim());
-  } catch { return false; }
-}
-
-app.use(cors({
-  origin(origin, cb) {
-    const ok = isAllowedOrigin(origin);
-    if (!ok && origin) { try { console.warn(JSON.stringify({ tag: 'cors_denied', origin })); } catch {} }
-    return cb(null, ok);
-  },
-  methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
-  allowedHeaders: [
-    'Content-Type','Authorization',
-    'X-PZ-Version','x-pz-version',
-    'X-Trace-Id','x-trace-id',
-    'X-Api-Token','x-api-token',
-    'X-Debug-Token','x-debug-token'
-  ],
-  optionsSuccessStatus: 204
-}));
+// Fallback: se body veio como string/sem Content-Type, tenta JSON
+app.use((req, _res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return next();
+  let data = '';
+  req.on('data', c => { data += c; if (data.length > 2 * 1024 * 1024) req.destroy(); }); // 2MB
+  req.on('end', () => {
+    if (!req.body || typeof req.body !== 'object') {
+      if (data && /^[\s{\[]/.test(data)) {
+        try { req.body = JSON.parse(data); } catch { /* ignore */ }
+      }
+    }
+    next();
+  });
+});
 
 // Headers padrão + trace id
 app.use((req, res, next) => {
@@ -257,9 +293,9 @@ app.get('/api/cors-check', (req, res) => {
    3.1) Debug – Credenciais SA
 ─────────────────────────────────────────────────────────────── */
 app.get('/api/debug/env-has-sa', (_req, res) => {
-  const hasProj = !!GCP_PROJECT_ID;
+  const hasProj  = !!GCP_PROJECT_ID;
   const hasEmail = !!GCP_SA_EMAIL;
-  const hasKey = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY');
+  const hasKey   = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY');
   res.status(200).json({ hasProj, hasEmail, hasKey });
 });
 
@@ -336,7 +372,7 @@ async function handleAuthGoogle(req, res) {
         user_id, sub, email: email || null, name: name || null, picture: picture || null,
         email_verified: !!email_verified
       });
-      const docName = `${FS_BASE}/documents/users/${encodeURIComponent(user_id)}`;
+      const docName = makeDocFullName('users', user_id);
       await fsCommitTransforms(docName, ['last_seen', 'updated_at']);
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, warn:'firestore_upsert_failed', error:e.message || String(e) }));
@@ -360,7 +396,6 @@ async function handleAuthGoogle(req, res) {
     }
 
     console.log(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, user_id, email: email || null }));
-
     return res.status(200).json({ user_id, email: email || null, name: name || null, picture: picture || null });
   } catch (err) {
     const msg = err?.message || String(err || '');
@@ -422,10 +457,11 @@ app.post('/api/debug/ping-fs', async (req, res) => {
       ts: new Date()
     });
 
-    const id = (r.name || '').split('/').pop() || null; // id do doc criado
+    const id = (r.name || '').split('/').pop() || null;
     return res.status(200).json({ ok:true, rid:req.rid, doc: id });
   } catch (e) {
     console.error(JSON.stringify({ route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) }));
+    if (e.code === 'sa_not_configured') return res.status(503).json({ ok:false, error:'sa_not_configured', meta:e.meta });
     return res.status(500).json({ ok:false, error:'ping_failed' });
   }
 });

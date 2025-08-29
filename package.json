@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.6.1-2025-08-29-railway-fs-rest-fix",
-  "version": "1.6.1-2025-08-29",
-  "description": "PZ Auth+API Backend – v1.6.1 – 2025-08-29 – Railway-FS-REST-FIX (Google One Tap AUTH + auxiliares; Firestore via REST/Service Account)",
+  "name": "pz-authapi-backend-v1.6.3-2025-08-29-railway-fs-pathfix-hardening",
+  "version": "1.6.3-2025-08-29",
+  "description": "PZ Auth+API Backend – v1.6.3 – 2025-08-29 – Railway-FS-PathFix+Hardening (Google One Tap AUTH + auxiliares; Firestore via REST/Service Account; fetch nativo com fallback; CORS no topo; JSON fallback).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
