@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.5.2 – 2025-08-29 – “GOT Solid”
+ * PZ Auth+API Backend – Versão 1.5.3 – 2025-08-29 – “CookieSafe”
  *
  * Endpoints:
  * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
@@ -13,15 +13,21 @@
  * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
  * - SA env check (diag):GET       /api/debug/env-has-sa
  *
- * Novidades v1.5.2:
- *  - ✅ Removido fallback antigo e definido o Client ID correto como padrão.
- *  - 🛡️ Verificação do ID token contra lista de audiences (env + primary).
- *  - 🧰 Parsing robusto (JSON e x-www-form-urlencoded) e logs diagnósticos.
+ * Novidades v1.5.3:
+ *  - 🛡️ Fallback seguro para ausência de `cookie-parser` (evita crash por dependência faltante).
+ *  - 🔎 Logs diagnósticos extras (audience/env) sem alterar o fluxo.
+ *  - 🔁 Demais funcionalidades preservadas (v1.5.2).
  */
 
 const express = require('express');
 const cors = require('cors');
-const cookieParser = require('cookie-parser');
+let cookieParser = null;
+try {
+  // Pode não estar instalado em algum deploy → fallback abaixo
+  cookieParser = require('cookie-parser');
+} catch (_) {
+  console.warn('[BOOT] cookie-parser não encontrado; usando parser leve de header (fallback).');
+}
 const { OAuth2Client } = require('google-auth-library');
 const { FieldValue } = require('@google-cloud/firestore');
 const { db, firestoreAuthMode } = require('./lib/firestore');
@@ -31,7 +37,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.5.2';
+const VERSION = '1.5.3';
 const BUILD_DATE = '2025-08-29';
 const PORT = process.env.PORT || 8080;
 
@@ -75,7 +81,22 @@ const eventsCol = db.collection('auth_events');
 /* ──────────────────────────────────────────────────────────────
    2) Middlewares
 ─────────────────────────────────────────────────────────────── */
-app.use(cookieParser());
+if (cookieParser) {
+  app.use(cookieParser());
+} else {
+  // Fallback: parser simples de cookies (apenas para g_csrf_token)
+  app.use((req, _res, next) => {
+    const raw = req.headers.cookie || '';
+    req.cookies = {};
+    raw.split(';').forEach(p => {
+      const [k, ...v] = p.split('=');
+      if (!k) return;
+      req.cookies[k.trim()] = decodeURIComponent((v.join('=') || '').trim());
+    });
+    next();
+  });
+}
+
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -156,7 +177,8 @@ app.get('/api/version', (_req, res) => {
     track_open: TRACK_OPEN,
     has_track_token: Boolean(TRACK_TOKEN),
     debug_ping_enabled: Boolean(DEBUG_TOKEN),
-    firestore_auth_mode: firestoreAuthMode()
+    firestore_auth_mode: firestoreAuthMode(),
+    has_cookie_parser: Boolean(cookieParser)
   });
 });
 
@@ -357,6 +379,7 @@ app.listen(PORT, () => {
   console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
   console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
   console.log('   FIRESTORE auth mode        :', firestoreAuthMode());
+  console.log('   HAS cookie-parser          :', Boolean(cookieParser));
   console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────────────────────');
 });
