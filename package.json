@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend",
-  "version": "1.4.3-2025-08-28",
-  "description": "PZ Auth+API Backend (Unified Google One Tap AUTH + auxiliary API endpoints) – v1.4.3 – 2025-08-28",
+  "name": "pz-authapi-backend-v1.5.2-2025-08-29",
+  "version": "1.5.2-2025-08-29",
+  "description": "PZ Auth+API Backend (Unified Google One Tap AUTH + auxiliary API endpoints) – v1.5.2 – 2025-08-29",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
