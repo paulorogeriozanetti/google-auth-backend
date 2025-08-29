@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.4.3 – 2025-08-28
+ * PZ Auth+API Backend – Versão 1.5.0 – 2025-08-29
  *
  * Endpoints:
  * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
@@ -12,26 +12,25 @@
  * - CORS check (diag):  GET       /api/cors-check   -> echo de origin/permitido (sem persistir)
  * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
  *
- * Novidades v1.4.3:
- *  - 🌐 CORS ainda mais robusto: wildcard para *.pzadvisors.com + 'Vary' padrão em todas as respostas.
- *  - 🧰 Diagnóstico rápido: /api/cors-check e /api/debug/ping-fs (guardado por token) p/ validar Firestore on-demand.
- *  - 🧵 HEAD em /healthz e /api/healthz (uptime em GET; 200 em HEAD).
- *  - 🧩 Aceita também application/x-www-form-urlencoded no /auth/google (além de JSON).
- *  - ✅ Demais funcionalidades preservadas (aliases, logs, Firestore por ENV/ADC, track, echo…).
+ * Novidades v1.5.0:
+ *  - 🔌 Firestore agora inicializa via lib externa (./lib/firestore) lendo SA Base64/JSON automaticamente.
+ *  - 📊 /api/version e logs reportam o modo real de auth do Firestore (service_account vs adc).
+ *  - 🔁 Demais funcionalidades preservadas (CORS avançado, aliases, track, echo, ping-fs, logs, form-urlencoded).
  */
 
 const express = require('express');
 const cors = require('cors');
 const { OAuth2Client } = require('google-auth-library');
-const { Firestore, FieldValue } = require('@google-cloud/firestore');
+const { FieldValue } = require('@google-cloud/firestore');
+const { db, firestoreAuthMode } = require('./lib/firestore'); // ← usa sua lib
 
 const app = express();
 
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.4.3';
-const BUILD_DATE = '2025-08-28';
+const VERSION = '1.5.0';
+const BUILD_DATE = '2025-08-29';
 
 const PORT = process.env.PORT || 8080;
 
@@ -67,43 +66,7 @@ const DEBUG_TOKEN = process.env.DEBUG_TOKEN || '';
 // Cloud proxies (Railway/Cloud Run)
 app.set('trust proxy', true);
 
-/* ──────────────────────────────────────────────────────────────
-   1.1) Firestore – credenciais via ENV (ou ADC fallback)
-─────────────────────────────────────────────────────────────── */
-function loadServiceAccountFromEnv() {
-  try {
-    let raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '';
-    if (!raw && process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
-      raw = Buffer.from(
-        process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
-        'base64'
-      ).toString('utf8');
-    }
-    if (!raw) return null;
-
-    const json = JSON.parse(raw);
-    if (json.private_key && typeof json.private_key === 'string') {
-      json.private_key = json.private_key.replace(/\\n/g, '\n');
-    }
-    return json;
-  } catch (e) {
-    console.error('[SA_PARSE_ERROR]', e?.message || String(e));
-    return null;
-  }
-}
-
-const sa = loadServiceAccountFromEnv();
-
-const db = sa && sa.client_email && sa.private_key
-  ? new Firestore({
-      projectId: sa.project_id,
-      credentials: {
-        client_email: sa.client_email,
-        private_key: sa.private_key
-      }
-    })
-  : new Firestore(); // fallback ADC (ex.: Cloud Run)
-
+// Coleções Firestore (db vem da lib)
 const usersCol  = db.collection('users');
 const eventsCol = db.collection('auth_events');
 
@@ -231,7 +194,7 @@ app.get('/api/version', (_req, res) => {
     track_open: TRACK_OPEN,
     has_track_token: Boolean(TRACK_TOKEN),
     debug_ping_enabled: Boolean(DEBUG_TOKEN),
-    firestore_auth_mode: sa ? 'service-account-env' : 'adc'
+    firestore_auth_mode: firestoreAuthMode() // ← reporta modo real
   });
 });
 
@@ -454,7 +417,7 @@ app.listen(PORT, () => {
   console.log('   TRACK_OPEN                 :', TRACK_OPEN);
   console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
   console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
-  console.log('   FIRESTORE auth mode        :', sa ? 'service-account-env' : 'adc');
+  console.log('   FIRESTORE auth mode        :', firestoreAuthMode()); // ← reporta modo real
   console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────');
 });
