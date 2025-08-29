@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.5.4-2025-08-29",
-  "version": "1.5.4-2025-08-29",
-  "description": "PZ Auth+API Backend (Unified Google One Tap AUTH + auxiliary API endpoints) – v1.5.4 – 2025-08-29 – RailwaySafe",
+  "name": "pz-authapi-backend-v1.6.1-2025-08-29-railway-fs-rest-fix",
+  "version": "1.6.1-2025-08-29",
+  "description": "PZ Auth+API Backend – v1.6.1 – 2025-08-29 – Railway-FS-REST-FIX (Google One Tap AUTH + auxiliares; Firestore via REST/Service Account)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,11 +14,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google-cloud/firestore": "^7.11.3",
+    "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.18.3",
     "google-auth-library": "^10.2.0",
-    "cookie-parser": "^1.4.6",
     "node-fetch": "^3.3.2"
   }
 }

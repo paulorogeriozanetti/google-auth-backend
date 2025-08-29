@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.6.0 – 2025-08-29 – “Railway-FS-REST”
+ * PZ Auth+API Backend – Versão 1.6.1 – 2025-08-29 – “Railway-FS-REST-FIX”
  *
  * Endpoints:
  * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
@@ -13,11 +13,10 @@
  * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
  * - SA env check (diag):GET       /api/debug/env-has-sa
  *
- * Novidades v1.6.0:
- *  - 🔄 Firestore via REST + Service Account (sem @google-cloud/firestore / Admin SDK).
- *  - 🧰 Upsert de usuário e criação de eventos preservados (coleções: users, auth_events).
- *  - ⏱️ Timestamps de eventos no backend (ISO) e, quando possível, transform de REQUEST_TIME.
- *  - ⚙️ Mantidas todas as rotas e CORS do 1.5.3.
+ * Novidades v1.6.1:
+ *  - 🔧 Firestore REST: normalização de caminhos para evitar “/documents/documents/...”.
+ *  - 🧰 express.json aceita application/*+json e limite ↑ para 2mb.
+ *  - ⚙️ Mantidas todas as rotas e CORS da 1.6.0.
  */
 
 const express = require('express');
@@ -26,8 +25,7 @@ let cookieParser = null;
 try { cookieParser = require('cookie-parser'); }
 catch (_) { console.warn('[BOOT] cookie-parser não encontrado; usando parser leve de header (fallback).'); }
 
-const { OAuth2Client } = require('google-auth-library'); // para verificar ID token (front → backend)
-const { JWT } = require('google-auth-library');           // para gerar access token da Service Account (backend → Firestore)
+const { OAuth2Client, JWT } = require('google-auth-library');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
@@ -35,13 +33,11 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 const BUILD_DATE = '2025-08-29';
 const PORT = process.env.PORT || 8080;
 
-/**
- * Client IDs aceitos (audiences)
- */
+/** Client IDs aceitos (audiences) */
 const PRIMARY_CLIENT_ID = '270930304722-pbl5cmp53omohrmfkf9dmicutknf3q95.apps.googleusercontent.com';
 const CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID,
@@ -49,7 +45,7 @@ const CLIENT_IDS = [
   PRIMARY_CLIENT_ID
 ].map(s => (s || '').trim()).filter(Boolean);
 
-// Origens permitidas
+/** Origens permitidas */
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ||
   [
     'https://pzadvisors.com',
@@ -72,93 +68,73 @@ app.set('trust proxy', true);
 /* ──────────────────────────────────────────────────────────────
    1.1) Firestore REST (Service Account)
 ─────────────────────────────────────────────────────────────── */
-const GCP_PROJECT_ID   = process.env.GCP_PROJECT_ID || '';
-const GCP_SA_EMAIL     = process.env.GCP_SA_EMAIL || '';
-const GCP_SA_PRIVATE_KEY = (process.env.GCP_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const GCP_PROJECT_ID      = process.env.GCP_PROJECT_ID || '';
+const GCP_SA_EMAIL        = process.env.GCP_SA_EMAIL || '';
+const GCP_SA_PRIVATE_KEY  = (process.env.GCP_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
 
-const FS_BASE = `https://firestore.googleapis.com/v1/projects/${GCP_PROJECT_ID}/databases/(default)`;
+const FS_BASE  = `https://firestore.googleapis.com/v1/projects/${GCP_PROJECT_ID}/databases/(default)`;
 const FS_SCOPE = 'https://www.googleapis.com/auth/datastore';
+
+// Normaliza caminhos: remove barras extras e prefixo "documents/"
+function normalizePath(p) {
+  return String(p || '').replace(/^\/+|\/+$/g, '').replace(/^documents\//, '');
+}
 
 // Gera access token via Service Account
 async function getSAToken() {
-  const client = new JWT({
-    email: GCP_SA_EMAIL,
-    key: GCP_SA_PRIVATE_KEY,
-    scopes: [FS_SCOPE],
-  });
+  const client = new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
   const { token } = await client.authorize();
   return token;
 }
 
-// Conversor simples JS → Firestore Value
+// Converte JS → Firestore Value
 function fsVal(v) {
   if (v === null || v === undefined) return { nullValue: null };
   if (typeof v === 'string')  return { stringValue: v };
   if (typeof v === 'boolean') return { booleanValue: v };
-  if (typeof v === 'number') {
-    if (Number.isInteger(v)) return { integerValue: String(v) };
-    return { doubleValue: v };
-  }
-  if (v instanceof Date) return { timestampValue: v.toISOString() };
+  if (typeof v === 'number')  return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (v instanceof Date)      return { timestampValue: v.toISOString() };
   if (typeof v === 'object') {
-    // mapValue
-    const fields = {};
-    for (const k of Object.keys(v)) fields[k] = fsVal(v[k]);
+    const fields = {}; for (const k of Object.keys(v)) fields[k] = fsVal(v[k]);
     return { mapValue: { fields } };
   }
   return { stringValue: String(v) };
 }
 
-// Cria documento (auto-id) → POST /documents/{collection}
-async function fsCreate(collection, data) {
+// Create (auto-id): POST /documents/{collection}
+async function fsCreate(collectionPath, data) {
   const token = await getSAToken();
-  const url = `${FS_BASE}/documents/${collection}`;
+  const col = normalizePath(collectionPath); // e.g., "auth_events"
+  const url = `${FS_BASE}/documents/${col}`;
   const body = { fields: {} };
   for (const k of Object.keys(data)) body.fields[k] = fsVal(data[k]);
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) throw new Error(`fsCreate ${collection} failed: ${r.status} ${await r.text()}`);
-  return r.json(); // contém name do doc
-}
-
-// Upsert (merge) → PATCH /documents/{docPath}?allowMissing=true&updateMask.fieldPaths=...
-async function fsUpsert(docPath, data) {
-  const token = await getSAToken();
-  const url = new URL(`${FS_BASE}/documents/${docPath}`);
-  url.searchParams.set('allowMissing', 'true');
-  const mask = Object.keys(data);
-  mask.forEach(f => url.searchParams.append('updateMask.fieldPaths', f));
-  const body = { fields: {} };
-  for (const k of mask) body.fields[k] = fsVal(data[k]);
-
-  const r = await fetch(url.toString(), {
-    method: 'PATCH',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) throw new Error(`fsUpsert ${docPath} failed: ${r.status} ${await r.text()}`);
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`fsCreate ${col} failed: ${r.status} ${await r.text()}`);
   return r.json();
 }
 
-// Commit com transform (REQUEST_TIME) → POST /documents:commit
+// Upsert (merge): PATCH /documents/{docPath}?allowMissing=true&updateMask.fieldPaths=...
+async function fsUpsert(docPath, data) {
+  const token = await getSAToken();
+  const doc = normalizePath(docPath); // e.g., "users/USER_ID"
+  const url = new URL(`${FS_BASE}/documents/${doc}`);
+  url.searchParams.set('allowMissing', 'true');
+  const fields = Object.keys(data);
+  fields.forEach(f => url.searchParams.append('updateMask.fieldPaths', f));
+  const body = { fields: {} };
+  for (const k of fields) body.fields[k] = fsVal(data[k]);
+  const r = await fetch(url.toString(), { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`fsUpsert ${doc} failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+// Commit com transform REQUEST_TIME: POST /documents:commit
 async function fsCommitTransforms(docFullName, fieldPaths = []) {
   if (!fieldPaths.length) return;
   const token = await getSAToken();
   const url = `${FS_BASE}/documents:commit`;
-  const writes = [{
-    transform: {
-      document: docFullName,
-      fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' }))
-    }
-  }];
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ writes })
-  });
+  const writes = [{ transform: { document: docFullName, fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' })) } }];
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ writes }) });
   if (!r.ok) throw new Error(`fsCommitTransforms failed: ${r.status} ${await r.text()}`);
   return r.json();
 }
@@ -169,7 +145,7 @@ async function fsCommitTransforms(docFullName, fieldPaths = []) {
 if (cookieParser) {
   app.use(cookieParser());
 } else {
-  // Fallback: parser simples de cookies (apenas para g_csrf_token)
+  // Fallback: parser simples de cookies (g_csrf_token)
   app.use((req, _res, next) => {
     const raw = req.headers.cookie || '';
     req.cookies = {};
@@ -182,7 +158,8 @@ if (cookieParser) {
   });
 }
 
-app.use(express.json({ limit: '1mb' }));
+// Body parsers (robustos)
+app.use(express.json({ limit: '2mb', type: ['application/json', 'application/*+json'] }));
 app.use(express.urlencoded({ extended: true }));
 
 function isAllowedOrigin(origin) {
@@ -192,31 +169,27 @@ function isAllowedOrigin(origin) {
     const host = String(hostname || '').toLowerCase();
     const isLocal = protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1');
     if (isLocal) return true;
-    if (host === 'pzadvisors.com' || host === 'www.pzadvisors.com' || host.endsWith('.pzadvisors.com')) {
-      return true;
-    }
+    if (host === 'pzadvisors.com' || host === 'www.pzadvisors.com' || host.endsWith('.pzadvisors.com')) return true;
     return allowedOrigins.includes(origin.trim());
   } catch { return false; }
 }
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      const ok = isAllowedOrigin(origin);
-      if (!ok && origin) { try { console.warn(JSON.stringify({ tag: 'cors_denied', origin })); } catch {} }
-      return cb(null, ok);
-    },
-    methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
-    allowedHeaders: [
-      'Content-Type','Authorization',
-      'X-PZ-Version','x-pz-version',
-      'X-Trace-Id','x-trace-id',
-      'X-Api-Token','x-api-token',
-      'X-Debug-Token','x-debug-token'
-    ],
-    optionsSuccessStatus: 204
-  })
-);
+app.use(cors({
+  origin(origin, cb) {
+    const ok = isAllowedOrigin(origin);
+    if (!ok && origin) { try { console.warn(JSON.stringify({ tag: 'cors_denied', origin })); } catch {} }
+    return cb(null, ok);
+  },
+  methods: ['GET', 'POST', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type','Authorization',
+    'X-PZ-Version','x-pz-version',
+    'X-Trace-Id','x-trace-id',
+    'X-Api-Token','x-api-token',
+    'X-Debug-Token','x-debug-token'
+  ],
+  optionsSuccessStatus: 204
+}));
 
 // Headers padrão + trace id
 app.use((req, res, next) => {
@@ -235,7 +208,7 @@ app.use((req, res, next) => {
     try {
       console.log(JSON.stringify({
         rid: req.rid, method: req.method, path: req.path,
-        status: res.statusCode, ms: Date.now()-t0, origin: req.headers.origin || null
+        status: res.statusCode, ms: Date.now() - t0, origin: req.headers.origin || null
       }));
     } catch {}
   });
@@ -298,7 +271,6 @@ const oauthClient = new OAuth2Client(CLIENT_IDS[0] || PRIMARY_CLIENT_ID);
 app.options('/auth/google', (_req, res) => res.sendStatus(204));
 app.options('/api/auth/google', (_req, res) => res.sendStatus(204));
 
-// Decode auxiliar (apenas log)
 function decodeJwtPayload(idToken) {
   try {
     const base64 = idToken.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
@@ -332,11 +304,7 @@ async function handleAuthGoogle(req, res) {
       }
     }
 
-    res.set({
-      'Cache-Control': 'no-store, no-cache, must-revalidate, private',
-      Pragma: 'no-cache',
-      Expires: '0'
-    });
+    res.set({ 'Cache-Control': 'no-store, no-cache, must-revalidate, private', Pragma: 'no-cache', Expires: '0' });
 
     // Log leve do token (aud/iss/exp)
     const decoded = decodeJwtPayload(credential) || {};
@@ -347,8 +315,8 @@ async function handleAuthGoogle(req, res) {
       }));
     }
 
-    // Verificação (assinatura + audience)
-    const ticket = await oauthClient.verifyIdToken({ idToken: credential, audience: CLIENT_IDS });
+    // Verificação (assinatura + audiences)
+    const ticket  = await oauthClient.verifyIdToken({ idToken: credential, audience: CLIENT_IDS });
     const payload = ticket.getPayload();
     if (!payload) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:false, error:'invalid_token_empty_payload' }));
@@ -364,22 +332,19 @@ async function handleAuthGoogle(req, res) {
 
     // Upsert user (REST) – merge + REQUEST_TIME em last_seen/updated_at
     try {
-      // 1) upsert campos principais
-      await fsUpsert(`documents/users/${encodeURIComponent(user_id)}`, {
+      await fsUpsert(`users/${encodeURIComponent(user_id)}`, {
         user_id, sub, email: email || null, name: name || null, picture: picture || null,
         email_verified: !!email_verified
       });
-
-      // 2) aplica transform REQUEST_TIME em last_seen/updated_at
       const docName = `${FS_BASE}/documents/users/${encodeURIComponent(user_id)}`;
       await fsCommitTransforms(docName, ['last_seen', 'updated_at']);
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, warn:'firestore_upsert_failed', error:e.message || String(e) }));
     }
 
-    // Event (não bloqueante) – cria doc em auth_events
+    // Event (não bloqueante)
     try {
-      await fsCreate('documents/auth_events', {
+      await fsCreate('auth_events', {
         type: 'auth_google',
         rid: req.rid,
         trace_id: req.headers['x-trace-id'] || null,
@@ -388,7 +353,7 @@ async function handleAuthGoogle(req, res) {
         context: context || null,
         ua: req.headers['user-agent'] || null,
         origin: req.headers.origin || null,
-        ts: new Date() // backend time
+        ts: new Date()
       });
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, warn:'auth_event_log_failed', error:e.message || String(e) }));
@@ -401,8 +366,8 @@ async function handleAuthGoogle(req, res) {
     const msg = err?.message || String(err || '');
     let code = 'auth_failed';
     if (/Wrong recipient|audience/.test(msg)) code = 'audience_mismatch';
-    if (/expired/i.test(msg)) code = 'token_expired';
-    if (/invalid/i.test(msg)) code = 'invalid_token';
+    if (/expired/i.test(msg))               code = 'token_expired';
+    if (/invalid/i.test(msg))               code = 'invalid_token';
 
     console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:false, error: msg, code }));
     return res.status(401).json({ error: code });
@@ -429,7 +394,7 @@ app.post('/api/track', async (req, res) => {
     const { event, payload } = req.body || {};
     if (!event || typeof event !== 'string') return res.status(400).json({ ok:false, error:'missing_event' });
 
-    await fsCreate('documents/auth_events', {
+    await fsCreate('auth_events', {
       type: event,
       rid: req.rid,
       payload: payload || null,
@@ -450,15 +415,14 @@ app.post('/api/debug/ping-fs', async (req, res) => {
     const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
     if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) return res.status(403).json({ ok:false, error:'forbidden' });
 
-    const r = await fsCreate('documents/auth_events', {
+    const r = await fsCreate('auth_events', {
       type: 'debug_ping_fs',
       rid: req.rid,
       origin: req.headers.origin || null,
       ts: new Date()
     });
 
-    // r.name = full path do documento criado
-    const id = (r.name || '').split('/').pop() || null;
+    const id = (r.name || '').split('/').pop() || null; // id do doc criado
     return res.status(200).json({ ok:true, rid:req.rid, doc: id });
   } catch (e) {
     console.error(JSON.stringify({ route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) }));
