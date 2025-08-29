@@ -1,4 +1,4 @@
-# PZ gitignore – R2 • 2025-08-28
+# PZ gitignore – R3 • 2025-08-29
 # Mantém o projeto limpo e evita vazar segredos/artefatos locais.
 
 # ───────────────────────── Dependências ─────────────────────────
@@ -9,6 +9,10 @@ node_modules/
 .env
 .env.*
 !.env.example
+.env.local
+.env.development.local
+.env.production.local
+.env.test.local
 
 # ───────────────────────── Logs ──────────────────────────────────
 *.log
@@ -35,11 +39,13 @@ Thumbs.db
 
 # ───────────────────────── Credenciais Locais ────────────────────
 # (NUNCA commitar chaves de serviço; no Railway use vars de ambiente)
+sa.json
 serviceAccount*.json
 firebase-adminsdk*.json
 gcp-key.json
 google-credentials.json
 credentials.json
+*.key.json
 
 # ───────────────────────── Outros opcionais ──────────────────────
 # Arquivos de ferramenta/host que não fazem parte do app

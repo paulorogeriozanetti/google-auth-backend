@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Versão 1.5.0 – 2025-08-29
+ * PZ Auth+API Backend – Versão 1.5.1 – 2025-08-29
  *
  * Endpoints:
  * - Healthcheck:        GET/HEAD  /healthz          (alias: GET/HEAD /api/healthz)
@@ -11,11 +11,12 @@
  * - Track (opcional):   POST      /api/track        { event, payload? } -> grava em auth_events (se habilitado)
  * - CORS check (diag):  GET       /api/cors-check   -> echo de origin/permitido (sem persistir)
  * - FS ping (diag):     POST      /api/debug/ping-fs  (Requer X-Debug-Token == DEBUG_TOKEN)
+ * - SA env check (diag):GET       /api/debug/env-has-sa -> indica presença das VARs de credencial
  *
- * Novidades v1.5.0:
- *  - 🔌 Firestore agora inicializa via lib externa (./lib/firestore) lendo SA Base64/JSON automaticamente.
- *  - 📊 /api/version e logs reportam o modo real de auth do Firestore (service_account vs adc).
- *  - 🔁 Demais funcionalidades preservadas (CORS avançado, aliases, track, echo, ping-fs, logs, form-urlencoded).
+ * Novidades v1.5.1:
+ *  - 🧪 Endpoint de debug /api/debug/env-has-sa para validar se as VARs de Service Account
+ *    (FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 / FIREBASE_SERVICE_ACCOUNT_JSON) chegam ao runtime.
+ *  - 🔁 Demais funcionalidades preservadas (v1.5.0).
  */
 
 const express = require('express');
@@ -29,7 +30,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 const BUILD_DATE = '2025-08-29';
 
 const PORT = process.env.PORT || 8080;
@@ -209,6 +210,21 @@ app.get('/api/cors-check', (req, res) => {
     ua: req.headers['user-agent'] || null,
     ts: new Date().toISOString()
   });
+});
+
+/* ──────────────────────────────────────────────────────────────
+   3.1) Debug – Variáveis de credenciais (Service Account)
+─────────────────────────────────────────────────────────────── */
+app.get('/api/debug/env-has-sa', (_req, res) => {
+  const hasB64 = Boolean(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 &&
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64.length > 50
+  );
+  const hasJson = Boolean(
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON &&
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON.length > 50
+  );
+  res.status(200).json({ hasB64, hasJson });
 });
 
 /* ──────────────────────────────────────────────────────────────
