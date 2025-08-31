@@ -1,12 +1,13 @@
 /**
- * PZ Auth+API Backend – Versão 1.6.3 – 2025-08-29 – “Railway-FS-PathFix+Hardening”
+ * PZ Auth+API Backend – Versão 1.6.4 – 2025-08-31 – “SA-JSON-Direct+Compat”
  *
- * Diff funcional vs 1.6.2:
- *  - 🔧 Firestore REST: caminho unificado (sem "documents/" nos helpers; só no fullName do commit).
- *  - 🧱 Guard rails SA mantidos (erro claro quando GCP_* faltarem).
- *  - 🌐 CORS no topo (mesma política).
- *  - 🧪 Fallback de JSON quando Content-Type vem errado.
- *  - ⚡ fetch nativo (Node 18+) com fallback para node-fetch@3 (ESM).
+ * Diff funcional vs 1.6.3:
+ *  - 🔑 Novo suporte nativo a FIREBASE_SERVICE_ACCOUNT_JSON (JSON “puro” do sa.json).
+ *  - ↩️ Compatibilidade mantida com GCP_PROJECT_ID / GCP_SA_EMAIL / GCP_SA_PRIVATE_KEY.
+ *  - 🧭 Precedência: usa FIREBASE_SERVICE_ACCOUNT_JSON quando presente; senão, usa as variáveis GCP_*.
+ *  - 🩹 Normalização automática de \n na private_key caso o provedor injete sequências escapadas.
+ *
+ * Nenhuma outra funcionalidade foi alterada.
  */
 
 const express = require('express');
@@ -27,8 +28,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.6.3';
-const BUILD_DATE = '2025-08-29';
+const VERSION = '1.6.4';
+const BUILD_DATE = '2025-08-30';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -93,10 +94,34 @@ app.use(cors({
 
 /* ──────────────────────────────────────────────────────────────
    1.2) Firestore REST (Service Account)
+   Agora com suporte a FIREBASE_SERVICE_ACCOUNT_JSON (JSON puro).
+   Precedência: JSON > variáveis GCP_* (compat).
 ─────────────────────────────────────────────────────────────── */
-const GCP_PROJECT_ID     = process.env.GCP_PROJECT_ID || '';
-const GCP_SA_EMAIL       = process.env.GCP_SA_EMAIL || '';
-const GCP_SA_PRIVATE_KEY = (process.env.GCP_SA_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+let SA_SOURCE = 'split_env';
+let SA_JSON = null;
+
+const SA_RAW = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+if (SA_RAW) {
+  try {
+    SA_JSON = JSON.parse(SA_RAW);
+    SA_SOURCE = 'env_json';
+  } catch (e) {
+    console.error('[FS] FIREBASE_SERVICE_ACCOUNT_JSON inválido (JSON parse falhou):', e?.message || e);
+  }
+}
+
+// Valores base vindos do JSON (se houver)
+let GCP_PROJECT_ID     = SA_JSON?.project_id || '';
+let GCP_SA_EMAIL       = SA_JSON?.client_email || SA_JSON?.client_email; // mesma key
+let GCP_SA_PRIVATE_KEY = SA_JSON?.private_key || '';
+
+// Compatibilidade: se variáveis GCP_* existirem, elas têm prioridade final
+GCP_PROJECT_ID     = process.env.GCP_PROJECT_ID     || GCP_PROJECT_ID || '';
+GCP_SA_EMAIL       = process.env.GCP_SA_EMAIL       || GCP_SA_EMAIL   || '';
+GCP_SA_PRIVATE_KEY = process.env.GCP_SA_PRIVATE_KEY || GCP_SA_PRIVATE_KEY || '';
+
+// Normaliza quebra de linha quando veio escapada como "\\n"
+if (GCP_SA_PRIVATE_KEY) GCP_SA_PRIVATE_KEY = String(GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n');
 
 const FS_BASE  = `https://firestore.googleapis.com/v1/projects/${GCP_PROJECT_ID}/databases/(default)`;
 const FS_SCOPE = 'https://www.googleapis.com/auth/datastore';
@@ -113,13 +138,15 @@ function makeDocFullName(collectionPath, id) {
 }
 
 function ensureSA() {
-  if (!GCP_PROJECT_ID || !GCP_SA_EMAIL || !GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY')) {
-    const miss = {
-      project: !!GCP_PROJECT_ID, email: !!GCP_SA_EMAIL, key: !!GCP_SA_PRIVATE_KEY
-    };
-    const msg = `[FS] Service Account config incompleta: ${JSON.stringify(miss)}`;
+  const miss = {
+    project: !!GCP_PROJECT_ID,
+    email  : !!GCP_SA_EMAIL,
+    key    : !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY')
+  };
+  if (!miss.project || !miss.email || !miss.key) {
+    const msg = `[FS] Service Account config incompleta: ${JSON.stringify(miss)} (source=${SA_SOURCE})`;
     console.error(msg);
-    throw Object.assign(new Error('sa_not_configured'), { code: 'sa_not_configured', meta: miss });
+    throw Object.assign(new Error('sa_not_configured'), { code: 'sa_not_configured', meta: { ...miss, source: SA_SOURCE } });
   }
 }
 
@@ -274,7 +301,8 @@ app.get('/api/version', (_req, res) => {
     firestore_auth_mode: 'REST+ServiceAccount',
     has_cookie_parser: Boolean(cookieParser),
     project_id: GCP_PROJECT_ID,
-    sa_email: !!GCP_SA_EMAIL
+    sa_email: !!GCP_SA_EMAIL,
+    sa_source: SA_SOURCE
   });
 });
 
@@ -296,7 +324,7 @@ app.get('/api/debug/env-has-sa', (_req, res) => {
   const hasProj  = !!GCP_PROJECT_ID;
   const hasEmail = !!GCP_SA_EMAIL;
   const hasKey   = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY');
-  res.status(200).json({ hasProj, hasEmail, hasKey });
+  res.status(200).json({ hasProj, hasEmail, hasKey, sa_source: SA_SOURCE });
 });
 
 /* ──────────────────────────────────────────────────────────────
@@ -488,7 +516,7 @@ app.listen(PORT, () => {
   console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
   console.log('   FIRESTORE auth mode        : REST+ServiceAccount');
   console.log('   PROJECT_ID                 :', GCP_PROJECT_ID);
-  console.log('   SA_EMAIL set               :', !!GCP_SA_EMAIL);
+  console.log('   SA_EMAIL set               :', !!GCP_SA_EMAIL, `(source=${SA_SOURCE})`);
   console.log('   HAS cookie-parser          :', Boolean(cookieParser));
   console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────────────────────');
