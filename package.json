@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.6.5-2025-09-01-railway-sa-json-direct-compat",
-  "version": "1.6.5-2025-08-31",
-  "description": "PZ Auth+API Backend – v1.6.5 – 2025-08-31 – SA-JSON-Direct+Compat (suporte nativo a FIREBASE_SERVICE_ACCOUNT_JSON “puro”, compat c/ variáveis GCP_*; Google One Tap AUTH; Firestore via REST/Service Account; fetch nativo com fallback; CORS no topo; fallback de JSON).",
+  "name": "pz-authapi-backend-v1.7.0-2025-09-01-adminsdk-directwrite",
+  "version": "1.7.0-2025-09-01",
+  "description": "PZ Auth+API Backend – v1.7.0 – 2025-09-01 – AdminSDK-DirectWrite (substitui escrita REST por Firebase Admin SDK; mantém Google One Tap AUTH, endpoints de debug/health, CORS no topo, fetch nativo com fallback, fallback de JSON).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -17,6 +17,7 @@
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.18.3",
+    "firebase-admin": "^12.5.0",
     "google-auth-library": "^10.2.0",
     "node-fetch": "^3.3.2"
   }

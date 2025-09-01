@@ -1,11 +1,15 @@
 /**
- * PZ Auth+API Backend – Versão 1.7.0 – 2025-09-01 – “AdminSDK-DirectWrite”
+ * PZ Auth+API Backend – Versão 1.6.5 – 2025-09-01 – “FS-Debug+SA-Compat”
  *
- * Mudanças principais vs 1.6.5 (“FS-Debug+SA-Compat”):
- *  - 🛠️ Substitui a escrita REST customizada do Firestore pelo **Firebase Admin SDK** (Node.js).
- *  - 🧭 Mantém todos endpoints e comportamentos (One Tap, tracking, debug, health, versão).
- *  - 🩺 Endpoints de debug preservados; `/api/debug/fs-token` continua disponível para inspeção do token SA.
- *  - ⏱️ Campos de tempo agora usam `FieldValue.serverTimestamp()` (relogio do servidor Firestore).
+ * Diff funcional vs 1.6.4 (“SA-JSON-Direct+Compat”):
+ *  - 🧰 Logs de Firestore muito mais verbosos (status + corpo da resposta em falhas).
+ *  - 🩺 Endpoints de diagnóstico (protegidos por DEBUG_TOKEN):
+ *      - GET  /api/debug/fs-token     → valida SA, escopo e expiração do token.
+ *      - POST /api/debug/fs-write     → tenta escrever em auth_events e retorna id/erro detalhado.
+ *      - POST /api/debug/ping-fs      → agora aceita ?verbose=1 (ou header X-Debug-Verbose: 1)
+ *        e retorna motivo detalhado em caso de erro.
+ *  - 🔐 Nenhum segredo é exposto em respostas públicas; detalhes só com DEBUG_TOKEN.
+ *  - 🔑 Suporte a FIREBASE_SERVICE_ACCOUNT_JSON “puro” preservado; compat GCP_* mantida.
  */
 
 const express = require('express');
@@ -15,9 +19,8 @@ try { cookieParser = require('cookie-parser'); }
 catch (_) { console.warn('[BOOT] cookie-parser não encontrado; usando parser leve de header (fallback).'); }
 
 const { OAuth2Client, JWT } = require('google-auth-library');
-const admin = require('firebase-admin');
 
-// fetch (apenas se necessário em futuras chamadas externas)
+// fetch robusto (nativo primeiro; fallback ESM)
 const fetch = (typeof globalThis.fetch === 'function')
   ? globalThis.fetch.bind(globalThis)
   : ((...args) => import('node-fetch').then(({ default: f }) => f(...args)));
@@ -27,7 +30,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.7.0';
+const VERSION = '1.6.5';
 const BUILD_DATE = '2025-09-01';
 const PORT = process.env.PORT || 8080;
 
@@ -93,29 +96,47 @@ app.use(cors({
 }));
 
 /* ──────────────────────────────────────────────────────────────
-   1.2) Service Account / Firebase Admin SDK
+   1.2) Firestore REST (Service Account) – JSON puro + compat
 ─────────────────────────────────────────────────────────────── */
 let SA_SOURCE = 'split_env';
 let SA_JSON = null;
 
 const SA_RAW = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 if (SA_RAW) {
-  try { SA_JSON = JSON.parse(SA_RAW); SA_SOURCE = 'env_json'; }
-  catch (e) { console.error('[FS] FIREBASE_SERVICE_ACCOUNT_JSON inválido:', e?.message || e); }
+  try {
+    SA_JSON = JSON.parse(SA_RAW);
+    SA_SOURCE = 'env_json';
+  } catch (e) {
+    console.error('[FS] FIREBASE_SERVICE_ACCOUNT_JSON inválido (JSON parse falhou):', e?.message || e);
+  }
 }
 
-// Base via JSON (se houver)
+// Valores base vindos do JSON (se houver)
 let GCP_PROJECT_ID     = SA_JSON?.project_id    || '';
 let GCP_SA_EMAIL       = SA_JSON?.client_email  || '';
 let GCP_SA_PRIVATE_KEY = SA_JSON?.private_key   || '';
 
-// Compatibilidade: variáveis GCP_* têm prioridade final
+// Compatibilidade: se variáveis GCP_* existirem, têm prioridade final
 GCP_PROJECT_ID     = process.env.GCP_PROJECT_ID     || GCP_PROJECT_ID || '';
 GCP_SA_EMAIL       = process.env.GCP_SA_EMAIL       || GCP_SA_EMAIL   || '';
 GCP_SA_PRIVATE_KEY = process.env.GCP_SA_PRIVATE_KEY || GCP_SA_PRIVATE_KEY || '';
 
-// Normaliza "\n" na private key
+// Normaliza quebra de linha quando veio escapada como "\\n"
 if (GCP_SA_PRIVATE_KEY) GCP_SA_PRIVATE_KEY = String(GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n');
+
+const FS_BASE  = `https://firestore.googleapis.com/v1/projects/${GCP_PROJECT_ID}/databases/(default)`;
+const FS_SCOPE = 'https://www.googleapis.com/auth/datastore';
+
+// Normaliza caminhos: remove barras extras e prefixo "documents/"
+function normalizePath(p) {
+  return String(p || '').replace(/^\/+|\/+$/g, '').replace(/^documents\//, '');
+}
+
+// Gera o "full document name" para APIs que exigem (ex.: transforms)
+function makeDocFullName(collectionPath, id) {
+  const col = normalizePath(collectionPath);
+  return `${FS_BASE}/documents/${col}/${encodeURIComponent(String(id))}`;
+}
 
 function ensureSA() {
   const miss = {
@@ -124,46 +145,117 @@ function ensureSA() {
     key    : !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY')
   };
   if (!miss.project || !miss.email || !miss.key) {
-    const msg = `[FS] Service Account incompleta: ${JSON.stringify(miss)} (source=${SA_SOURCE})`;
+    const msg = `[FS] Service Account config incompleta: ${JSON.stringify(miss)} (source=${SA_SOURCE})`;
     console.error(msg);
-    const err = new Error('sa_not_configured');
-    err.code = 'sa_not_configured';
-    err.meta = { ...miss, source: SA_SOURCE };
-    throw err;
+    throw Object.assign(new Error('sa_not_configured'), { code: 'sa_not_configured', meta: { ...miss, source: SA_SOURCE } });
   }
 }
 
-/** Inicializa Firebase Admin SDK apenas uma vez */
-let _adminInited = false;
-function initAdmin() {
-  if (_adminInited) return;
+// Auth com retorno expandido (inclui expiry_date)
+async function getSAClient() {
   ensureSA();
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: GCP_PROJECT_ID,
-      clientEmail: GCP_SA_EMAIL,
-      privateKey: GCP_SA_PRIVATE_KEY
-    }),
-    projectId: GCP_PROJECT_ID
-  });
-  _adminInited = true;
-  console.log('[ADMIN] Firebase Admin inicializado (project:', GCP_PROJECT_ID, ')');
+  return new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
 }
 
-function getDB() {
-  initAdmin();
-  return admin.firestore();
-}
-
-const FieldValue = admin.firestore.FieldValue;
-
-/** Para diagnóstico de token SA (mesmo usando Admin SDK) */
-const FS_SCOPE = 'https://www.googleapis.com/auth/datastore';
-async function getSATokenDiag() {
-  ensureSA();
-  const client = new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
-  const { token, expiry_date } = await client.authorize();
+async function getSAToken() {
+  const client = await getSAClient();
+  const { token, res, expiry_date } = await client.authorize();
+  // Guardamos info útil para diagnósticos
   return { token, expiry_date: expiry_date || null };
+}
+
+// Converte JS → Firestore Value
+function fsVal(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'string')  return { stringValue: v };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number')  return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (v instanceof Date)      return { timestampValue: v.toISOString() };
+  if (typeof v === 'object') {
+    const fields = {}; for (const k of Object.keys(v)) fields[k] = fsVal(v[k]);
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(v) };
+}
+
+/* Helpers de Firestore com logs detalhados */
+async function fsCreate(collectionPath, data) {
+  const { token } = await getSAToken();
+  const col = normalizePath(collectionPath);
+  const url = `${FS_BASE}/documents/${col}`;
+  const body = { fields: {} };
+  for (const k of Object.keys(data)) body.fields[k] = fsVal(data[k]);
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsCreate ${col} failed: ${r.status} ${t}`;
+    console.error('[FS][CREATE][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
+  return r.json();
+}
+
+async function fsUpsert(docPath, data) {
+  const { token } = await getSAToken();
+  const doc = normalizePath(docPath);
+  const url = new URL(`${FS_BASE}/documents/${doc}`);
+  url.searchParams.set('allowMissing', 'true');
+
+  const fields = Object.keys(data);
+  fields.forEach(f => url.searchParams.append('updateMask.fieldPaths', f));
+
+  const body = { fields: {} };
+  for (const k of fields) body.fields[k] = fsVal(data[k]);
+
+  const r = await fetch(url.toString(), {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsUpsert ${doc} failed: ${r.status} ${t}`;
+    console.error('[FS][UPSERT][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
+  return r.json();
+}
+
+async function fsCommitTransforms(docFullName, fieldPaths = []) {
+  if (!fieldPaths.length) return;
+  const { token } = await getSAToken();
+  const url = `${FS_BASE}/documents:commit`;
+  const writes = [{
+    transform: {
+      document: docFullName,
+      fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' }))
+    }
+  }];
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes })
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsCommitTransforms failed: ${r.status} ${t}`;
+    console.error('[FS][COMMIT][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
+  return r.json();
+}
+
+async function safeText(resp) {
+  try { return await resp.text(); } catch { return '(no-body)'; }
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -185,11 +277,11 @@ if (cookieParser) {
   });
 }
 
-// Body parsers
+// Body parsers (robustos)
 app.use(express.json({ limit: '2mb', type: ['application/json', 'application/*+json'] }));
 app.use(express.urlencoded({ extended: true }));
 
-// Fallback para corpo raw→JSON
+// Fallback: se body veio como string/sem Content-Type, tenta JSON
 app.use((req, _res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return next();
@@ -249,7 +341,7 @@ app.get('/api/version', (_req, res) => {
     track_open: TRACK_OPEN,
     has_track_token: Boolean(TRACK_TOKEN),
     debug_ping_enabled: Boolean(DEBUG_TOKEN),
-    firestore_auth_mode: 'AdminSDK',
+    firestore_auth_mode: 'REST+ServiceAccount',
     has_cookie_parser: Boolean(cookieParser),
     project_id: GCP_PROJECT_ID,
     sa_email: !!GCP_SA_EMAIL,
@@ -287,16 +379,17 @@ app.get('/api/debug/env-has-sa', (_req, res) => {
   res.status(200).json({ hasProj, hasEmail, hasKey, sa_source: SA_SOURCE });
 });
 
-// Diagnóstico do token do SA
+// Novo: detalha token e expiração
 app.get('/api/debug/fs-token', async (req, res) => {
   if (!assertDebugAccess(req, res)) return;
   try {
-    const { expiry_date } = await getSATokenDiag();
+    const client = await getSAClient();
+    const { token, res: rawRes, expiry_date } = await client.authorize();
     const expires_in_s = expiry_date ? Math.max(0, Math.floor((expiry_date - Date.now())/1000)) : null;
     res.status(200).json({
       ok: true,
       project_id: GCP_PROJECT_ID,
-      sa_email: !!GCP_SA_EMAIL,
+      sa_email: GCP_SA_EMAIL ? true : false,
       scope: FS_SCOPE,
       expiry_date,
       expires_in_s
@@ -306,18 +399,18 @@ app.get('/api/debug/fs-token', async (req, res) => {
   }
 });
 
-// Tentativa de escrita com retorno detalhado
+// Novo: tentativa de escrita com retorno detalhado
 app.post('/api/debug/fs-write', async (req, res) => {
   if (!assertDebugAccess(req, res)) return;
   try {
-    const db = getDB();
-    const r = await db.collection('auth_events').add({
+    const r = await fsCreate('auth_events', {
       type: 'debug_write',
       rid: req.rid,
       note: (req.body && req.body.note) || 'manual',
-      ts: FieldValue.serverTimestamp()
+      ts: new Date()
     });
-    res.status(200).json({ ok:true, rid:req.rid, doc:r.id });
+    const id = (r.name || '').split('/').pop() || null;
+    res.status(200).json({ ok:true, rid:req.rid, doc:id });
   } catch (e) {
     res.status(500).json({ ok:false, rid:req.rid, error: e.message || String(e) });
   }
@@ -390,26 +483,21 @@ async function handleAuthGoogle(req, res) {
     const { sub, email, name, picture, email_verified } = payload;
     const user_id = String(sub);
 
-    // Upsert user (Admin SDK) – merge + serverTimestamp() em last_seen/updated_at
+    // Upsert user (REST) – merge + REQUEST_TIME em last_seen/updated_at
     try {
-      const db = getDB();
-      const docRef = db.collection('users').doc(user_id);
-      await docRef.set({
+      await fsUpsert(`users/${encodeURIComponent(user_id)}`, {
         user_id, sub, email: email || null, name: name || null, picture: picture || null,
         email_verified: !!email_verified
-      }, { merge: true });
-      await docRef.set({
-        last_seen : FieldValue.serverTimestamp(),
-        updated_at: FieldValue.serverTimestamp()
-      }, { merge: true });
+      });
+      const docName = makeDocFullName('users', user_id);
+      await fsCommitTransforms(docName, ['last_seen', 'updated_at']);
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, ok:true, warn:'firestore_upsert_failed', error:e.message || String(e) }));
     }
 
     // Event (não bloqueante)
     try {
-      const db = getDB();
-      await db.collection('auth_events').add({
+      await fsCreate('auth_events', {
         type: 'auth_google',
         rid: req.rid,
         trace_id: req.headers['x-trace-id'] || null,
@@ -418,7 +506,7 @@ async function handleAuthGoogle(req, res) {
         context: context || null,
         ua: req.headers['user-agent'] || null,
         origin: req.headers.origin || null,
-        ts: FieldValue.serverTimestamp()
+        ts: new Date()
       });
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, warn:'auth_event_log_failed', error:e.message || String(e) }));
@@ -458,14 +546,13 @@ app.post('/api/track', async (req, res) => {
     const { event, payload } = req.body || {};
     if (!event || typeof event !== 'string') return res.status(400).json({ ok:false, error:'missing_event' });
 
-    const db = getDB();
-    await db.collection('auth_events').add({
+    await fsCreate('auth_events', {
       type: event,
       rid: req.rid,
       payload: payload || null,
       origin: req.headers.origin || null,
       ua: req.headers['user-agent'] || null,
-      ts: FieldValue.serverTimestamp()
+      ts: new Date()
     });
 
     return res.status(200).json({ ok:true, rid:req.rid });
@@ -475,22 +562,22 @@ app.post('/api/track', async (req, res) => {
   }
 });
 
-/* Atualizado: aceita verbose=1 para detalhes do erro */
+/* atualizado: aceita verbose=1 para detalhes do erro */
 app.post('/api/debug/ping-fs', async (req, res) => {
   const verbose = (String(req.query.verbose || req.headers['x-debug-verbose'] || '') === '1');
   try {
     const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
     if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) return res.status(403).json({ ok:false, error:'forbidden' });
 
-    const db = getDB();
-    const r = await db.collection('auth_events').add({
+    const r = await fsCreate('auth_events', {
       type: 'debug_ping_fs',
       rid: req.rid,
       origin: req.headers.origin || null,
-      ts: FieldValue.serverTimestamp()
+      ts: new Date()
     });
 
-    return res.status(200).json({ ok:true, rid:req.rid, doc: r.id });
+    const id = (r.name || '').split('/').pop() || null;
+    return res.status(200).json({ ok:true, rid:req.rid, doc: id });
   } catch (e) {
     const payload = { route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) };
     console.error(JSON.stringify(payload));
@@ -519,7 +606,7 @@ app.listen(PORT, () => {
   console.log('   TRACK_OPEN                 :', TRACK_OPEN);
   console.log('   TRACK_TOKEN set            :', Boolean(TRACK_TOKEN));
   console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
-  console.log('   FIRESTORE auth mode        : AdminSDK');
+  console.log('   FIRESTORE auth mode        : REST+ServiceAccount');
   console.log('   PROJECT_ID                 :', GCP_PROJECT_ID);
   console.log('   SA_EMAIL set               :', !!GCP_SA_EMAIL, `(source=${SA_SOURCE})`);
   console.log('   HAS cookie-parser          :', Boolean(cookieParser));
