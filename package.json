@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.6.4-2025-08-31-railway-sa-json-or-b64",
-  "version": "1.6.4-2025-08-30",
-  "description": "PZ Auth+API Backend – v1.6.4 – 2025-08-30 – Railway-SA-JSON (suporte a FIREBASE_SERVICE_ACCOUNT_JSON puro ou *_BASE64; Google One Tap AUTH; Firestore via REST/Service Account; fetch nativo com fallback; CORS no topo; fallback de JSON).",
+  "name": "pz-authapi-backend-v1.6.5-2025-09-01-railway-sa-json-direct-compat",
+  "version": "1.6.5-2025-08-31",
+  "description": "PZ Auth+API Backend – v1.6.5 – 2025-08-31 – SA-JSON-Direct+Compat (suporte nativo a FIREBASE_SERVICE_ACCOUNT_JSON “puro”, compat c/ variáveis GCP_*; Google One Tap AUTH; Firestore via REST/Service Account; fetch nativo com fallback; CORS no topo; fallback de JSON).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -1,13 +1,15 @@
 /**
- * PZ Auth+API Backend – Versão 1.6.4 – 2025-08-31 – “SA-JSON-Direct+Compat”
+ * PZ Auth+API Backend – Versão 1.6.5 – 2025-09-01 – “FS-Debug+SA-Compat”
  *
- * Diff funcional vs 1.6.3:
- *  - 🔑 Novo suporte nativo a FIREBASE_SERVICE_ACCOUNT_JSON (JSON “puro” do sa.json).
- *  - ↩️ Compatibilidade mantida com GCP_PROJECT_ID / GCP_SA_EMAIL / GCP_SA_PRIVATE_KEY.
- *  - 🧭 Precedência: usa FIREBASE_SERVICE_ACCOUNT_JSON quando presente; senão, usa as variáveis GCP_*.
- *  - 🩹 Normalização automática de \n na private_key caso o provedor injete sequências escapadas.
- *
- * Nenhuma outra funcionalidade foi alterada.
+ * Diff funcional vs 1.6.4 (“SA-JSON-Direct+Compat”):
+ *  - 🧰 Logs de Firestore muito mais verbosos (status + corpo da resposta em falhas).
+ *  - 🩺 Endpoints de diagnóstico (protegidos por DEBUG_TOKEN):
+ *      - GET  /api/debug/fs-token     → valida SA, escopo e expiração do token.
+ *      - POST /api/debug/fs-write     → tenta escrever em auth_events e retorna id/erro detalhado.
+ *      - POST /api/debug/ping-fs      → agora aceita ?verbose=1 (ou header X-Debug-Verbose: 1)
+ *        e retorna motivo detalhado em caso de erro.
+ *  - 🔐 Nenhum segredo é exposto em respostas públicas; detalhes só com DEBUG_TOKEN.
+ *  - 🔑 Suporte a FIREBASE_SERVICE_ACCOUNT_JSON “puro” preservado; compat GCP_* mantida.
  */
 
 const express = require('express');
@@ -28,8 +30,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.6.4';
-const BUILD_DATE = '2025-08-30';
+const VERSION = '1.6.5';
+const BUILD_DATE = '2025-09-01';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -87,15 +89,14 @@ app.use(cors({
     'X-PZ-Version','x-pz-version',
     'X-Trace-Id','x-trace-id',
     'X-Api-Token','x-api-token',
-    'X-Debug-Token','x-debug-token'
+    'X-Debug-Token','x-debug-token',
+    'X-Debug-Verbose','x-debug-verbose'
   ],
   optionsSuccessStatus: 204
 }));
 
 /* ──────────────────────────────────────────────────────────────
-   1.2) Firestore REST (Service Account)
-   Agora com suporte a FIREBASE_SERVICE_ACCOUNT_JSON (JSON puro).
-   Precedência: JSON > variáveis GCP_* (compat).
+   1.2) Firestore REST (Service Account) – JSON puro + compat
 ─────────────────────────────────────────────────────────────── */
 let SA_SOURCE = 'split_env';
 let SA_JSON = null;
@@ -111,11 +112,11 @@ if (SA_RAW) {
 }
 
 // Valores base vindos do JSON (se houver)
-let GCP_PROJECT_ID     = SA_JSON?.project_id || '';
-let GCP_SA_EMAIL       = SA_JSON?.client_email || SA_JSON?.client_email; // mesma key
-let GCP_SA_PRIVATE_KEY = SA_JSON?.private_key || '';
+let GCP_PROJECT_ID     = SA_JSON?.project_id    || '';
+let GCP_SA_EMAIL       = SA_JSON?.client_email  || '';
+let GCP_SA_PRIVATE_KEY = SA_JSON?.private_key   || '';
 
-// Compatibilidade: se variáveis GCP_* existirem, elas têm prioridade final
+// Compatibilidade: se variáveis GCP_* existirem, têm prioridade final
 GCP_PROJECT_ID     = process.env.GCP_PROJECT_ID     || GCP_PROJECT_ID || '';
 GCP_SA_EMAIL       = process.env.GCP_SA_EMAIL       || GCP_SA_EMAIL   || '';
 GCP_SA_PRIVATE_KEY = process.env.GCP_SA_PRIVATE_KEY || GCP_SA_PRIVATE_KEY || '';
@@ -150,12 +151,17 @@ function ensureSA() {
   }
 }
 
-// Gera access token via Service Account
-async function getSAToken() {
+// Auth com retorno expandido (inclui expiry_date)
+async function getSAClient() {
   ensureSA();
-  const client = new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
-  const { token } = await client.authorize();
-  return token;
+  return new JWT({ email: GCP_SA_EMAIL, key: GCP_SA_PRIVATE_KEY, scopes: [FS_SCOPE] });
+}
+
+async function getSAToken() {
+  const client = await getSAClient();
+  const { token, res, expiry_date } = await client.authorize();
+  // Guardamos info útil para diagnósticos
+  return { token, expiry_date: expiry_date || null };
 }
 
 // Converte JS → Firestore Value
@@ -172,37 +178,59 @@ function fsVal(v) {
   return { stringValue: String(v) };
 }
 
-// Create (auto-id): POST /documents/{collection}
+/* Helpers de Firestore com logs detalhados */
 async function fsCreate(collectionPath, data) {
-  const token = await getSAToken();
+  const { token } = await getSAToken();
   const col = normalizePath(collectionPath);
   const url = `${FS_BASE}/documents/${col}`;
   const body = { fields: {} };
   for (const k of Object.keys(data)) body.fields[k] = fsVal(data[k]);
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error(`fsCreate ${col} failed: ${r.status} ${await r.text()}`);
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsCreate ${col} failed: ${r.status} ${t}`;
+    console.error('[FS][CREATE][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
   return r.json();
 }
 
-// Upsert (merge): PATCH /documents/{docPath}?allowMissing=true&updateMask.fieldPaths=...
 async function fsUpsert(docPath, data) {
-  const token = await getSAToken();
+  const { token } = await getSAToken();
   const doc = normalizePath(docPath);
   const url = new URL(`${FS_BASE}/documents/${doc}`);
   url.searchParams.set('allowMissing', 'true');
+
   const fields = Object.keys(data);
   fields.forEach(f => url.searchParams.append('updateMask.fieldPaths', f));
+
   const body = { fields: {} };
   for (const k of fields) body.fields[k] = fsVal(data[k]);
-  const r = await fetch(url.toString(), { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error(`fsUpsert ${doc} failed: ${r.status} ${await r.text()}`);
+
+  const r = await fetch(url.toString(), {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsUpsert ${doc} failed: ${r.status} ${t}`;
+    console.error('[FS][UPSERT][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
   return r.json();
 }
 
-// Commit com transform REQUEST_TIME: POST /documents:commit
 async function fsCommitTransforms(docFullName, fieldPaths = []) {
   if (!fieldPaths.length) return;
-  const token = await getSAToken();
+  const { token } = await getSAToken();
   const url = `${FS_BASE}/documents:commit`;
   const writes = [{
     transform: {
@@ -210,9 +238,24 @@ async function fsCommitTransforms(docFullName, fieldPaths = []) {
       fieldTransforms: fieldPaths.map(fp => ({ fieldPath: fp, setToServerValue: 'REQUEST_TIME' }))
     }
   }];
-  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ writes }) });
-  if (!r.ok) throw new Error(`fsCommitTransforms failed: ${r.status} ${await r.text()}`);
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes })
+  });
+
+  if (!r.ok) {
+    const t = await safeText(r);
+    const errMsg = `fsCommitTransforms failed: ${r.status} ${t}`;
+    console.error('[FS][COMMIT][ERR]', errMsg);
+    throw new Error(errMsg);
+  }
   return r.json();
+}
+
+async function safeText(resp) {
+  try { return await resp.text(); } catch { return '(no-body)'; }
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -318,13 +361,59 @@ app.get('/api/cors-check', (req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────
-   3.1) Debug – Credenciais SA
+   3.1) Debug – Credenciais SA / Firestore (protegido)
 ─────────────────────────────────────────────────────────────── */
+function assertDebugAccess(req, res) {
+  const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
+  if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) {
+    res.status(403).json({ ok:false, error:'forbidden' });
+    return false;
+  }
+  return true;
+}
+
 app.get('/api/debug/env-has-sa', (_req, res) => {
   const hasProj  = !!GCP_PROJECT_ID;
   const hasEmail = !!GCP_SA_EMAIL;
   const hasKey   = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY');
   res.status(200).json({ hasProj, hasEmail, hasKey, sa_source: SA_SOURCE });
+});
+
+// Novo: detalha token e expiração
+app.get('/api/debug/fs-token', async (req, res) => {
+  if (!assertDebugAccess(req, res)) return;
+  try {
+    const client = await getSAClient();
+    const { token, res: rawRes, expiry_date } = await client.authorize();
+    const expires_in_s = expiry_date ? Math.max(0, Math.floor((expiry_date - Date.now())/1000)) : null;
+    res.status(200).json({
+      ok: true,
+      project_id: GCP_PROJECT_ID,
+      sa_email: GCP_SA_EMAIL ? true : false,
+      scope: FS_SCOPE,
+      expiry_date,
+      expires_in_s
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e.message || String(e) });
+  }
+});
+
+// Novo: tentativa de escrita com retorno detalhado
+app.post('/api/debug/fs-write', async (req, res) => {
+  if (!assertDebugAccess(req, res)) return;
+  try {
+    const r = await fsCreate('auth_events', {
+      type: 'debug_write',
+      rid: req.rid,
+      note: (req.body && req.body.note) || 'manual',
+      ts: new Date()
+    });
+    const id = (r.name || '').split('/').pop() || null;
+    res.status(200).json({ ok:true, rid:req.rid, doc:id });
+  } catch (e) {
+    res.status(500).json({ ok:false, rid:req.rid, error: e.message || String(e) });
+  }
 });
 
 /* ──────────────────────────────────────────────────────────────
@@ -473,7 +562,9 @@ app.post('/api/track', async (req, res) => {
   }
 });
 
+/* atualizado: aceita verbose=1 para detalhes do erro */
 app.post('/api/debug/ping-fs', async (req, res) => {
+  const verbose = (String(req.query.verbose || req.headers['x-debug-verbose'] || '') === '1');
   try {
     const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
     if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) return res.status(403).json({ ok:false, error:'forbidden' });
@@ -488,9 +579,10 @@ app.post('/api/debug/ping-fs', async (req, res) => {
     const id = (r.name || '').split('/').pop() || null;
     return res.status(200).json({ ok:true, rid:req.rid, doc: id });
   } catch (e) {
-    console.error(JSON.stringify({ route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) }));
+    const payload = { route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) };
+    console.error(JSON.stringify(payload));
     if (e.code === 'sa_not_configured') return res.status(503).json({ ok:false, error:'sa_not_configured', meta:e.meta });
-    return res.status(500).json({ ok:false, error:'ping_failed' });
+    return res.status(500).json(verbose ? { ok:false, ...payload } : { ok:false, error:'ping_failed' });
   }
 });
 
