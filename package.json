@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.9.0-2025-09-06-dailyfacts-directwrite",
-  "version": "1.9.0-2025-09-10",
-  "description": "PZ Auth+API Backend – v1.9.0 – 2025-09-10 – DailyFacts-DirectWrite (Lógica de escrita alterada para usar um novo documento por evento para maior robustez e compatibilidade com o ambiente de produção).",
+  "name": "pz-authapi-backend-v1.9.1-2025-09-06-dailyfacts-saferwrite",
+  "version": "1.9.1-2025-09-11",
+  "description": "PZ Auth+API Backend – v1.9.1 – 2025-09-06 – DailyFacts-SaferWrite (Versão com sanitização reforçada na escrita de documentos para resolver falhas de argumento inválido no Firestore).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

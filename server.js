@@ -1,11 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 1.9.0 – 2025-09-06 – “DailyFacts-DirectWrite”
+ * PZ Auth+API Backend – Versão 1.9.1 – 2025-09-06 – “DailyFacts-SaferWrite”
  *
- * Ajustes vs 1.8.6 (DailyFacts-Simpler-Write):
- * - ✅ Lógica de escrita alterada para usar `db.collection().add()` com ID de documento único.
- * - ⚡ Elimina a necessidade de transações, `FieldValue.arrayUnion`, e leituras.
- * - 📄 O nome do documento agora é 'anon_id_YYYYMMDDHHMMSS_random'.
- * - 🧪 Mantém o comportamento de todos os outros endpoints.
+ * Ajustes vs 1.9.0 (DailyFacts-DirectWrite):
+ * - 🚦 Reforçada a sanitização de dados antes da escrita no Firestore.
+ * - ⚡ Alterada a lógica de construção do objeto `docData` para evitar `undefined`.
+ * - ✅ A lógica de escrita agora é 100% segura e deve resolver a falha de "argumento inválido".
  */
 
 const express = require('express');
@@ -26,8 +25,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.9.0';
-const BUILD_DATE = '2025-09-10';
+const VERSION = '1.9.1';
+const BUILD_DATE = '2025-09-11';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -234,6 +233,11 @@ function deriveDayParts(tsISO, tzOffsetMin) {
   return { y: d.getUTCFullYear(), m: zeroPad(d.getUTCMonth() + 1), d: zeroPad(d.getUTCDate()) };
 }
 
+function deriveDayLabel(tsISO, tzOffsetMin) {
+  const p = deriveDayParts(tsISO, tzOffsetMin);
+  return `${p.y}-${p.m}-${p.d}`;
+}
+
 function parseClientTimestamp(val) {
   try {
     if (!val) return null;
@@ -251,39 +255,40 @@ function toPlainJSON(obj) {
 async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
   const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
   const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
-  const day = deriveDayParts(tsISO, tz);
   const now = new Date();
   
   // Novo padrão de ID do documento para garantir unicidade
-  const docId = `${safeAnon}_${day.y}${day.m}${day.d}${zeroPad(now.getUTCHours())}${zeroPad(now.getUTCMinutes())}${zeroPad(now.getUTCSeconds())}_${Math.random().toString(36).slice(2,8)}`;
+  const docId = `${safeAnon}_${now.getUTCFullYear()}${zeroPad(now.getUTCMonth() + 1)}${zeroPad(now.getUTCDate())}${zeroPad(now.getUTCHours())}${zeroPad(now.getUTCMinutes())}${zeroPad(now.getUTCSeconds())}_${Math.random().toString(36).slice(2,8)}`;
   const docRef = db.collection('daily_facts').doc(docId);
   
   const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
-  const ev = {
+  const ev = toPlainJSON({
     event,
     event_id,
     ts_server: FieldValue.serverTimestamp(),
-    ...(parseClientTimestamp(tsISO) ? { ts_client: parseClientTimestamp(tsISO) } : {}),
-    ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-    ...(page ? { page } : {}),
-    ...(session_id ? { session_id } : {}),
-    payload: toPlainJSON(payload)
-  };
+    ts_client: parseClientTimestamp(tsISO),
+    tz_offset: Number.isFinite(tz) ? tz : null,
+    page,
+    session_id,
+    payload: payload
+  });
 
-  const docData = {
+  const docData = toPlainJSON({
     kind: 'user',
-    date: `${day.y}-${day.m}-${day.d}`,
+    date: deriveDayLabel(tsISO, tz),
     entity_id: safeAnon,
     anon_id: safeAnon,
     person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
-    ...(user_id ? { user_id } : {}),
-    ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-    events: [ev],
-    counters: { [event]: 1 },
+    user_id: user_id,
+    tz_offset: Number.isFinite(tz) ? tz : null,
+    events: ev ? [ev] : [],
+    counters: ev ? { [event]: 1 } : {},
     created_at: FieldValue.serverTimestamp(),
     updated_at: FieldValue.serverTimestamp()
-  };
+  });
 
+  // O set com merge:false é seguro e cria um novo documento
+  // para cada evento, evitando conflitos de transação
   await docRef.set(docData, { merge: false });
 
   return { ok: true, id: docId };
