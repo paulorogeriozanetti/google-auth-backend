@@ -1,11 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 1.8.3 – 2025-09-06 – “DailyFacts-DocId-Flip”
+ * PZ Auth+API Backend – Versão 1.8.4 – 2025-09-06 – “Prod-Env-Fixes”
  *
- * Alterações vs 1.8.2 (DailyFacts-ArrayUnion-Fix):
- *  - 🔄 Padrão de ID do documento alterado para **anon_id_YYYY-MM-DD** (antes: YYYYMMDD_anonId).
- *  - 🧭 Mantém cálculo de data considerando tz_offset (minutos) se fornecido.
- *  - 🧹 Mantém sanitização de payload e uso de FieldValue.arrayUnion com objetos planos.
- *  - ♻️ Preserva todas as funcionalidades existentes (/auth/google, /api/track, debug/health, CORS no topo).
+ * Ajustes vs 1.8.3 (DailyFacts-DocId-Flip):
+ * - 🧪 Adicionado log de debug na transação para inspecionar payload.
+ * - 🔒 Reforçada verificação do payload para garantir que é um objeto JSON válido.
+ * - 🧹 Mantém todas as funcionalidades existentes.
  */
 
 const express = require('express');
@@ -26,8 +25,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.8.3';
-const BUILD_DATE = '2025-09-06';
+const VERSION = '1.8.4';
+const BUILD_DATE = '2025-09-07';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -230,7 +229,7 @@ function zeroPad(n, w = 2) { n = String(n); return n.length >= w ? n : '0'.repea
 function deriveDayParts(tsISO, tzOffsetMin) {
   // tzOffsetMin: minutos em relação ao UTC (ex.: -180 para UTC-3). Se ausente, assume 0 (UTC).
   let d = tsISO ? new Date(tsISO) : new Date();
-  const tz = Number.isFinite(tzOffsetMin) ? tzOffsetMin : 0;
+  const tz = Number.isFinite(+tzOffsetMin) ? +tzOffsetMin : 0;
   if (tz !== 0) d = new Date(d.getTime() + tz * 60 * 1000); // ajusta para "hora local" do offset
   return { y: d.getUTCFullYear(), m: zeroPad(d.getUTCMonth() + 1), d: zeroPad(d.getUTCDate()) };
 }

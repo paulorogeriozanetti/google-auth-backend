@@ -1,24 +1,24 @@
 {
-"name": "pz-authapi-backend-v1.8.3-2025-09-06-adminsdk-dailyfacts-upsert-fix",
-"version": "1.8.3-2025-09-06",
-"description": "PZ Auth+API Backend – v1.8.3 – 2025-09-06 – AdminSDK-DailyFacts-Upsert-Fix (daily_facts com chave anon_id_YYYY-MM-DD; correção de arrayUnion/serialização; mantém Google One Tap AUTH, endpoints de debug/health, CORS no topo, fetch nativo com fallback e parsing JSON tolerante).",
-"main": "server.js",
-"scripts": {
-"start": "node server.js",
-"dev": "PORT=8080 node server.js",
-"dev:win": "set PORT=8080&& node server.js"
-},
-"engines": {
-"node": ">=18"
-},
-"author": "",
-"license": "ISC",
-"dependencies": {
-"cookie-parser": "^1.4.6",
-"cors": "^2.8.5",
-"express": "^4.18.3",
-"firebase-admin": "^12.7.0",
-"google-auth-library": "^10.2.0",
-"node-fetch": "^3.3.2"
-}
+  "name": "pz-authapi-backend-v1.8.4-2025-09-07-prod-env-fixes",
+  "version": "1.8.4-2025-09-07",
+  "description": "PZ Auth+API Backend – v1.8.4 – 2025-09-06 – Prod-Env-Fixes (atualização de versão e descrição para refletir a nova compilação e o foco em correções de ambiente de produção).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "PORT=8080 node server.js",
+    "dev:win": "set PORT=8080&& node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "express": "^4.18.3",
+    "firebase-admin": "^12.7.0",
+    "google-auth-library": "^10.2.0",
+    "node-fetch": "^3.3.2"
+  }
 }
