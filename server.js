@@ -1,13 +1,11 @@
 /**
- * PZ Auth+API Backend – Versão 1.8.2 – 2025-09-06 – “DailyFacts-ArrayUnion-Fix”
+ * PZ Auth+API Backend – Versão 1.8.3 – 2025-09-06 – “DailyFacts-DocId-Flip”
  *
- * Alterações vs 1.8.1 (DailyFacts-Upsert):
- *  - 🧯 Corrige erro "Element at index 0 is not a valid array element. Field." usando **FieldValue.arrayUnion(ev)**
- *    sempre com objeto plano, validado e serializável.
- *  - 🧹 Sanitiza payload antes de gravar (remove undefined / funções / estruturas inválidas).
- *  - 🧭 Mantém ID de doc em `daily_facts` como YYYYMMDD_anonId (com tz_offset),
- *    incrementa `counters.{event}` e anexa em `events`.
- *  - ♻️ Preserva todas as funcionalidades: One Tap (/auth/google), /api/track, health/debug, CORS no topo.
+ * Alterações vs 1.8.2 (DailyFacts-ArrayUnion-Fix):
+ *  - 🔄 Padrão de ID do documento alterado para **anon_id_YYYY-MM-DD** (antes: YYYYMMDD_anonId).
+ *  - 🧭 Mantém cálculo de data considerando tz_offset (minutos) se fornecido.
+ *  - 🧹 Mantém sanitização de payload e uso de FieldValue.arrayUnion com objetos planos.
+ *  - ♻️ Preserva todas as funcionalidades existentes (/auth/google, /api/track, debug/health, CORS no topo).
  */
 
 const express = require('express');
@@ -28,7 +26,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.8.2';
+const VERSION = '1.8.3';
 const BUILD_DATE = '2025-09-06';
 const PORT = process.env.PORT || 8080;
 
@@ -229,17 +227,17 @@ app.use((req, res, next) => {
 ─────────────────────────────────────────────────────────────── */
 function zeroPad(n, w = 2) { n = String(n); return n.length >= w ? n : '0'.repeat(w - n.length) + n; }
 
-function deriveDayYYYYMMDD(tsISO, tzOffsetMin) {
+function deriveDayParts(tsISO, tzOffsetMin) {
   // tzOffsetMin: minutos em relação ao UTC (ex.: -180 para UTC-3). Se ausente, assume 0 (UTC).
   let d = tsISO ? new Date(tsISO) : new Date();
-  if (Number.isFinite(tzOffsetMin)) {
-    // converte data UTC para "tempo local" aplicando o offset (minutos)
-    d = new Date(d.getTime() + tzOffsetMin * 60 * 1000);
-  }
-  const y = d.getUTCFullYear();
-  const m = zeroPad(d.getUTCMonth() + 1);
-  const day = zeroPad(d.getUTCDate());
-  return `${y}${m}${day}`; // YYYYMMDD
+  const tz = Number.isFinite(tzOffsetMin) ? tzOffsetMin : 0;
+  if (tz !== 0) d = new Date(d.getTime() + tz * 60 * 1000); // ajusta para "hora local" do offset
+  return { y: d.getUTCFullYear(), m: zeroPad(d.getUTCMonth() + 1), d: zeroPad(d.getUTCDate()) };
+}
+
+function deriveDayLabel(tsISO, tzOffsetMin) {
+  const p = deriveDayParts(tsISO, tzOffsetMin);
+  return `${p.y}-${p.m}-${p.d}`; // YYYY-MM-DD
 }
 
 function parseClientTimestamp(val) {
@@ -253,18 +251,15 @@ function parseClientTimestamp(val) {
 
 function toPlainJSON(obj) {
   // Remove undefined, funções e converte apenas chaves JSON-serializáveis
-  try {
-    return JSON.parse(JSON.stringify(obj || null));
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(JSON.stringify(obj || null)); }
+  catch { return null; }
 }
 
 async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
   const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
   const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
-  const day = deriveDayYYYYMMDD(tsISO, tz);
-  const docId = `${day}_${safeAnon}`; // YYYYMMDD_anon
+  const day = deriveDayLabel(tsISO, tz); // YYYY-MM-DD
+  const docId = `${safeAnon}_${day}`;    // anon_id_YYYY-MM-DD
   const docRef = db.collection('daily_facts').doc(docId);
 
   const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
@@ -283,7 +278,7 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
 
   const seed = {
     kind: 'user',
-    date: `${docId.slice(0,4)}-${docId.slice(4,6)}-${docId.slice(6,8)}`,
+    date: day, // YYYY-MM-DD
     entity_id: safeAnon,
     anon_id: safeAnon,
     person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
@@ -344,7 +339,7 @@ app.get('/api/version', (_req, res) => {
     has_cookie_parser: Boolean(cookieParser),
     project_id: process.env.GCP_PROJECT_ID || null,
     facts_collection: 'daily_facts',
-    facts_doc_pattern: 'YYYYMMDD_anon_id'
+    facts_doc_pattern: 'anon_id_YYYY-MM-DD'
   });
 });
 
@@ -501,7 +496,7 @@ app.post('/api/echo', (req, res) => {
   return res.status(200).json({ ok:true, rid:req.rid, echo:req.body || null, ts:new Date().toISOString() });
 });
 
-// Grava em daily_facts com doc YYYYMMDD_anon_id
+// Grava em daily_facts com doc anon_id_YYYY-MM-DD
 app.post('/api/track', async (req, res) => {
   try {
     if (!TRACK_OPEN) {
