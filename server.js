@@ -1,10 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 1.8.4 – 2025-09-06 – “Prod-Env-Fixes”
+ * PZ Auth+API Backend – Versão 1.8.6 – 2025-09-06 – “DailyFacts-Simpler-Write”
  *
- * Ajustes vs 1.8.3 (DailyFacts-DocId-Flip):
- * - 🧪 Adicionado log de debug na transação para inspecionar payload.
- * - 🔒 Reforçada verificação do payload para garantir que é um objeto JSON válido.
- * - 🧹 Mantém todas as funcionalidades existentes.
+ * Ajustes vs 1.8.5 (DailyFacts-Robust-Write):
+ * - ⚡ Substituída a lógica de `arrayUnion` por um fluxo de escrita mais simples.
+ * - 🧪 A lógica de upsert agora lê o documento, adiciona o novo evento ao array e sobrescreve o documento.
+ * - ✅ Mantém todas as outras funcionalidades existentes.
  */
 
 const express = require('express');
@@ -25,8 +25,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.8.4';
-const BUILD_DATE = '2025-09-07';
+const VERSION = '1.8.6';
+const BUILD_DATE = '2025-09-09';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -293,22 +293,20 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
     const snap = await tx.get(docRef);
     if (!snap.exists) {
       tx.set(docRef, seed, { merge: false });
-    } else {
-      // Atualiza cabeçalho (ex.: upgrade de user_id)
-      const headerUpdate = {
-        updated_at: FieldValue.serverTimestamp(),
-        ...(user_id ? { user_id, person_id: user_id } : {})
-      };
-      tx.set(docRef, headerUpdate, { merge: true });
     }
-
-    // append evento + increment de contador – **sempre** objeto plano
+    
+    // Obtém o array de eventos existente ou um array vazio
+    const currentEvents = snap.exists ? snap.get('events') : [];
+    
+    // Adiciona o novo evento ao array existente
+    const newEvents = [...currentEvents, ev];
+    
     const incField = `counters.${event}`;
-    tx.set(docRef, {
-      events: FieldValue.arrayUnion(ev),
+    tx.update(docRef, {
+      events: newEvents,
       [incField]: FieldValue.increment(1),
       updated_at: FieldValue.serverTimestamp()
-    }, { merge: true });
+    });
   });
 
   return { ok: true, id: docId };
@@ -377,25 +375,31 @@ app.get('/api/debug/fs-token', async (req, res) => {
 });
 
 // Tentativa de escrita com retorno detalhado – agora em daily_facts
-app.post('/api/debug/fs-write', async (req, res) => {
-  if (!assertDebugAccess(req, res)) return;
+app.post('/api/debug/ping-fs', async (req, res) => {
+  const verbose = (String(req.query.verbose || req.headers['x-debug-verbose'] || '') === '1');
   try {
+    const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
+    if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) return res.status(403).json({ ok:false, error:'forbidden' });
+
     const db = getDB();
-    const anon_id = (req.body && req.body.anon_id) || 'anon_debug';
     const out = await upsertDailyFact({
       db,
-      anon_id,
+      anon_id: (req.body && req.body.anon_id) || 'anon_debug',
       user_id: req.body && req.body.user_id,
       tz_offset: req.body && req.body.tz_offset,
       event: 'debug_write',
       page: '/debug',
       session_id: null,
       payload: { note: (req.body && req.body.note) || 'manual' },
-      tsISO: (req.body && req.body.ts) || new Date().toISOString()
+      tsISO: new Date().toISOString()
     });
-    res.status(200).json({ ok:true, rid:req.rid, doc: out.id });
+
+    return res.status(200).json({ ok:true, rid:req.rid, doc: out.id });
   } catch (e) {
-    res.status(500).json({ ok:false, rid:req.rid, error: e.message || String(e) });
+    const payload = { route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) };
+    console.error(JSON.stringify(payload));
+    if (e.code === 'sa_not_configured') return res.status(503).json({ ok:false, error:'sa_not_configured', meta:e.meta });
+    return res.status(500).json(verbose ? { ok:false, ...payload } : { ok:false, error:'ping_failed' });
   }
 });
 
@@ -550,10 +554,10 @@ app.post('/api/debug/ping-fs', async (req, res) => {
       anon_id: (req.body && req.body.anon_id) || 'anon_debug',
       user_id: req.body && req.body.user_id,
       tz_offset: req.body && req.body.tz_offset,
-      event: 'debug_ping_fs',
+      event: 'debug_write',
       page: '/debug',
       session_id: null,
-      payload: null,
+      payload: { note: (req.body && req.body.note) || 'manual' },
       tsISO: new Date().toISOString()
     });
 

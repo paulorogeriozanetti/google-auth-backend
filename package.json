@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.8.4-2025-09-07-prod-env-fixes",
-  "version": "1.8.4-2025-09-07",
-  "description": "PZ Auth+API Backend – v1.8.4 – 2025-09-06 – Prod-Env-Fixes (atualização de versão e descrição para refletir a nova compilação e o foco em correções de ambiente de produção).",
+  "name": "pz-authapi-backend-v1.8.6-2025-09-06-dailyfacts-simpler-write",
+  "version": "1.8.6-2025-09-09",
+  "description": "PZ Auth+API Backend – v1.8.6 – 2025-09-09 – DailyFacts-Simpler-Write (Versão com lógica de escrita simplificada para resolver falhas de 'arrayUnion' no ambiente de produção).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
