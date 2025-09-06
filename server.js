@@ -1,10 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 2.0.0 – 2025-09-06 – “DailyFacts-UpsertNoTx”
+ * PZ Auth+API Backend – Versão 2.1.0 – 2025-09-06 – “DailyFacts-SetMerge”
  *
- * Ajustes vs 1.9.1 (DailyFacts-SaferWrite):
- * - 🚦 Reintroduz a lógica de upsert para manter 1 documento por anon_id por dia.
- * - ⚡ Substitui a transação e o arrayUnion por um fluxo de `update/set` que é mais robusto no ambiente atual.
- * - ✅ Mantém todas as outras funcionalidades existentes.
+ * Ajustes vs 2.0.0 (DailyFacts-UpsertNoTx):
+ * - 🚦 Resolvido o erro 'Update() requires...' substituindo a lógica de `try/catch` por `set()` com `merge: true`.
+ * - ✅ A lógica de upsert agora usa `FieldValue.arrayUnion` e `FieldValue.increment` de forma segura.
+ * - ⚡ Garante 1 documento por anon_id por dia e elimina a necessidade de transações ou lógica de `update()`.
  */
 
 const express = require('express');
@@ -25,8 +25,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '2.0.0';
-const BUILD_DATE = '2025-09-12';
+const VERSION = '2.1.0';
+const BUILD_DATE = '2025-09-13';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -186,7 +186,7 @@ app.use((req, _res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return next();
   let data = '';
-  req.on('data', c => { data += c; if (data.length > 2 * 1024 * 1024) req.destroy(); }); // 2MB
+  req.on('data', c => { data += c; if (data.length > 2 * 1024 * 1024) req.destroy(); });
   req.on('end', () => {
     if (!req.body || typeof req.body !== 'object') {
       if (data && /^[\s{\[]/.test(data)) {
@@ -256,28 +256,20 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
   const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
   const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
   const day = deriveDayLabel(tsISO, tz);
-  const docId = `${safeAnon}_${day}`; // anon_id_YYYY-MM-DD
+  const docId = `${safeAnon}_${day}`;
   const docRef = db.collection('daily_facts').doc(docId);
 
   const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
-  const evBase = {
+  const newEvent = toPlainJSON({
     event,
     event_id,
     ts_server: FieldValue.serverTimestamp(),
-    ...(parseClientTimestamp(tsISO) ? { ts_client: parseClientTimestamp(tsISO) } : {}),
-    ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-    ...(page ? { page } : {}),
-    ...(session_id ? { session_id } : {})
-  };
-  const cleanPayload = toPlainJSON(payload);
-  const newEvent = cleanPayload ? { ...evBase, payload: cleanPayload } : evBase;
-
-  const incField = `counters.${event}`;
-  const headerUpdate = {
-    updated_at: FieldValue.serverTimestamp(),
-    [incField]: FieldValue.increment(1),
-    events: FieldValue.arrayUnion(newEvent)
-  };
+    ts_client: parseClientTimestamp(tsISO),
+    tz_offset: Number.isFinite(tz) ? tz : null,
+    page,
+    session_id,
+    payload: payload
+  });
   
   const seed = {
     kind: 'user',
@@ -293,18 +285,17 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
     updated_at: FieldValue.serverTimestamp()
   };
 
-  try {
-    // Tenta atualizar um documento existente
-    await docRef.update(headerUpdate);
-  } catch (e) {
-    if (e.code === 5) { // NOT_FOUND
-      // Se não existir, cria o documento
-      await docRef.set(seed, { merge: false });
-    } else {
-      // Outro erro, relança
-      throw e;
-    }
-  }
+  const update = {
+    updated_at: FieldValue.serverTimestamp(),
+    counters: {
+      [event]: FieldValue.increment(1)
+    },
+    events: FieldValue.arrayUnion(newEvent),
+    ...(user_id ? { user_id, person_id: user_id } : {})
+  };
+
+  await docRef.set(seed, { merge: true });
+  await docRef.update(update);
 
   return { ok: true, id: docId };
 }

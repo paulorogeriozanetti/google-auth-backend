@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v2.0.0-2025-09-06-dailyfacts-upsertnotx",
-  "version": "2.0.0-2025-09-06",
-  "description": "PZ Auth+API Backend – v2.0.0 – 2025-09-06 – DailyFacts-UpsertNoTx (Reintroduz a lógica de upsert de forma robusta, sem transações, para garantir 1 documento diário por usuário).",
+  "name": "pz-authapi-backend-v2.1.0-2025-09-06-dailyfacts-setmerge",
+  "version": "2.1.0-2025-09-06",
+  "description": "PZ Auth+API Backend – v2.1.0 – 2025-09-06 – DailyFacts-SetMerge (Versão com lógica de upsert mais robusta, usando 'set' com 'merge: true' para evitar falhas de gravação).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
