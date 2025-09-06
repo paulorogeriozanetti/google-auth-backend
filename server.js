@@ -1,12 +1,13 @@
 /**
- * PZ Auth+API Backend – Versão 1.8.1 – 2025-09-06 – “DailyFacts-Upsert”
+ * PZ Auth+API Backend – Versão 1.8.2 – 2025-09-06 – “DailyFacts-ArrayUnion-Fix”
  *
- * Alterações vs 1.7.0 (AdminSDK-DirectWrite):
- *  - 🔁 Substitui gravação em "auth_events" por **upsert** em "daily_facts" (fato único diário).
- *  - 🗂️ ID do documento: YYYYMMDD + '_' + anon_id (considerando tz_offset, se enviado).
- *  - ➕ Append de eventos em array `events` + incremento em `counters.{event}` + `updated_at`.
- *  - 🕒 Mantém `ts_server` (serverTimestamp) e aceita `ts_client` (ISO) do payload.
- *  - ♻️ Continua aceitando `/auth/google` e `/api/track`, CORS no topo e endpoints de debug/health.
+ * Alterações vs 1.8.1 (DailyFacts-Upsert):
+ *  - 🧯 Corrige erro "Element at index 0 is not a valid array element. Field." usando **FieldValue.arrayUnion(ev)**
+ *    sempre com objeto plano, validado e serializável.
+ *  - 🧹 Sanitiza payload antes de gravar (remove undefined / funções / estruturas inválidas).
+ *  - 🧭 Mantém ID de doc em `daily_facts` como YYYYMMDD_anonId (com tz_offset),
+ *    incrementa `counters.{event}` e anexa em `events`.
+ *  - ♻️ Preserva todas as funcionalidades: One Tap (/auth/google), /api/track, health/debug, CORS no topo.
  */
 
 const express = require('express');
@@ -27,7 +28,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.8.1';
+const VERSION = '1.8.2';
 const BUILD_DATE = '2025-09-06';
 const PORT = process.env.PORT || 8080;
 
@@ -250,32 +251,44 @@ function parseClientTimestamp(val) {
   } catch { return null; }
 }
 
+function toPlainJSON(obj) {
+  // Remove undefined, funções e converte apenas chaves JSON-serializáveis
+  try {
+    return JSON.parse(JSON.stringify(obj || null));
+  } catch {
+    return null;
+  }
+}
+
 async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
   const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
-  const day = deriveDayYYYYMMDD(tsISO, Number.isFinite(+tz_offset) ? +tz_offset : 0);
+  const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
+  const day = deriveDayYYYYMMDD(tsISO, tz);
   const docId = `${day}_${safeAnon}`; // YYYYMMDD_anon
   const docRef = db.collection('daily_facts').doc(docId);
 
   const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
-  const ev = {
+  const evBase = {
     event,
     event_id,
-    ts_server: FieldValue.serverTimestamp(), // sempre
+    ts_server: FieldValue.serverTimestamp(),
     ...(parseClientTimestamp(tsISO) ? { ts_client: parseClientTimestamp(tsISO) } : {}),
-    ...(Number.isFinite(+tz_offset) ? { tz_offset: +tz_offset } : {}),
+    ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
     ...(page ? { page } : {}),
-    ...(session_id ? { session_id } : {}),
-    ...(payload ? { payload } : {})
+    ...(session_id ? { session_id } : {})
   };
+  // Garante objeto plano e válido no payload do evento
+  const cleanPayload = toPlainJSON(payload);
+  const ev = cleanPayload ? { ...evBase, payload: cleanPayload } : evBase;
 
   const seed = {
     kind: 'user',
-    date: `${docId.slice(0,4)}-${docId.slice(4,6)}-${docId.slice(6,8)}`, // ex.: 2025-09-06
+    date: `${docId.slice(0,4)}-${docId.slice(4,6)}-${docId.slice(6,8)}`,
     entity_id: safeAnon,
     anon_id: safeAnon,
     person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
     ...(user_id ? { user_id } : {}),
-    ...(Number.isFinite(+tz_offset) ? { tz_offset: +tz_offset } : {}),
+    ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
     events: [],
     counters: {},
     created_at: FieldValue.serverTimestamp(),
@@ -287,7 +300,7 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
     if (!snap.exists) {
       tx.set(docRef, seed, { merge: false });
     } else {
-      // pode atualizar cabeçalho (ex.: upgrade de user_id)
+      // Atualiza cabeçalho (ex.: upgrade de user_id)
       const headerUpdate = {
         updated_at: FieldValue.serverTimestamp(),
         ...(user_id ? { user_id, person_id: user_id } : {})
@@ -295,7 +308,7 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
       tx.set(docRef, headerUpdate, { merge: true });
     }
 
-    // append evento + increment de contador
+    // append evento + increment de contador – **sempre** objeto plano
     const incField = `counters.${event}`;
     tx.set(docRef, {
       events: FieldValue.arrayUnion(ev),
@@ -329,7 +342,9 @@ app.get('/api/version', (_req, res) => {
     debug_ping_enabled: Boolean(DEBUG_TOKEN),
     firestore_auth_mode: 'AdminSDK',
     has_cookie_parser: Boolean(cookieParser),
-    project_id: process.env.GCP_PROJECT_ID || null
+    project_id: process.env.GCP_PROJECT_ID || null,
+    facts_collection: 'daily_facts',
+    facts_doc_pattern: 'YYYYMMDD_anon_id'
   });
 });
 
@@ -486,7 +501,7 @@ app.post('/api/echo', (req, res) => {
   return res.status(200).json({ ok:true, rid:req.rid, echo:req.body || null, ts:new Date().toISOString() });
 });
 
-// Novo: grava em daily_facts com doc YYYYMMDD_anon_id
+// Grava em daily_facts com doc YYYYMMDD_anon_id
 app.post('/api/track', async (req, res) => {
   try {
     if (!TRACK_OPEN) {
@@ -498,7 +513,7 @@ app.post('/api/track', async (req, res) => {
     if (!event || typeof event !== 'string') return res.status(400).json({ ok:false, error:'missing_event' });
 
     const anon_id   = payload?.anon_id || req.body?.anon_id || 'anon_unknown';
-    const user_id   = payload?.user_id || null; // será "upgraded" quando houver
+    const user_id   = payload?.user_id || null;
     const tz_offset = (typeof payload?.tz_offset !== 'undefined') ? payload.tz_offset : 0;
     const tsISO     = payload?.ts || null;
     const page      = payload?.page || payload?.context?.page || null;
@@ -513,11 +528,10 @@ app.post('/api/track', async (req, res) => {
       event,
       page,
       session_id: sessionId,
-      // remove campos redundantes do payload
       payload: (() => {
         const p = { ...payload };
         delete p.ts; delete p.tz_offset; delete p.page; delete p.session_id; delete p.user_id; delete p.anon_id; delete p.context;
-        return Object.keys(p).length ? p : null;
+        return toPlainJSON(p); // retorna objeto limpo ou null
       })(),
       tsISO: tsISO || new Date().toISOString()
     });

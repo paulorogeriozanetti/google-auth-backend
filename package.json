@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.8.1-2025-09-06-adminsdk-dailyfacts",
-  "version": "1.8.1-2025-09-06",
-  "description": "PZ Auth+API Backend – v1.8.1 – 2025-09-04 – AdminSDK-DailyFacts (escrita consolidada em Firestore/daily_facts com chave YYYYMMDD+anon_id; mantém Google One Tap AUTH, endpoints de debug/health, CORS no topo, fetch nativo com fallback, parsing JSON tolerante).",
+  "name": "pz-authapi-backend-v1.8.2-2025-09-06-adminsdk-dailyfacts-upsert",
+  "version": "1.8.2-2025-09-06",
+  "description": "PZ Auth+API Backend – v1.8.2 – 2025-09-06 – AdminSDK-DailyFacts-Upsert (escrita consolidada em Firestore/daily_facts com chave YYYYMMDD+anon_id; correções de upsert/transação e melhorias de logs; mantém Google One Tap AUTH, endpoints de debug/health, CORS no topo, fetch nativo com fallback e parsing JSON tolerante).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
