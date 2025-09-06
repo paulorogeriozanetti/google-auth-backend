@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Teste Google One Tap</title>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <script>
+      window.onload = function () {
+        google.accounts.id.initialize({
+          client_id: "270930304722-pbl5cmp53omohrmfkf9dmicutknf3q95.apps.googleusercontent.com",
+          callback: (resp) => {
+            console.log("Credenciais recebidas:", resp);
+          }
+        });
+
+        // Exibir One Tap
+        google.accounts.id.prompt();
+      };
+    </script>
+  </head>
+  <body>
+    <h1>Teste One Tap</h1>
+    <div id="buttonDiv"></div>
+    <script>
+      google.accounts.id.renderButton(
+        document.getElementById("buttonDiv"),
+        { theme: "outline", size: "large" }
+      );
+    </script>
+  </body>
+</html>
