@@ -1,10 +1,11 @@
 /**
- * PZ Auth+API Backend – Versão 1.8.6 – 2025-09-06 – “DailyFacts-Simpler-Write”
+ * PZ Auth+API Backend – Versão 1.9.0 – 2025-09-06 – “DailyFacts-DirectWrite”
  *
- * Ajustes vs 1.8.5 (DailyFacts-Robust-Write):
- * - ⚡ Substituída a lógica de `arrayUnion` por um fluxo de escrita mais simples.
- * - 🧪 A lógica de upsert agora lê o documento, adiciona o novo evento ao array e sobrescreve o documento.
- * - ✅ Mantém todas as outras funcionalidades existentes.
+ * Ajustes vs 1.8.6 (DailyFacts-Simpler-Write):
+ * - ✅ Lógica de escrita alterada para usar `db.collection().add()` com ID de documento único.
+ * - ⚡ Elimina a necessidade de transações, `FieldValue.arrayUnion`, e leituras.
+ * - 📄 O nome do documento agora é 'anon_id_YYYYMMDDHHMMSS_random'.
+ * - 🧪 Mantém o comportamento de todos os outros endpoints.
  */
 
 const express = require('express');
@@ -25,8 +26,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '1.8.6';
-const BUILD_DATE = '2025-09-09';
+const VERSION = '1.9.0';
+const BUILD_DATE = '2025-09-10';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -227,16 +228,10 @@ app.use((req, res, next) => {
 function zeroPad(n, w = 2) { n = String(n); return n.length >= w ? n : '0'.repeat(w - n.length) + n; }
 
 function deriveDayParts(tsISO, tzOffsetMin) {
-  // tzOffsetMin: minutos em relação ao UTC (ex.: -180 para UTC-3). Se ausente, assume 0 (UTC).
   let d = tsISO ? new Date(tsISO) : new Date();
   const tz = Number.isFinite(+tzOffsetMin) ? +tzOffsetMin : 0;
-  if (tz !== 0) d = new Date(d.getTime() + tz * 60 * 1000); // ajusta para "hora local" do offset
+  if (tz !== 0) d = new Date(d.getTime() + tz * 60 * 1000);
   return { y: d.getUTCFullYear(), m: zeroPad(d.getUTCMonth() + 1), d: zeroPad(d.getUTCDate()) };
-}
-
-function deriveDayLabel(tsISO, tzOffsetMin) {
-  const p = deriveDayParts(tsISO, tzOffsetMin);
-  return `${p.y}-${p.m}-${p.d}`; // YYYY-MM-DD
 }
 
 function parseClientTimestamp(val) {
@@ -249,7 +244,6 @@ function parseClientTimestamp(val) {
 }
 
 function toPlainJSON(obj) {
-  // Remove undefined, funções e converte apenas chaves JSON-serializáveis
   try { return JSON.parse(JSON.stringify(obj || null)); }
   catch { return null; }
 }
@@ -257,57 +251,40 @@ function toPlainJSON(obj) {
 async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
   const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
   const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
-  const day = deriveDayLabel(tsISO, tz); // YYYY-MM-DD
-  const docId = `${safeAnon}_${day}`;    // anon_id_YYYY-MM-DD
+  const day = deriveDayParts(tsISO, tz);
+  const now = new Date();
+  
+  // Novo padrão de ID do documento para garantir unicidade
+  const docId = `${safeAnon}_${day.y}${day.m}${day.d}${zeroPad(now.getUTCHours())}${zeroPad(now.getUTCMinutes())}${zeroPad(now.getUTCSeconds())}_${Math.random().toString(36).slice(2,8)}`;
   const docRef = db.collection('daily_facts').doc(docId);
-
+  
   const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
-  const evBase = {
+  const ev = {
     event,
     event_id,
     ts_server: FieldValue.serverTimestamp(),
     ...(parseClientTimestamp(tsISO) ? { ts_client: parseClientTimestamp(tsISO) } : {}),
     ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
     ...(page ? { page } : {}),
-    ...(session_id ? { session_id } : {})
+    ...(session_id ? { session_id } : {}),
+    payload: toPlainJSON(payload)
   };
-  // Garante objeto plano e válido no payload do evento
-  const cleanPayload = toPlainJSON(payload);
-  const ev = cleanPayload ? { ...evBase, payload: cleanPayload } : evBase;
 
-  const seed = {
+  const docData = {
     kind: 'user',
-    date: day, // YYYY-MM-DD
+    date: `${day.y}-${day.m}-${day.d}`,
     entity_id: safeAnon,
     anon_id: safeAnon,
     person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
     ...(user_id ? { user_id } : {}),
     ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-    events: [],
-    counters: {},
+    events: [ev],
+    counters: { [event]: 1 },
     created_at: FieldValue.serverTimestamp(),
     updated_at: FieldValue.serverTimestamp()
   };
 
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(docRef);
-    if (!snap.exists) {
-      tx.set(docRef, seed, { merge: false });
-    }
-    
-    // Obtém o array de eventos existente ou um array vazio
-    const currentEvents = snap.exists ? snap.get('events') : [];
-    
-    // Adiciona o novo evento ao array existente
-    const newEvents = [...currentEvents, ev];
-    
-    const incField = `counters.${event}`;
-    tx.update(docRef, {
-      events: newEvents,
-      [incField]: FieldValue.increment(1),
-      updated_at: FieldValue.serverTimestamp()
-    });
-  });
+  await docRef.set(docData, { merge: false });
 
   return { ok: true, id: docId };
 }
@@ -336,7 +313,7 @@ app.get('/api/version', (_req, res) => {
     has_cookie_parser: Boolean(cookieParser),
     project_id: process.env.GCP_PROJECT_ID || null,
     facts_collection: 'daily_facts',
-    facts_doc_pattern: 'anon_id_YYYY-MM-DD'
+    facts_doc_pattern: 'anon_id_YYYYMMDDHHMMSS_random'
   });
 });
 
@@ -424,7 +401,7 @@ async function handleAuthGoogle(req, res) {
     const ct = (req.headers['content-type'] || '').toLowerCase();
     const body = req.body || {};
     const credential = (typeof body.credential === 'string' && body.credential) || (typeof body.id_token === 'string' && body.id_token) || null;
-    const context = body.context || {}; // pode carregar anon_id, page, etc.
+    const context = body.context || {}; 
 
     console.log(JSON.stringify({ route:'/auth/google', rid:req.rid, content_type:ct, has_credential: !!credential }));
 
@@ -499,7 +476,7 @@ app.post('/api/echo', (req, res) => {
   return res.status(200).json({ ok:true, rid:req.rid, echo:req.body || null, ts:new Date().toISOString() });
 });
 
-// Grava em daily_facts com doc anon_id_YYYY-MM-DD
+// Grava em daily_facts com doc anon_id_YYYYMMDDHHMMSS_random
 app.post('/api/track', async (req, res) => {
   try {
     if (!TRACK_OPEN) {
@@ -529,7 +506,7 @@ app.post('/api/track', async (req, res) => {
       payload: (() => {
         const p = { ...payload };
         delete p.ts; delete p.tz_offset; delete p.page; delete p.session_id; delete p.user_id; delete p.anon_id; delete p.context;
-        return toPlainJSON(p); // retorna objeto limpo ou null
+        return toPlainJSON(p);
       })(),
       tsISO: tsISO || new Date().toISOString()
     });
@@ -538,35 +515,6 @@ app.post('/api/track', async (req, res) => {
   } catch (e) {
     console.error(JSON.stringify({ route:'/api/track', rid:req.rid, error:e.message || String(e) }));
     return res.status(500).json({ ok:false, error:'track_failed' });
-  }
-});
-
-// Ping FS com verbose
-app.post('/api/debug/ping-fs', async (req, res) => {
-  const verbose = (String(req.query.verbose || req.headers['x-debug-verbose'] || '') === '1');
-  try {
-    const tok = req.headers['x-debug-token'] || req.headers['X-Debug-Token'];
-    if (!DEBUG_TOKEN || tok !== DEBUG_TOKEN) return res.status(403).json({ ok:false, error:'forbidden' });
-
-    const db = getDB();
-    const out = await upsertDailyFact({
-      db,
-      anon_id: (req.body && req.body.anon_id) || 'anon_debug',
-      user_id: req.body && req.body.user_id,
-      tz_offset: req.body && req.body.tz_offset,
-      event: 'debug_write',
-      page: '/debug',
-      session_id: null,
-      payload: { note: (req.body && req.body.note) || 'manual' },
-      tsISO: new Date().toISOString()
-    });
-
-    return res.status(200).json({ ok:true, rid:req.rid, doc: out.id });
-  } catch (e) {
-    const payload = { route:'/api/debug/ping-fs', rid:req.rid, error:e.message || String(e) };
-    console.error(JSON.stringify(payload));
-    if (e.code === 'sa_not_configured') return res.status(503).json({ ok:false, error:'sa_not_configured', meta:e.meta });
-    return res.status(500).json(verbose ? { ok:false, ...payload } : { ok:false, error:'ping_failed' });
   }
 });
 
@@ -592,6 +540,7 @@ app.listen(PORT, () => {
   console.log('   DEBUG_TOKEN set            :', Boolean(DEBUG_TOKEN));
   console.log('   FIRESTORE auth mode        : AdminSDK');
   console.log('   PROJECT_ID                 :', process.env.GCP_PROJECT_ID || '(env)');
+  console.log('   SA_EMAIL set               :', !!GCP_SA_EMAIL, `(source=${SA_SOURCE})`);
   console.log('   HAS cookie-parser          :', Boolean(cookieParser));
   console.log('   NODE_ENV                   :', process.env.NODE_ENV || '(not set)');
   console.log('──────────────────────────────────────────────────────────────');

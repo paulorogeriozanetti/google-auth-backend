@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v1.8.6-2025-09-06-dailyfacts-simpler-write",
-  "version": "1.8.6-2025-09-09",
-  "description": "PZ Auth+API Backend – v1.8.6 – 2025-09-09 – DailyFacts-Simpler-Write (Versão com lógica de escrita simplificada para resolver falhas de 'arrayUnion' no ambiente de produção).",
+  "name": "pz-authapi-backend-v1.9.0-2025-09-06-dailyfacts-directwrite",
+  "version": "1.9.0-2025-09-10",
+  "description": "PZ Auth+API Backend – v1.9.0 – 2025-09-10 – DailyFacts-DirectWrite (Lógica de escrita alterada para usar um novo documento por evento para maior robustez e compatibilidade com o ambiente de produção).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
