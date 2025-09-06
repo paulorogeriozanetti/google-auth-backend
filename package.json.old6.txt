@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v2.0.0-2025-09-06-dailyfacts-upsertnotx",
-  "version": "2.0.0-2025-09-06",
-  "description": "PZ Auth+API Backend – v2.0.0 – 2025-09-06 – DailyFacts-UpsertNoTx (Reintroduz a lógica de upsert de forma robusta, sem transações, para garantir 1 documento diário por usuário).",
+  "name": "pz-authapi-backend-v1.9.1-2025-09-06-dailyfacts-saferwrite",
+  "version": "1.9.1-2025-09-11",
+  "description": "PZ Auth+API Backend – v1.9.1 – 2025-09-06 – DailyFacts-SaferWrite (Versão com sanitização reforçada na escrita de documentos para resolver falhas de argumento inválido no Firestore).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
