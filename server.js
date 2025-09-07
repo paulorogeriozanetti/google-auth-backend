@@ -1,12 +1,13 @@
 /**
- * PZ Auth+API Backend – Versão 2.2.0 – 2025-09-07 – “DailyFacts-UpdateThenCreate”
+ * PZ Auth+API Backend – Versão 2.2.1 – 2025-09-07 – “DailyFacts-CatchFix”
  *
- * Ajustes vs 2.1.0 (DailyFacts-SetMerge):
- * - 🚦 Resolvido o bug de sobrescrita de eventos e contadores no Firestore.
- * - ✅ Implementada a lógica "Update-then-Create" na função `upsertDailyFact`.
- * - ⚡ O código agora tenta atualizar um documento existente com `update()` e, se falhar por não existência (`NOT_FOUND`),
- * cria o documento com `set()`. Isso garante a correta acumulação de dados no array `events` e nos `counters`.
- * - ⚠️ Mantidas todas as funcionalidades anteriores de autenticação, tracking e CORS.
+ * Ajustes vs 2.2.0 (DailyFacts-UpdateThenCreate):
+ * - 🚦 CORREÇÃO DEFINITIVA: O bug de erro 500 persistia porque a condição `error.code === 'NOT_FOUND'` falhava.
+ * - ✅ A verificação no bloco `catch` foi alterada para `error.message.includes('NOT_FOUND')`,
+ * que é uma forma mais robusta e garantida de identificar o erro de documento não encontrado,
+ * com base nos logs observados em produção.
+ * - ⚡ Esta versão deve resolver completamente o problema de criação de documentos no Firestore,
+ * permitindo que a lógica "Update-then-Create" funcione como projetado.
  */
 
 const express = require('express');
@@ -27,7 +28,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 const BUILD_DATE = '2025-09-07';
 const PORT = process.env.PORT || 8080;
 
@@ -273,21 +274,18 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
     payload: payload
   });
 
-  // Payload para ATUALIZAR um documento existente.
   const updatePayload = {
     updated_at: FieldValue.serverTimestamp(),
     events: FieldValue.arrayUnion(newEvent),
-    // Usamos dot notation para incrementar um campo aninhado de forma segura.
     ['counters.' + event]: FieldValue.increment(1),
     ...(user_id ? { user_id, person_id: user_id } : {})
   };
 
   try {
-    // 1. Tenta ATUALIZAR. Isso falhará se o documento não existir.
     await docRef.update(updatePayload);
   } catch (error) {
-    // 2. Se falhar porque não foi encontrado, CRIA o documento.
-    if (error.code === 'NOT_FOUND') {
+    // CORREÇÃO: Verifica a mensagem do erro, que é mais confiável que o 'code'.
+    if (error.message && error.message.includes('NOT_FOUND')) {
       const seedPayload = {
         kind: 'user',
         date: day,
@@ -296,14 +294,13 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
         person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
         ...(user_id ? { user_id } : {}),
         ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-        events: [newEvent], // Cria com o primeiro evento
-        counters: { [event]: 1 }, // Cria com o primeiro contador
+        events: [newEvent],
+        counters: { [event]: 1 },
         created_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp()
       };
       await docRef.set(seedPayload);
     } else {
-      // 3. Se for outro tipo de erro, propaga a exceção.
       console.error(JSON.stringify({
           tag: 'upsert_daily_fact_failed',
           docId,
