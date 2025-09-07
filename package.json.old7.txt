@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v2.2.0-2025-09-07-dailyfacts-updatethencreate",
-  "version": "2.2.0-2025-09-07",
-  "description": "PZ Auth+API Backend – v2.2.0 – 2025-09-07 – DailyFacts-UpdateThenCreate (Versão com correção do bug de sobrescrita de eventos, implementando a lógica 'Update-then-Create' para garantir a acumulação correta de dados no Firestore).",
+  "name": "pz-authapi-backend-v2.1.0-2025-09-06-dailyfacts-setmerge",
+  "version": "2.1.0-2025-09-06",
+  "description": "PZ Auth+API Backend – v2.1.0 – 2025-09-06 – DailyFacts-SetMerge (Versão com lógica de upsert mais robusta, usando 'set' com 'merge: true' para evitar falhas de gravação).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
