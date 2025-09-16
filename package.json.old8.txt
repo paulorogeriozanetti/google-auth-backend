@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v3.0.0-2025-09-17-convertkit-integration",
-  "version": "3.0.0-2025-09-17",
-  "description": "PZ Auth+API Backend – v3.0.0 – 2025-09-17 – ConvertKit-Integration (Versão principal que adiciona a integração completa com a plataforma de automação de marketing ConvertKit, utilizando um módulo de abstração para escalabilidade futura).",
+  "name": "pz-authapi-backend-v2.2.1-2025-09-07-dailyfacts-catchfix",
+  "version": "2.2.1-2025-09-07",
+  "description": "PZ Auth+API Backend – v2.2.1 – 2025-09-07 – DailyFacts-CatchFix (Versão de correção que ajusta o tratamento de erros na lógica 'Update-then-Create', garantindo que a criação de novos documentos no Firestore funcione corretamente).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -19,7 +19,6 @@
     "express": "^4.18.3",
     "firebase-admin": "^12.7.0",
     "google-auth-library": "^10.2.0",
-    "node-convertkit": "^1.2.0",
     "node-fetch": "^3.3.2"
   }
 }

@@ -1,14 +1,13 @@
 /**
- * PZ Auth+API Backend – Versão 3.0.0 – 2025-09-17 – “ConvertKit-Integration”
+ * PZ Auth+API Backend – Versão 2.2.1 – 2025-09-07 – “DailyFacts-CatchFix”
  *
- * Principais alterações vs 2.2.1:
- * - 🚀 INTEGRAÇÃO CONVERTKIT: Adicionado suporte completo para automação de marketing via ConvertKit.
- * - ✨ MÓDULO DE ABSTRAÇÃO: Importa e utiliza o novo módulo `marketingAutomator.js`,
- * isolando a lógica do provedor de e-mail para facilitar futuras migrações (ex: ActiveCampaign).
- * - 📬 NOVO ENDPOINT: Criada a rota `POST /api/send-guide`, que se torna o orquestrador
- * para o funil de captura de leads. Ele busca dados do usuário, gera a URL dinâmica
- * e envia tudo para o módulo de automação.
- * - 📦 DEPENDÊNCIAS: O `package.json` deve agora incluir a dependência `node-convertkit`.
+ * Ajustes vs 2.2.0 (DailyFacts-UpdateThenCreate):
+ * - 🚦 CORREÇÃO DEFINITIVA: O bug de erro 500 persistia porque a condição `error.code === 'NOT_FOUND'` falhava.
+ * - ✅ A verificação no bloco `catch` foi alterada para `error.message.includes('NOT_FOUND')`,
+ * que é uma forma mais robusta e garantida de identificar o erro de documento não encontrado,
+ * com base nos logs observados em produção.
+ * - ⚡ Esta versão deve resolver completamente o problema de criação de documentos no Firestore,
+ * permitindo que a lógica "Update-then-Create" funcione como projetado.
  */
 
 const express = require('express');
@@ -18,9 +17,6 @@ try { cookieParser = require('cookie-parser'); } catch (_) { console.warn('[BOOT
 
 const { OAuth2Client, JWT } = require('google-auth-library');
 const admin = require('firebase-admin');
-
-// Módulo de Automação de Marketing
-const marketingAutomator = require('./marketingAutomator');
 
 // fetch (fallback para Node < 18)
 const fetch = (typeof globalThis.fetch === 'function')
@@ -32,8 +28,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '3.0.0';
-const BUILD_DATE = '2025-09-17';
+const VERSION = '2.2.1';
+const BUILD_DATE = '2025-09-07';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -288,6 +284,7 @@ async function upsertDailyFact({ db, anon_id, user_id, tz_offset, event, page, s
   try {
     await docRef.update(updatePayload);
   } catch (error) {
+    // CORREÇÃO: Verifica a mensagem do erro, que é mais confiável que o 'code'.
     if (error.message && error.message.includes('NOT_FOUND')) {
       const seedPayload = {
         kind: 'user',
@@ -574,69 +571,6 @@ app.post('/api/debug/ping-fs', async (req, res) => {
     return res.status(500).json(verbose ? { ok:false, ...payload } : { ok:false, error:'ping_failed' });
   }
 });
-
-
-/* ──────────────────────────────────────────────────────────────
-   NOVO ENDPOINT PARA O FUNIL DE LEAD MAGNET
-─────────────────────────────────────────────────────────────── */
-app.post('/api/send-guide', async (req, res) => {
-    try {
-        const { user_id, anon_id, utms } = req.body;
-        if (!user_id) return res.status(400).json({ ok: false, error: 'missing_user_id' });
-
-        const db = getDB();
-        const userDoc = await db.collection('users').doc(String(user_id)).get();
-        if (!userDoc.exists) return res.status(404).json({ ok: false, error: 'user_not_found' });
-        
-        const userData = userDoc.data();
-        const { email, name } = userData;
-        if (!email) return res.status(400).json({ ok: false, error: 'user_has_no_email' });
-
-        // 1. Gera a URL Dinâmica para o CTA
-        const params = new URLSearchParams({
-            uid: user_id,
-            anon_id: anon_id || 'anon_from_email',
-            utm_source: utms?.utm_source || 'convertkit',
-            utm_medium: 'ebook-cta',
-            utm_campaign: utms?.utm_campaign || 'lead-magnet-guide'
-        });
-        const dynamicUrl = `https://pzadvisors.com/eroxcel-com-latam-text-en-bridge/?${params.toString()}`;
-
-        // 2. Prepara os dados para o módulo de automação
-        const subscriberData = {
-            email: email,
-            first_name: name || '',
-            fields: {
-                dynamic_cta_url: dynamicUrl
-            }
-        };
-
-        // 3. Chama a função genérica do nosso módulo de automação
-        await marketingAutomator.addSubscriberToFunnel(subscriberData);
-        
-        // 4. Loga o evento de sucesso na nossa base (daily_facts)
-        await upsertDailyFact({
-            db,
-            anon_id: anon_id || 'anon_unknown',
-            user_id: user_id,
-            event: 'convertkit_subscribe_success',
-            page: '/free-guide',
-            payload: { email, tagId: process.env.CONVERTKIT_TAG_ID },
-            tsISO: new Date().toISOString()
-        });
-
-        res.status(200).json({ ok: true, message: 'subscriber_added_to_funnel' });
-
-    } catch (e) {
-        console.error(JSON.stringify({
-            route: '/api/send-guide',
-            rid: req.rid,
-            error: e.message || String(e)
-        }));
-        res.status(500).json({ ok: false, error: 'funnel_integration_failed' });
-    }
-});
-
 
 /* ──────────────────────────────────────────────────────────────
    7) Erros globais
