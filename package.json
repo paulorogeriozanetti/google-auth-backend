@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v3.0.2-2025-09-17-convertkit-version-fix",
-  "version": "3.0.2-2025-09-17",
-  "description": "PZ Auth+API Backend – v3.0.2 – 2025-09-17 – ConvertKit-Version-Fix (Versão de correção final que ajusta a versão da dependência 'convertkit' para uma versão existente no repositório npm, resolvendo a falha de build 'ETARGET').",
+  "name": "pz-authapi-backend-v3.0.3-2025-09-17-convertkit-version-lock",
+  "version": "3.0.3-2025-09-17",
+  "description": "PZ Auth+API Backend – v3.0.3 – 2025-09-17 – ConvertKit-Version-Lock (Correção definitiva que fixa a versão exata do pacote 'convertkit' para resolver o erro 'ETARGET' no build).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,7 +16,7 @@
   "dependencies": {
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
-    "convertkit": "^1.2.0",
+    "convertkit": "1.2.0",
     "express": "^4.18.3",
     "firebase-admin": "^12.7.0",
     "google-auth-library": "^10.2.0",
