@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v2.2.2-2025-09-17-revert-stable",
-  "version": "2.2.2-2025-09-17",
-  "description": "PZ Auth+API Backend – v2.2.2 – 2025-09-17 – Revert-Stable (Reverte para a base de código estável para validar o processo de build).",
+  "name": "pz-authapi-backend-v4.0.0-2025-09-17-axios-integration",
+  "version": "4.0.0-2025-09-17",
+  "description": "PZ Auth+API Backend – v4.0.0 – API communication via Axios (Replaces the unstable 'convertkit' npm package with direct API calls using Axios for robustness).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,6 +14,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "axios": "^1.6.8",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.18.3",
