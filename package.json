@@ -1,5 +1,5 @@
 {
-  "name": "pz-authapi-backend-v3.1.2-2025-09-17-final-typo-fix",
+  "name": "pz-authapi-backend-v3.1.2-2025-09-17-final-typo-fix2",
   "version": "3.1.2-2025-09-17",
   "description": "PZ Auth+API Backend – v3.1.2 – 2025-09-17 – Final-Typo-Fix (Correção final que ajusta um typo no nome do pacote 'convertkit' no package.json).",
   "main": "server.js",
