@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v3.1.2-2025-09-17-final-typo-fix2",
-  "version": "3.1.2-2025-09-17",
-  "description": "PZ Auth+API Backend – v3.1.2 – 2025-09-17 – Final-Typo-Fix (Correção final que ajusta um typo no nome do pacote 'convertkit' no package.json).",
+  "name": "pz-authapi-backend-v3.1.3-2025-09-17-final-typo-correction",
+  "version": "3.1.3-2025-09-17",
+  "description": "PZ Auth+API Backend – v3.1.3 – 2025-09-17 – Final-Typo-Correction (Correção final e definitiva do typo no nome do pacote 'convertkit' no package.json).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,7 +16,7 @@
   "dependencies": {
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
-    "convertkit": "1.1.2",
+    "convertkit": "1.1.1",
     "express": "^4.18.3",
     "firebase-admin": "^12.7.0",
     "google-auth-library": "^10.2.0",
