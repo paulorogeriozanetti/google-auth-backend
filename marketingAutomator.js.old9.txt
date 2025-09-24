@@ -1,9 +1,8 @@
 /**
- * PZ Marketing Automator Module – Versão 4.1.0 – 2025-09-24
+ * PZ Marketing Automator Module – Versão 2.0.0 – 2025-09-17
  *
- * - Nenhuma alteração funcional. A versão foi atualizada para alinhar com o
- * server.js v4.1.0. O módulo já suporta a estrutura de dados com nomes separados.
  * - Implementação com Axios para comunicação direta com a API do ConvertKit.
+ * - Remove a dependência do pacote instável 'convertkit' para maior estabilidade.
  */
 
 const axios = require('axios');
@@ -30,7 +29,6 @@ async function addSubscriberToFunnel(subscriberInfo) {
 
   const endpoint = `${CONVERTKIT_API_URL}/tags/${CONVERTKIT_TAG_ID}/subscribe`;
 
-  // O payload é construído dinamicamente a partir do objeto recebido
   const payload = {
     api_key: CONVERTKIT_API_KEY,
     email: subscriberInfo.email,
