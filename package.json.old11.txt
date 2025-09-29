@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v4.2.0-2025-09-29-stable",
-  "version": "4.2.0-2025-09-29",
-  "description": "PZ Auth+API Backend – v4.2.0 – Stable Release. Confirma a implementação estável da integração com o ConvertKit e a lógica de separação de nomes.",
+  "name": "pz-authapi-backend-v4.1.0-2025-09-29-production-ready",
+  "version": "4.1.0-2025-09-29",
+  "description": "PZ Auth+API Backend – v4.1.0 – Production-Ready (Versão final e estável com a integração do ConvertKit via Axios e a lógica de separação de nomes).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

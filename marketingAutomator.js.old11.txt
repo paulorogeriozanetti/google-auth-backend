@@ -1,9 +1,9 @@
 /**
- * PZ Marketing Automator Module – Versão 4.2.0 – 2025-09-29
+ * PZ Marketing Automator Module – Versão 4.1.0 – 2025-09-29
  *
- * - Atualização de versionamento para alinhamento com o server.js v4.2.0.
- * - Nenhuma alteração funcional necessária. O módulo continua estável e
- * pronto para produção, utilizando Axios para a comunicação com o ConvertKit.
+ * - Nenhuma alteração funcional. A versão foi atualizada para alinhar com o
+ * server.js v4.1.0. O módulo já suporta a estrutura de dados com nomes separados.
+ * - Implementação com Axios para comunicação direta com a API do ConvertKit.
  */
 
 const axios = require('axios');
@@ -30,6 +30,7 @@ async function addSubscriberToFunnel(subscriberInfo) {
 
   const endpoint = `${CONVERTKIT_API_URL}/tags/${CONVERTKIT_TAG_ID}/subscribe`;
 
+  // O payload é construído dinamicamente a partir do objeto recebido
   const payload = {
     api_key: CONVERTKIT_API_KEY,
     email: subscriberInfo.email,
@@ -48,6 +49,7 @@ async function addSubscriberToFunnel(subscriberInfo) {
     console.error(`[MARKETING-AUTOMATOR] Erro ao processar assinante ${subscriberInfo.email}:`,
       JSON.stringify(error.response?.data || error.message || error)
     );
+    // Re-lança o erro para que a rota da API possa tratá-lo
     throw error;
   }
 }

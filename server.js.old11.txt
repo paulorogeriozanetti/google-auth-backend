@@ -1,10 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 4.2.0 – 2025-09-29
+ * PZ Auth+API Backend – Versão 4.1.0 – 2025-09-29 – “Name-Splitting-Logic”
  *
- * - Confirmação e versionamento da lógica de integração com ConvertKit.
- * - Nenhuma alteração funcional em relação à v4.1.0, pois a implementação
- * do funil de captura de leads já está correta e estável.
- * - Preserva toda a base de código da versão 4.1.0.
+ * - Reintegra o funil de captura de leads com o ConvertKit via Axios.
+ * - Adiciona a lógica para separar o nome completo do utilizador em "primeiro nome"
+ * e "apelido" para uma personalização de e-mail mais flexível.
+ * - Preserva toda a base de código estável da versão 2.2.1.
  */
 
 const express = require('express');
@@ -28,7 +28,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
    1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '4.2.0';
+const VERSION = '4.1.0';
 const BUILD_DATE = '2025-09-29';
 const PORT = process.env.PORT || 8080;
 
@@ -505,7 +505,7 @@ app.post('/api/track', async (req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────
-   ENDPOINT DO FUNIL DE LEAD MAGNET
+   NOVO ENDPOINT PARA O FUNIL DE LEAD MAGNET
 ─────────────────────────────────────────────────────────────── */
 app.post('/api/send-guide', async (req, res) => {
     try {
@@ -523,7 +523,7 @@ app.post('/api/send-guide', async (req, res) => {
         // Lógica de separação do nome completo
         let firstName = name || '';
         let lastName = '';
-        const nameParts = (name || '').trim().split(/\s+/);
+        const nameParts = (name || '').split(' ');
         if (nameParts.length > 1) {
             firstName = nameParts[0];
             lastName = nameParts.slice(1).join(' ');
