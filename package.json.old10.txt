@@ -1,7 +1,7 @@
 {
-  "name": "pz-authapi-backend-v4.1.0-2025-09-29-production-ready",
-  "version": "4.1.0-2025-09-29",
-  "description": "PZ Auth+API Backend – v4.1.0 – Production-Ready (Versão final e estável com a integração do ConvertKit via Axios e a lógica de separação de nomes).",
+  "name": "pz-authapi-backend-v4.1.0-2025-09-24-name-splitting-logic",
+  "version": "4.1.0-2025-09-24",
+  "description": "PZ Auth+API Backend – v4.1.0 – Name-Splitting-Logic (Adds logic to split the user's full name into first and last names for more flexible email personalization in ConvertKit).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
