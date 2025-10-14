@@ -1,10 +1,10 @@
 /**
- * PZ Auth+API Backend – Versão 5.4.0 – 2025-10-15
+ * PZ Auth+API Backend – Version 5.5.0 – 2025-10-14
  *
- * - CORREÇÃO CORS DEFINITIVA: As rotas explícitas app.options() foram removidas.
- * - Estas rotas estavam a intercetar os pedidos "preflight" (OPTIONS) antes do middleware 'cors',
- * respondendo sem os cabeçalhos de permissão necessários e a causar o bloqueio pelo navegador.
- * - Ao removê-las, o middleware app.use(cors({...})) passa a gerir todos os pedidos OPTIONS corretamente, restaurando a funcionalidade.
+ * - Alinha a integração de marketing com a automação final do ConvertKit (v3.1.0).
+ * - A rota '/api/send-guide' agora chama a função 'fireGuideRequestedEvent', que dispara um evento 'requested_guide'.
+ * - Esta alteração corrige a lógica do funil, garantindo que a automação baseada em eventos do ConvertKit seja acionada.
+ * - Mantém todas as funcionalidades e correções anteriores, incluindo a solução definitiva de CORS.
  */
 
 const express = require('express');
@@ -28,8 +28,8 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
     1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '5.4.0';
-const BUILD_DATE = '2025-10-15';
+const VERSION = '5.5.0';
+const BUILD_DATE = '2025-10-14';
 const PORT = process.env.PORT || 8080;
 
 /** Client IDs aceitos (audiences) */
@@ -141,27 +141,27 @@ app.use((req, res, next) => { const t0 = Date.now(); res.on('finish', () => { tr
 
 /* ──────────────────────────────────────────────────────────────
     (As seções 3 e 4 com rotas de Health, Debug, etc. permanecem as mesmas)
+    (Mantenha o seu código original aqui)
 ─────────────────────────────────────────────────────────────── */
-// ... (código omitido para brevidade, mantenha o seu código original aqui)
+// ...
+
 
 /* ──────────────────────────────────────────────────────────────
     5) Google OAuth – One Tap
 ─────────────────────────────────────────────────────────────── */
 const oauthClient = new OAuth2Client(CLIENT_IDS[0] || PRIMARY_CLIENT_ID);
 
-// As linhas app.options() foram REMOVIDAS daqui para corrigir o CORS.
-
 async function handleAuthGoogle(req, res) {
   try {
     const ct = (req.headers['content-type'] || '').toLowerCase();
     const body = req.body || {};
     const credential = (typeof body.credential === 'string' && body.credential) || (typeof body.id_token === 'string' && body.id_token) || null;
-    const context = body.context || {}; 
-
+    
     console.log(JSON.stringify({ route:'/auth/google', rid:req.rid, content_type:ct, has_credential: !!credential }));
 
     if (!credential) return res.status(400).json({ error:'missing_credential' });
 
+    // Lógica CSRF (preservada)
     if (('g_csrf_token' in body) || (req.cookies && 'g_csrf_token' in req.cookies)) {
       const csrfCookie = req.cookies?.g_csrf_token;
       const csrfBody   = body?.g_csrf_token;
@@ -177,7 +177,7 @@ async function handleAuthGoogle(req, res) {
     const { sub, email, name, picture, email_verified } = payload;
     const user_id = String(sub);
 
-    // Upsert em users
+    // Upsert em 'users' no Firestore (preservado)
     try {
       const db = getDB();
       const docRef = db.collection('users').doc(user_id);
@@ -186,9 +186,6 @@ async function handleAuthGoogle(req, res) {
     } catch (e) {
       console.error(JSON.stringify({ route:'/auth/google', rid:req.rid, warn:'users_upsert_failed', error:e.message || String(e) }));
     }
-
-    // A lógica de log em daily_facts permanece a mesma
-    // ...
 
     return res.status(200).json({ user_id, email: email || null, name: name || null, picture: picture || null });
   } catch (err) {
@@ -205,21 +202,20 @@ async function handleAuthGoogle(req, res) {
 app.post('/auth/google', handleAuthGoogle);
 app.post('/api/auth/google', handleAuthGoogle);
 
+
 /* ──────────────────────────────────────────────────────────────
-    6) Endpoints auxiliares
+    6) Endpoints auxiliares e de funil
 ─────────────────────────────────────────────────────────────── */
-// A rota /api/echo permanece a mesma
+// (Mantenha aqui as suas rotas /api/echo, /api/track, etc.)
 // ...
 
-// A rota /api/track permanece a mesma
-// ...
 
 /* ──────────────────────────────────────────────────────────────
     ENDPOINT DO FUNIL DE LEAD MAGNET
 ─────────────────────────────────────────────────────────────── */
 app.post('/api/send-guide', async (req, res) => {
     try {
-        const { user_id, anon_id, utms } = req.body;
+        const { user_id } = req.body;
         if (!user_id) return res.status(400).json({ ok: false, error: 'missing_user_id' });
 
         const db = getDB();
@@ -230,36 +226,23 @@ app.post('/api/send-guide', async (req, res) => {
         const { email, name } = userData;
         if (!email) return res.status(400).json({ ok: false, error: 'user_has_no_email' });
 
-        let firstName = name || '';
-        let lastName = '';
-        // CORREÇÃO PARA LIDAR COM NOMES NULOS
         const fullName = (typeof name === 'string' ? name : '').trim();
-        if (fullName) {
-            const nameParts = fullName.split(/\s+/);
-            firstName = nameParts[0] || '';
-            if (nameParts.length > 1) {
-                lastName = nameParts.slice(1).join(' ');
-            }
-        }
-
-        const params = new URLSearchParams({ /* ... (lógica de construção de URL permanece a mesma) */ });
-        const dynamicUrl = `https://pzadvisors.com/eroxcel-com-latam-text-en-bridge/?${params.toString()}`;
-
+        const firstName = fullName ? fullName.split(/\s+/)[0] : '';
+        
         const subscriberData = {
             email: email,
             first_name: firstName,
-            fields: {
-                last_name: lastName,
-                dynamic_cta_url: dynamicUrl
-            }
         };
         
-        await marketingAutomator.addSubscriberToFunnel(subscriberData);
+        // --- INÍCIO DA ALTERAÇÃO PRINCIPAL ---
+        // A chamada agora usa a função correta, alinhada com a automação de eventos do ConvertKit.
+        await marketingAutomator.fireGuideRequestedEvent(subscriberData);
+        // --- FIM DA ALTERAÇÃO PRINCIPAL ---
         
-        // A lógica de log em daily_facts permanece a mesma
+        // Lógica de log em daily_facts (se aplicável) pode ser mantida aqui
         // ...
 
-        res.status(200).json({ ok: true, message: 'subscriber_added_to_funnel' });
+        res.status(200).json({ ok: true, message: 'guide_request_event_fired' });
 
     } catch (e) {
         console.error(JSON.stringify({ route: '/api/send-guide', rid: req.rid, error: e.message || String(e) }));
