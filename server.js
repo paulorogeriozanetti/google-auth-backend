@@ -1,10 +1,10 @@
 /**
- * PZ Auth+API Backend – Version 5.5.0 FIX – 2025-10-14
+ * PZ Auth+API Backend – Version 5.5.1 (Hotfix) – 2025-10-14
  *
- * - Alinha a integração de marketing com a automação final do ConvertKit (v3.1.0).
- * - A rota '/api/send-guide' agora chama a função 'fireGuideRequestedEvent', que dispara um evento 'requested_guide'.
- * - Esta alteração corrige a lógica do funil, garantindo que a automação baseada em eventos do ConvertKit seja acionada.
- * - Mantém todas as funcionalidades e correções anteriores, incluindo a solução definitiva de CORS.
+ * - HOTFIX: Reverte a chamada na rota /api/send-guide para 'addSubscriberToFunnel'.
+ * - Esta alteração garante retrocompatibilidade com a versão v2.0.0 do 'marketingAutomator.js'
+ * que está atualmente em produção, resolvendo o erro 'TypeError'.
+ * - A solução de longo prazo é atualizar ambos os ficheiros para a lógica de eventos.
  */
 
 const express = require('express');
@@ -28,7 +28,7 @@ const app = express();
 /* ──────────────────────────────────────────────────────────────
     1) Config / Vars
 ─────────────────────────────────────────────────────────────── */
-const VERSION = '5.5.0';
+const VERSION = '5.5.1 (Hotfix)';
 const BUILD_DATE = '2025-10-14';
 const PORT = process.env.PORT || 8080;
 
@@ -143,7 +143,7 @@ app.use((req, res, next) => { const t0 = Date.now(); res.on('finish', () => { tr
     (As seções 3 e 4 com rotas de Health, Debug, etc. permanecem as mesmas)
     (Mantenha o seu código original aqui)
 ─────────────────────────────────────────────────────────────── */
-// ...
+// ... (código omitido para brevidade, mantenha o seu código original aqui)
 
 
 /* ──────────────────────────────────────────────────────────────
@@ -161,7 +161,6 @@ async function handleAuthGoogle(req, res) {
 
     if (!credential) return res.status(400).json({ error:'missing_credential' });
 
-    // Lógica CSRF (preservada)
     if (('g_csrf_token' in body) || (req.cookies && 'g_csrf_token' in req.cookies)) {
       const csrfCookie = req.cookies?.g_csrf_token;
       const csrfBody   = body?.g_csrf_token;
@@ -177,7 +176,6 @@ async function handleAuthGoogle(req, res) {
     const { sub, email, name, picture, email_verified } = payload;
     const user_id = String(sub);
 
-    // Upsert em 'users' no Firestore (preservado)
     try {
       const db = getDB();
       const docRef = db.collection('users').doc(user_id);
@@ -207,7 +205,7 @@ app.post('/api/auth/google', handleAuthGoogle);
     6) Endpoints auxiliares e de funil
 ─────────────────────────────────────────────────────────────── */
 // (Mantenha aqui as suas rotas /api/echo, /api/track, etc.)
-// ...
+// ... (código omitido para brevidade, mantenha o seu código original aqui)
 
 
 /* ──────────────────────────────────────────────────────────────
@@ -234,15 +232,13 @@ app.post('/api/send-guide', async (req, res) => {
             first_name: firstName,
         };
         
-        // --- INÍCIO DA ALTERAÇÃO PRINCIPAL ---
-        // A chamada agora usa a função correta, alinhada com a automação de eventos do ConvertKit.
-        await marketingAutomator.fireGuideRequestedEvent(subscriberData);
-        // --- FIM DA ALTERAÇÃO PRINCIPAL ---
+        // --- INÍCIO DO HOTFIX ---
+        // A chamada foi revertida para 'addSubscriberToFunnel' para ser compatível
+        // com o marketingAutomator.js v2.0.0 que está em produção.
+        await marketingAutomator.addSubscriberToFunnel(subscriberData);
+        // --- FIM DO HOTFIX ---
         
-        // Lógica de log em daily_facts (se aplicável) pode ser mantida aqui
-        // ...
-
-        res.status(200).json({ ok: true, message: 'guide_request_event_fired' });
+        res.status(200).json({ ok: true, message: 'subscriber_added_to_funnel' });
 
     } catch (e) {
         console.error(JSON.stringify({ route: '/api/send-guide', rid: req.rid, error: e.message || String(e) }));
