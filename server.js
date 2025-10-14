@@ -1,5 +1,5 @@
 /**
- * PZ Auth+API Backend – Version 5.5.0 – 2025-10-14
+ * PZ Auth+API Backend – Version 5.5.0 FIX – 2025-10-14
  *
  * - Alinha a integração de marketing com a automação final do ConvertKit (v3.1.0).
  * - A rota '/api/send-guide' agora chama a função 'fireGuideRequestedEvent', que dispara um evento 'requested_guide'.

@@ -1,6 +1,6 @@
 /**
  * PZ Advisors - Marketing Automation Module
- * Version: v3.1.0 (Debug-Enhanced)
+ * Version: v3.1.0 (Debug-Enhanced FIX)
  * Date: 2025-10-14
  * Desc: Implementa a lógica correta de 'disparo de evento' e adiciona logging detalhado.
  * - Altera a estratégia de 'adicionar tag' para 'disparar evento', alinhando-se com a automação final do ConvertKit.
