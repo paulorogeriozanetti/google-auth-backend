@@ -1,0 +1,25 @@
+{
+  "name": "pz-authapi-backend-v4.2.0-2025-09-29-stable",
+  "version": "4.2.0-2025-09-29",
+  "description": "PZ Auth+API Backend – v4.2.0 – Stable Release. Confirma a implementação estável da integração com o ConvertKit e a lógica de separação de nomes.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "PORT=8080 node server.js",
+    "dev:win": "set PORT=8080&& node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "express": "^4.18.3",
+    "firebase-admin": "^12.7.0",
+    "google-auth-library": "^10.2.0",
+    "node-fetch": "^3.3.2"
+  }
+}
