@@ -1,12 +1,15 @@
 {
-  "name": "pz-authapi-backend-v4.2.0-2025-09-29-stable",
-  "version": "4.2.0-2025-09-29",
-  "description": "PZ Auth+API Backend – v4.2.0 – Stable Release. Confirma a implementação estável da integração com o ConvertKit e a lógica de separação de nomes.",
+  "name": "pz-authapi-backend-v5.0.3-2025-10-25-adapters",
+  "version": "5.0.3-2025-10-25",
+  "description": "PZ Auth+API Backend – v5.0.3 – Implementação final da arquitetura de Adapters (v1.1.4) e correções dos duplo checks.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "PORT=8080 node server.js",
-    "dev:win": "set PORT=8080&& node server.js"
+    "dev": "PORT=8081 node server.js",
+    "dev:win": "set PORT=8081&& node server.js",
+    "test": "jest",
+    "test:unit": "jest src/adapters",
+    "test:integration": "jest src/__tests__/server.integration.test.js"
   },
   "engines": {
     "node": ">=18"
@@ -15,11 +18,17 @@
   "license": "ISC",
   "dependencies": {
     "axios": "^1.6.8",
+    "cheerio": "^1.0.0-rc.12",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "express": "^4.18.3",
     "firebase-admin": "^12.7.0",
     "google-auth-library": "^10.2.0",
     "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.0",
+    "jest": "^30.2.0",
+    "supertest": "^7.1.4"
   }
 }
