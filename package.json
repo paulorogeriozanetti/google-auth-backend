@@ -1,15 +1,15 @@
 {
-  "name": "pz-authapi-backend-v5.0.3-2025-10-25-adapters",
-  "version": "5.0.3-2025-10-25",
-  "description": "PZ Auth+API Backend – v5.0.3 – Implementação final da arquitetura de Adapters (v1.1.4) e correções dos duplo checks.",
+  "name": "pz-authapi-backend-v5.0.4-2025-10-25-adapters-stable",
+  "version": "5.0.4-2025-10-25",
+  "description": "PZ Auth+API Backend – v5.0.4 – Versão estável pós-deploy da arquitetura de Adapters (v1.1.4).",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "PORT=8081 node server.js",
     "dev:win": "set PORT=8081&& node server.js",
     "test": "jest",
-    "test:unit": "jest src/adapters",
-    "test:integration": "jest src/__tests__/server.integration.test.js"
+    "test:unit": "jest Adapter\\.test\\.js$",
+    "test:integration": "jest server\\.integration\\.test\\.js$"
   },
   "engines": {
     "node": ">=18"
