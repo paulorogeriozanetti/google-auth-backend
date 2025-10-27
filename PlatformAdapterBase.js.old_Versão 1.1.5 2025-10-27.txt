@@ -1,11 +1,11 @@
-console.log('--- [BOOT CHECK] Loading PlatformAdapterBase v1.1.6 ---'); 
 /**
  * PZ Advisors - Platform Adapter Base / Factory
- * Versão: 1.1.6 (Patch de Diagnóstico)
+ * Versão: 1.1.5 (Patch de Correção Node.js)
  * Data: 2025-10-27
- * Desc: Adiciona log de diagnóstico ('[BOOT CHECK]') na linha 1
- * para verificar qual versão está sendo carregada no Railway.
- * - Mantém a correção v1.1.5 ('File is not defined').
+ * Desc: Corrige erro 'File is not defined' no runtime do Node.js.
+ * - Adiciona "typeof File" para proteger as verificações 'instanceof File'
+ * dentro da função safeLog, que causava falha no 'require' do módulo.
+ * - Mantém toda a lógica v1.1.4.
  */
 class PlatformAdapterBase {
     /**
@@ -31,7 +31,7 @@ class PlatformAdapterBase {
                     break;
                 // Adicione outros casos aqui
                 default:
-                    console.warn(`[AdapterFactory v1.1.6] Plataforma não suportada: ${platformName}`);
+                    console.warn(`[AdapterFactory v1.1.5] Plataforma não suportada: ${platformName}`);
                     throw new Error(`Plataforma não suportada: ${platformName}`);
             }
 
@@ -46,13 +46,13 @@ class PlatformAdapterBase {
             });
 
             // Adiciona metadados para logging/identificação
-            instance.__meta = instance.__meta || { platform, version: instance.version || '1.1.6' }; // Usa a versão do adapter ou a desta base
+            instance.__meta = instance.__meta || { platform, version: instance.version || '1.1.5' }; // Usa a versão do adapter ou a desta base
 
-            console.log(`[AdapterFactory v1.1.6] Instância criada para: ${platformName} (Versão: ${instance.__meta.version})`);
+            console.log(`[AdapterFactory v1.1.5] Instância criada para: ${platformName} (Versão: ${instance.__meta.version})`);
             return instance;
 
         } catch (error) {
-            console.error(`[AdapterFactory v1.1.6] Falha ao instanciar adapter ${platformName}:`, error?.message || error);
+            console.error(`[AdapterFactory v1.1.5] Falha ao instanciar adapter ${platformName}:`, error?.message || error);
             throw error;
         }
     }
@@ -82,7 +82,8 @@ class PlatformAdapterBase {
         // headers sensíveis
         ['authorization','cookie','set-cookie'].forEach(k => SENSITIVE_KEYS_SET.add(k));
 
-        // Funções seguras para verificar tipos de Navegador (v1.1.5)
+        // --- INÍCIO DA CORREÇÃO v1.1.5 ---
+        // Funções seguras para verificar tipos de Navegador
         const isWebFile = (val) => {
           if (typeof File === 'undefined') return false;
           try { return val instanceof File; } catch { return false; }
@@ -91,6 +92,7 @@ class PlatformAdapterBase {
           if (typeof FileList === 'undefined') return false;
           try { return val instanceof FileList; } catch { return false; }
         };
+        // --- FIM DA CORREÇÃO v1.1.5 ---
 
         // Função recursiva de sanitização
         const scrub = (value, kPath = []) => {
@@ -115,9 +117,11 @@ class PlatformAdapterBase {
           
           // 5. Se for Array, aplica recursivamente
           if (Array.isArray(value)) {
-            // Correção v1.1.5
+            // --- INÍCIO DA CORREÇÃO v1.1.5 ---
+            // (NOTA: Verificação insegura removida e substituída)
             if (isWebFile(value)) return '<File: hidden>';
             if (isWebFileList(value)) return `<FileList: ${value.length} items hidden>`;
+            // --- FIM DA CORREÇÃO v1.1.5 ---
             
             return value.map((item, idx) => scrub(item, kPath.concat(idx)));
           }
@@ -142,7 +146,7 @@ class PlatformAdapterBase {
         return scrub(clonedObj); // Inicia a recursão
 
       } catch (e) {
-        console.error('[safeLog v1.1.6] Erro ao sanitizar log:', e);
+        console.error('[safeLog v1.1.5] Erro ao sanitizar log:', e);
         return { error: 'Falha ao sanitizar log', originalType: typeof obj };
       }
     }

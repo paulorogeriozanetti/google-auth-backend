@@ -1,22 +1,25 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.2.2 ---'); 
 /**
  * PZ Advisors - Clickbank Adapter
- * Versão: 1.2.2 (Patch de Diagnóstico)
+ * Versão: 1.2.1 (Scraper de Múltiplos Links)
  * Data: 2025-10-27
- * Desc: Adiciona log de diagnóstico ('[BOOT CHECK]') na linha 1
- * para verificar qual versão está sendo carregada no Railway.
- * - Mantém a lógica v1.2.1 (Scraper de Múltiplos Links).
+ * Desc:
+ * - CORRIGE a lógica do scraper (v1.2.0) para retornar um ARRAY de
+ * todos os links de checkout (...pay.clickbank.net...) encontrados,
+ * em vez de apenas o primeiro.
+ * - Isso permite que o frontend (presell clonada) popule
+ * múltiplas opções de pacotes (ex: 1, 3, 6 garrafas).
+ * - Mantém todos os patches anteriores (v1.1.17).
  */
 const axios = require('axios');
 const crypto = require('crypto');
-const cheerio = require('cheerio'); 
+const cheerio = require('cheerio'); // Certifique-se que 'cheerio' está no package.json
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
 class ClickbankAdapter extends PlatformAdapterBase {
     constructor() {
         super();
-        this.version = '1.2.2'; // Atualizado
-        this.logPrefix = '[ClickbankAdapter v1.2.2]';
+        this.version = '1.2.1';
+        this.logPrefix = '[ClickbankAdapter v1.2.1]';
         
         // A verificação da WEBHOOK_SECRET_KEY fica em verifyWebhook()
         this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
@@ -77,25 +80,33 @@ class ClickbankAdapter extends PlatformAdapterBase {
             const html = response.data;
             const $ = cheerio.load(html);
 
-            // Lógica v1.2.1 (retorna array)
-            const checkoutLinks = []; 
+            // --- INÍCIO DA ALTERAÇÃO v1.2.1 ---
+            const checkoutLinks = []; // Inicializa um array
+            
+            // Procura por links de checkout direto do Clickbank
             $('a[href*="pay.clickbank.net"]').each((i, elem) => {
                 const link = $(elem).attr('href');
                 if (link) {
-                    checkoutLinks.push(link); 
+                    checkoutLinks.push(link); // Adiciona CADA link encontrado
                 }
             });
 
             if (checkoutLinks.length > 0) {
                 console.log(`${this.logPrefix} SUCESSO. ${checkoutLinks.length} links de checkout encontrados.`);
+                // Retorna o ARRAY de links
                 return checkoutLinks; 
-            } else {
+            } 
+            // --- FIM DA ALTERAÇÃO v1.2.1 ---
+            else {
                 console.warn(`${this.logPrefix} Scrape falhou (nenhum link 'pay.clickbank.net' encontrado). Usando fallback.`);
+                // FALLBACK: Retorna o hoplink rastreado (string)
                 return trackedHoplink;
             }
 
         } catch (scrapeError) {
             console.error(`${this.logPrefix} Erro durante o scrape:`, scrapeError.message);
+            // FALLBACK SEGURO: Se o scrape falhar (timeout, erro de SSL, etc),
+            // retorna o hoplink rastreado (Etapa 1). O fluxo não quebra.
             console.warn(`${this.logPrefix} Usando fallback (HopLink rastreado) devido a erro.`);
             return trackedHoplink;
         }
@@ -106,7 +117,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
      * Verifica e descriptografa o webhook (INS) do Clickbank.
      */
     async verifyWebhook(rawBodyBuffer, headers) {
-        // Verificação JIT da chave secreta (v1.1.17)
+        // Verificação JIT (Just-in-Time) da chave secreta
         if (!this.WEBHOOK_SECRET_KEY) {
             console.error(`${this.logPrefix} Webhook falhou: Variável de ambiente CLICKBANK_WEBHOOK_SECRET_KEY não configurada.`);
             return null;
@@ -126,11 +137,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
         }
 
         try {
-            // 1. Validação HMAC
+            // 1. Validação HMAC (SHA-256)
             const hmac = crypto.createHmac('sha256', this.WEBHOOK_SECRET_KEY);
             hmac.update(rawBodyBuffer);
             const calculatedSignature = hmac.digest('hex');
 
+            // Comparação segura
             const sigBuf = Buffer.from(signatureHeader, 'hex');
             const calcSigBuf = Buffer.from(calculatedSignature, 'hex');
             
@@ -140,7 +152,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
             }
             console.log(`${this.logPrefix} Validação HMAC do Webhook OK.`);
 
-            // 2. Descriptografia
+            // 2. Descriptografia (AES-256-CBC)
             const iv = Buffer.from(ivHeader, 'base64');
             const key = crypto.createHash('sha256').update(this.WEBHOOK_SECRET_KEY).digest();
             
