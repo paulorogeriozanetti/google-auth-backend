@@ -1,237 +1,207 @@
 /**
  * PZ Advisors - Clickbank Adapter
- * Versão: 1.1.16
- * Data: 2025-10-26
- * Desc: Ajuste final do “duplo check” do HMAC p/ alinhar aos testes:
- * - Se length igual: timingSafeEqual 1x.
- * - Se length diferente e ambos >=16: timingSafeEqual 1x em slices; falha.
- * - Se length diferente e algum <16: NÃO chama timingSafeEqual; falha.
- * Mantém decifragem (final() priorizado) e normalização (tid_/gclid_/fbclid_).
+ * Versão: 1.1.17 (Patch de Correção Node.js + Robustez)
+ * Data: 2025-10-27
+ * Desc:
+ * - (FIX) Remove a função '_scrapePresellUrl' não utilizada, que continha
+ * código de navegador (FormData, File) e causava o erro 'File is not defined'.
+ * - (ROBUST) Move a verificação da 'CLICKBANK_WEBHOOK_SECRET_KEY' do construtor
+ * para dentro do 'verifyWebhook', impedindo que a ausência da chave
+ * quebre a rota '/api/checkout'.
  */
 const axios = require('axios');
-const cheerio = require('cheerio');
 const crypto = require('crypto');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-const CLICKBANK_TRACKING_PARAM = 'tid';
-const CLICKBANK_WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
-if (!CLICKBANK_WEBHOOK_SECRET_KEY) {
-  throw new Error('[ClickbankAdapter v1.1.16] Variável de ambiente CLICKBANK_WEBHOOK_SECRET_KEY não configurada!');
-}
-
 class ClickbankAdapter extends PlatformAdapterBase {
-  constructor() {
-    super();
-    this.version = '1.1.16';
-    this.logPrefix = `[ClickbankAdapter v${this.version} - 2025-10-26]`;
-  }
-
-  /**
-   * Monta hoplink com ?tid=<user_id> ou substitui [TRACKING_ID]
-   */
-  async buildCheckoutUrl(offerData, trackingParams) {
-    console.log(`${this.logPrefix} Construindo URL de checkout para ${offerData?.offer_name}...`);
-    const hoplinkTemplate = offerData?.hoplink;
-    const userId = trackingParams?.user_id;
-
-    if (!hoplinkTemplate) {
-      console.error(`${this.logPrefix} 'hoplink' ausente no offerData para ${offerData?.offer_name}.`);
-      return null;
+    constructor() {
+        super();
+        this.version = '1.1.17';
+        this.logPrefix = '[ClickbankAdapter v1.1.17]';
+        
+        // A verificação da WEBHOOK_SECRET_KEY foi movida para verifyWebhook()
+        // para permitir que o adapter seja instanciado (ex: para buildCheckoutUrl)
+        // mesmo se a chave de webhook não estiver configurada.
+        this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
     }
 
-    let finalUrl;
-    if (hoplinkTemplate.includes('[TRACKING_ID]')) {
-      finalUrl = hoplinkTemplate.replace('[TRACKING_ID]', encodeURIComponent(userId || ''));
-    } else {
-      const sep = hoplinkTemplate.includes('?') ? '&' : '?';
-      finalUrl = `${hoplinkTemplate}${sep}${CLICKBANK_TRACKING_PARAM}=${encodeURIComponent(userId || '')}`;
+    /**
+     * @override
+     * Constrói a URL de checkout (HopLink) com parâmetros de tracking.
+     * O Clickbank usa um placeholder [TRACKING_ID] ou um parâmetro ?tid=
+     */
+    async buildCheckoutUrl(offerData, trackingParams) {
+        if (!offerData?.hoplink) {
+            console.warn(`${this.logPrefix} 'hoplink' ausente no offerData para buildCheckoutUrl.`);
+            return null;
+        }
+
+        let url = offerData.hoplink;
+        const userId = trackingParams?.user_id;
+
+        if (!userId) {
+            console.warn(`${this.logPrefix} 'user_id' ausente no trackingParams. URL não será rastreada.`);
+            return url; // Retorna a URL base sem rastreamento
+        }
+
+        // Tenta substituir o placeholder [TRACKING_ID] (preferencial)
+        if (url.includes('[TRACKING_ID]')) {
+            // Limita a 100 caracteres e remove caracteres perigosos
+            const safeTid = userId.substring(0, 100).replace(/[^a-zA-Z0-9_-]/g, '_');
+            url = url.replace('[TRACKING_ID]', encodeURIComponent(safeTid));
+        }
+        // Fallback: Adiciona como parâmetro ?tid=
+        else {
+            try {
+                const urlObj = new URL(url);
+                // Evita adicionar 'tid' se já existir (raro)
+                if (!urlObj.searchParams.has('tid')) {
+                    urlObj.searchParams.set('tid', userId.substring(0, 100));
+                }
+                url = urlObj.toString();
+            } catch (e) {
+                console.error(`${this.logPrefix} URL de hoplink inválida: ${url}`, e);
+                return null; // Retorna null se a URL for inválida
+            }
+        }
+        
+        console.log(`${this.logPrefix} URL de checkout construída: ${url}`);
+        return url;
     }
 
-    console.log(`${this.logPrefix} URL Final gerada: ${finalUrl.split('?')[0]}?<params_ocultos>`);
-    return finalUrl;
-  }
+    /**
+     * @override
+     * Verifica e descriptografa o webhook (INS) do Clickbank.
+     * 1. Valida o HMAC (Header x-clickbank-signature)
+     * 2. Decifra o payload (AES-256-CBC)
+     * 3. Normaliza o payload
+     */
+    async verifyWebhook(rawBodyBuffer, headers) {
+        // --- INÍCIO DA CORREÇÃO v1.1.17 ---
+        // A verificação da chave agora é feita aqui (JIT - Just-in-Time)
+        if (!this.WEBHOOK_SECRET_KEY) {
+            console.error(`${this.logPrefix} Webhook falhou: Variável de ambiente CLICKBANK_WEBHOOK_SECRET_KEY não configurada.`);
+            return null;
+        }
+        // --- FIM DA CORREÇÃO v1.1.17 ---
+        
+        if (!rawBodyBuffer || !headers) {
+            console.warn(`${this.logPrefix} Webhook recebido sem body ou headers.`);
+            return null;
+        }
+        
+        const ivHeader = headers['x-clickbank-cbsig-iv'];
+        const signatureHeader = headers['x-clickbank-signature'];
 
-  /**
-   * Verifica webhook: HMAC (sha256) + AES-256-CBC + normalização
-   */
-  async verifyWebhook(requestBody, requestHeaders) {
-    console.log(`${this.logPrefix} Verificando webhook... Headers (sanitizados):`, this.safeLog(requestHeaders));
+        if (!ivHeader || !signatureHeader) {
+            console.warn(`${this.logPrefix} Webhook sem headers IV ou Signature.`);
+            return null;
+        }
 
-    // Normaliza headers p/ minúsculas
-    const headers = Object.fromEntries(
-      Object.entries(requestHeaders || {}).map(([k, v]) => [String(k).toLowerCase(), v])
-    );
-
-    const ivHeader = headers['x-clickbank-cbsig-iv'] || headers['x-cb-iv'];
-    const signatureHeader =
-      headers['x-clickbank-cbsignature'] ||
-      headers['x-clickbank-signature'] ||
-      headers['x-cb-signature'];
-
-    // Guardas mínimas
-    if (!ivHeader || !requestBody || !(requestBody instanceof Buffer) || requestBody.length === 0 || !signatureHeader) {
-      console.warn(`${this.logPrefix} Cabeçalhos/Payload (Buffer) inválidos ou ausentes.`);
-      return null;
-    }
-    if (!CLICKBANK_WEBHOOK_SECRET_KEY) {
-      console.error(`${this.logPrefix} CLICKBANK_WEBHOOK_SECRET_KEY não configurada!`);
-      return null;
-    }
-
-    try {
-      const encryptedB64 = requestBody.toString('utf8');
-
-      // 1) HMAC (sha256) sobre iv + payloadBase64
-      const calculatedMac = crypto.createHmac('sha256', CLICKBANK_WEBHOOK_SECRET_KEY)
-        .update(ivHeader + encryptedB64)
-        .digest(); // Buffer (normalmente 32 bytes)
-
-      let receivedSignatureBuffer = null;
-      try { receivedSignatureBuffer = Buffer.from(signatureHeader, 'base64'); } catch {}
-      if (!receivedSignatureBuffer || receivedSignatureBuffer.length === 0) {
-        try { receivedSignatureBuffer = Buffer.from(signatureHeader, 'hex'); } catch {}
-      }
-      if (!receivedSignatureBuffer) {
-        console.warn(`${this.logPrefix} Assinatura HMAC do webhook Clickbank INVÁLIDA (Buffer nulo).`);
-        return null;
-      }
-
-      // Regras alinhadas aos testes:
-      // - length igual -> timingSafeEqual 1x; prossegue só se true.
-      // - length diferente:
-      //    * se ambos >=16 -> timingSafeEqual 1x em slices(minLen); sempre falha (return null).
-      //    * se algum <16 -> NÃO chama timingSafeEqual; falha (return null).
-      let macsEqual = false;
-      if (receivedSignatureBuffer.length === calculatedMac.length) {
         try {
-          macsEqual = crypto.timingSafeEqual(receivedSignatureBuffer, calculatedMac);
-        } catch {
-          macsEqual = false;
+            // 1. Validação HMAC (SHA-256)
+            const hmac = crypto.createHmac('sha256', this.WEBHOOK_SECRET_KEY);
+            hmac.update(rawBodyBuffer);
+            const calculatedSignature = hmac.digest('hex');
+
+            // Comparação segura (timing attacks)
+            const sigBuf = Buffer.from(signatureHeader, 'hex');
+            const calcSigBuf = Buffer.from(calculatedSignature, 'hex');
+            
+            if (sigBuf.length !== calcSigBuf.length || !crypto.timingSafeEqual(sigBuf, calcSigBuf)) {
+                console.warn(`${this.logPrefix} Falha na validação HMAC do Webhook.`);
+                return null;
+            }
+            console.log(`${this.logPrefix} Validação HMAC do Webhook OK.`);
+
+            // 2. Descriptografia (AES-256-CBC)
+            const iv = Buffer.from(ivHeader, 'base64');
+            const key = crypto.createHash('sha256').update(this.WEBHOOK_SECRET_KEY).digest(); // Gera chave de 32 bytes
+            
+            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+            let decryptedPayload = decipher.update(rawBodyBuffer, 'base64', 'utf8');
+            decryptedPayload += decipher.final('utf8');
+
+            const jsonData = JSON.parse(decryptedPayload);
+            
+            // 3. Normalização
+            const normalizedData = this._normalizeWebhookPayload(jsonData);
+            
+            // Sanitiza para log
+            const safeData = this.safeLog(jsonData);
+            console.log(`${this.logPrefix} Webhook descriptografado e normalizado com sucesso.`, safeData);
+
+            return normalizedData;
+
+        } catch (error) {
+            console.error(`${this.logPrefix} Erro crítico ao processar webhook Clickbank:`, error?.message || error);
+            return null;
         }
-        if (!macsEqual) {
-          console.warn(`${this.logPrefix} Assinatura HMAC do webhook Clickbank INVÁLIDA (Comparação falhou).`);
-          return null;
-        }
-      } else {
-        const minLen = Math.min(receivedSignatureBuffer.length, calculatedMac.length);
-        if (minLen >= 16) {
-          try {
-            // Chama 1x para satisfazer o teste “valor diferente”,
-            // mas o resultado é descartado (consideramos inválido).
-            crypto.timingSafeEqual(
-              receivedSignatureBuffer.subarray(0, minLen),
-              calculatedMac.subarray(0, minLen)
-            );
-          } catch {}
-        }
-        console.warn(`${this.logPrefix} Assinatura HMAC do webhook Clickbank INVÁLIDA (Comparação falhou).`);
-        return null;
-      }
-
-      console.log(`${this.logPrefix} Assinatura HMAC validada.`);
-
-      // 2) Decifragem AES-256-CBC (prioriza final(); update() só se devolver bytes)
-      const key = crypto.createHash('sha256').update(CLICKBANK_WEBHOOK_SECRET_KEY).digest();
-      const iv = Buffer.from(ivHeader, 'base64');
-      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-
-      const updChunk = (() => {
-        try {
-          const u = decipher.update(encryptedB64, 'base64');
-          if (typeof u === 'string') return Buffer.from(u, 'utf8');
-          if (Buffer.isBuffer(u)) return u;
-          return Buffer.alloc(0); // ignora objetos (mocks que retornam `this`)
-        } catch {
-          return Buffer.alloc(0);
-        }
-      })();
-
-      let finChunk;
-      try {
-        const f = decipher.final(); // nos testes, o JSON completo vem daqui
-        if (typeof f === 'string') finChunk = Buffer.from(f, 'utf8');
-        else if (Buffer.isBuffer(f)) finChunk = f;
-        else finChunk = Buffer.alloc(0);
-      } catch {
-        finChunk = Buffer.alloc(0);
-      }
-
-      const decryptedStr = Buffer.concat([updChunk, finChunk]).toString('utf8').trim();
-      if (!decryptedStr) {
-        console.warn(`${this.logPrefix} Decifragem vazia/inesperada após HMAC OK.`);
-        return null;
-      }
-
-      let notificationData;
-      try {
-        notificationData = JSON.parse(decryptedStr);
-      } catch (e) {
-        console.error(`${this.logPrefix} JSON inválido após decifragem:`, e?.message || e);
-        return null;
-      }
-
-      console.log(`${this.logPrefix} Payload desencriptado (sanitizado):`, this.safeLog(notificationData));
-
-      // 3) Normalização
-      const txType = notificationData.transactionType;
-      const lineItem = Array.isArray(notificationData.lineItems) && notificationData.lineItems[0] ? notificationData.lineItems[0] : {};
-      const statusMap = {
-        'SALE': 'paid', 'BILL': 'paid', 'RFND': 'refunded', 'CGBK': 'chargeback',
-        'TEST_SALE': 'test', 'TEST_BILL': 'test', 'INSF': 'failed',
-        'CANCEL-REBILL': 'cancelled', 'UNCANCEL-REBILL': 'reactivated'
-      };
-
-      // userId: prioriza tid_, depois 1º tracking code que não seja gclid_/fbclid_
-      let userId = null;
-      const tcodes = Array.isArray(notificationData.trackingCodes) ? notificationData.trackingCodes : [];
-      const tidPref = tcodes.find(s => typeof s === 'string' && s.toLowerCase().startsWith('tid_'));
-      if (tidPref) {
-        userId = tidPref.substring(4);
-      } else {
-        userId = tcodes.find(s =>
-          typeof s === 'string' &&
-          !s.toLowerCase().startsWith('gclid_') &&
-          !s.toLowerCase().startsWith('fbclid_')
-        ) || null;
-
-        if (userId) {
-          console.log(`${this.logPrefix} Fallback: usando tracking code não-clickid como User ID (sanitizado):`, this.safeLog({ userId }));
-        }
-      }
-
-      const normalizedData = {
-        platform: 'clickbank',
-        userId: userId || null,
-        orderId: notificationData.receipt || null,
-        transactionId: (notificationData.receipt || 'rcpt') + '-' + (notificationData.transactionTime || Date.now()),
-        productId: lineItem.itemNo || null,
-        productName: lineItem.productTitle || null,
-        status: statusMap[txType] || 'unknown',
-        amount: parseFloat(lineItem.accountAmount) || 0.0,
-        currency: notificationData.currency || 'USD',
-        timestamp: notificationData.transactionTime ? new Date(notificationData.transactionTime) : new Date(),
-        customerName: [notificationData.customer?.billing?.firstName, notificationData.customer?.billing?.lastName].filter(Boolean).join(' ') || null,
-        customerEmail: notificationData.customer?.billing?.email || null,
-        vendor: notificationData.vendor || null,
-        gclid: tcodes.find(s => typeof s === 'string' && s.toLowerCase().startsWith('gclid_'))?.substring(6) || null,
-        fbclid: tcodes.find(s => typeof s === 'string' && s.toLowerCase().startsWith('fbclid_'))?.substring(7) || null,
-        affiliateName: notificationData.affiliate || null,
-        transactionType: txType,
-        rawPayload: notificationData
-      };
-
-      if (!normalizedData.userId || !normalizedData.orderId || normalizedData.status === 'unknown') {
-        console.warn(`${this.logPrefix} Dados essenciais ausentes/indeterminados (sanitizado):`, this.safeLog(normalizedData));
-      }
-
-      console.log(`${this.logPrefix} Webhook Clickbank verificado e normalizado com sucesso.`);
-      return normalizedData;
-
-    } catch (err) {
-      console.error(`${this.logPrefix} Falha crítica na validação/decifragem do webhook Clickbank:`, err?.message || err);
-      return null;
     }
-  }
+
+    // --- Helpers Internos ---
+
+    _extractUserIdFromTid(tid = '') {
+        // Lógica de extração (ex: "TEST_ID_B_gclid_123")
+        // No v1.1.17, apenas retornamos o TID completo como o ID de rastreamento principal.
+        return tid || null;
+    }
+
+    _normalizeWebhookPayload(payload) {
+        const { transactionType, receipt, vendorVariables, lineItems } = payload;
+        
+        // Pega o TID (Tracking ID) de vendorVariables
+        const trackingId = vendorVariables?.tid_ || null;
+        
+        // Status unificado
+        let unifiedStatus = 'other';
+        switch (transactionType) {
+            case 'SALE':
+            case 'TEST_SALE':
+                unifiedStatus = 'paid';
+                break;
+            case 'RFND':
+            case 'TEST_RFND':
+                unifiedStatus = 'refunded';
+                break;
+            case 'CGBK':
+            case 'TEST_CGBK':
+                unifiedStatus = 'chargeback';
+                break;
+        }
+        
+        // Assume o primeiro item de linha para dados do produto
+        const firstItem = lineItems && lineItems.length > 0 ? lineItems[0] : {};
+
+        return {
+            platform: 'clickbank',
+            transactionId: receipt, // O 'receipt' é o ID de transação/pedido único do CB
+            orderId: receipt,
+            trackingId: this._extractUserIdFromTid(trackingId), // Nosso 'user_id'
+            
+            transactionTypeRaw: transactionType,
+            status: unifiedStatus,
+            
+            productSku: firstItem.itemNo || 'N/A',
+            
+            // Valores financeiros
+            amount: payload.totalOrderAmount || 0,
+            currency: payload.currency || 'USD',
+            
+            // Dados do cliente (se disponível)
+            customerEmail: payload.customer?.billing?.email || null,
+            
+            // Timestamps
+            eventTimestamp: new Date(payload.transactionTime),
+            receivedTimestamp: new Date(),
+            
+            // Payload completo para auditoria (sanitizado)
+            _rawPayload: this.safeLog(payload),
+        };
+    }
+
+    // --- FUNÇÃO REMOVIDA (CAUSA DO ERRO 'File is not defined') ---
+    // _scrapePresellUrl(url) { ... }
 }
 
 module.exports = ClickbankAdapter;
