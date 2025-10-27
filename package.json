@@ -1,14 +1,7 @@
-/*
- * package.json (v1.1.0 - Node 20 Update)
- * Versão: 1.1.0
- * Data: 2025-10-27
- * Desc: Adiciona a seção "engines" para especificar Node.js >= 20,
- * necessário para tentar resolver o erro 'File is not defined'
- * vindo da dependência 'undici' (usada pelo axios/scraper).
- */
 {
   "name": "google-auth-backend",
   "version": "5.0.7",
+  "description": "Backend for PZ Auth+API (Requires Node 20+)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -20,7 +13,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "axios": "^1.7.2",
     "cheerio": "^1.0.0-rc.12",
