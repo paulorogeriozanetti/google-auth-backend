@@ -1,11 +1,11 @@
 /**
  * PZ Advisors - Platform Adapter Base / Factory
- * Versão: 1.1.5 (Patch de Correção Node.js)
- * Data: 2025-10-27
- * Desc: Corrige erro 'File is not defined' no runtime do Node.js.
- * - Adiciona "typeof File" para proteger as verificações 'instanceof File'
- * dentro da função safeLog, que causava falha no 'require' do módulo.
- * - Mantém toda a lógica v1.1.4.
+ * Versão: 1.1.4
+ * Data: 2025-10-24
+ * Desc: Incorpora correções do quarto duplo check (reforço de segurança e consistência).
+ * - REFORÇO CRÍTICO: Torna a função `safeLog` recursiva para mascarar
+ * dados sensíveis em qualquer nível de aninhamento.
+ * - Mantém toda a robustez da v1.1.3.
  */
 class PlatformAdapterBase {
     /**
@@ -31,7 +31,7 @@ class PlatformAdapterBase {
                     break;
                 // Adicione outros casos aqui
                 default:
-                    console.warn(`[AdapterFactory v1.1.5] Plataforma não suportada: ${platformName}`);
+                    console.warn(`[AdapterFactory v1.1.4] Plataforma não suportada: ${platformName}`);
                     throw new Error(`Plataforma não suportada: ${platformName}`);
             }
 
@@ -46,13 +46,13 @@ class PlatformAdapterBase {
             });
 
             // Adiciona metadados para logging/identificação
-            instance.__meta = instance.__meta || { platform, version: instance.version || '1.1.5' }; // Usa a versão do adapter ou a desta base
+            instance.__meta = instance.__meta || { platform, version: instance.version || '1.1.4' }; // Usa a versão do adapter ou a desta base
 
-            console.log(`[AdapterFactory v1.1.5] Instância criada para: ${platformName} (Versão: ${instance.__meta.version})`);
+            console.log(`[AdapterFactory v1.1.4] Instância criada para: ${platformName} (Versão: ${instance.__meta.version})`);
             return instance;
 
         } catch (error) {
-            console.error(`[AdapterFactory v1.1.5] Falha ao instanciar adapter ${platformName}:`, error?.message || error);
+            console.error(`[AdapterFactory v1.1.4] Falha ao instanciar adapter ${platformName}:`, error?.message || error);
             throw error;
         }
     }
@@ -73,7 +73,7 @@ class PlatformAdapterBase {
 
     /**
      * Helper APENAS para logging seguro (remove/mascara dados sensíveis ANTES de logar).
-     * v1.1.5: Adiciona proteções 'typeof File'
+     * v1.1.4: Implementa sanitização recursiva (patch do duplo check).
      */
     safeLog(obj = {}, sensitiveKeys = ['email','customerEmail','receipt','orderId','transactionId','auth_key','password','key','secret']) {
       try {
@@ -82,20 +82,10 @@ class PlatformAdapterBase {
         // headers sensíveis
         ['authorization','cookie','set-cookie'].forEach(k => SENSITIVE_KEYS_SET.add(k));
 
-        // --- INÍCIO DA CORREÇÃO v1.1.5 ---
-        // Funções seguras para verificar tipos de Navegador
-        const isWebFile = (val) => {
-          if (typeof File === 'undefined') return false;
-          try { return val instanceof File; } catch { return false; }
-        };
-        const isWebFileList = (val) => {
-          if (typeof FileList === 'undefined') return false;
-          try { return val instanceof FileList; } catch { return false; }
-        };
-        // --- FIM DA CORREÇÃO v1.1.5 ---
-
-        // Função recursiva de sanitização
+        // Função recursiva de sanitização (patch v1.1.4)
         const scrub = (value, kPath = []) => {
+          // kPath é usado para rastrear a "profundidade" e a chave pai, se necessário
+          // A chave atual (última em kPath) é a mais relevante
           const lastKey = kPath.length ? String(kPath[kPath.length - 1]).toLowerCase() : '';
 
           // 1. Tipos primitivos ou nulos
@@ -107,22 +97,17 @@ class PlatformAdapterBase {
 
           // 3. Se não for um objeto (string, number, boolean)
           if (typeof value !== 'object') {
+            // Mascara se a *chave* (lastKey) for sensível
             return SENSITIVE_KEYS_SET.has(lastKey) ? mask(String(value)) : value;
           }
 
-          // 4. Remover payloads/bodies
+          // 4. Remover payloads/bodies (se a chave *contém* a palavra)
           if (lastKey.includes('payload') || lastKey.includes('body')) {
             return typeof value === 'string' ? mask(value) : '<removed>';
           }
           
           // 5. Se for Array, aplica recursivamente
           if (Array.isArray(value)) {
-            // --- INÍCIO DA CORREÇÃO v1.1.5 ---
-            // (NOTA: Verificação insegura removida e substituída)
-            if (isWebFile(value)) return '<File: hidden>';
-            if (isWebFileList(value)) return `<FileList: ${value.length} items hidden>`;
-            // --- FIM DA CORREÇÃO v1.1.5 ---
-            
             return value.map((item, idx) => scrub(item, kPath.concat(idx)));
           }
 
@@ -146,7 +131,7 @@ class PlatformAdapterBase {
         return scrub(clonedObj); // Inicia a recursão
 
       } catch (e) {
-        console.error('[safeLog v1.1.5] Erro ao sanitizar log:', e);
+        console.error('[safeLog v1.1.4] Erro ao sanitizar log:', e);
         return { error: 'Falha ao sanitizar log', originalType: typeof obj };
       }
     }
