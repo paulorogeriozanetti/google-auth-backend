@@ -1,561 +1,204 @@
 /**
- * PZ Auth+API Backend (v5.0.6 - Production Fix)
- * Versão: 5.0.6
- * Data: 2025-10-27
- * Desc: CORREÇÃO DE DEPLOY (RAILWAY): Força o binding '0.0.0.0' no app.listen()
- * para permitir que os health checks externos se conectem.
+ * PZ Auth+API Backend – Versão 5.0.5 – 2025-10-26
+ *
+ * - FIX (Testes): Exporta 'app' condicionalmente para uso com supertest (não chama app.listen() em teste).
+ * - FIX (Testes): Protege require('./marketingAutomator') com try/catch e fornece stub para ambiente de teste.
+ * - FIX (Duplo Check 5): Corrige typo no polyfill do fetch (...args em vez de .args).
+ * - Mantém toda a lógica funcional e melhorias da v5.0.3 (Adapters, correções duplo check, etc.).
  */
 
-// 1) Imports
 const express = require('express');
 const cors = require('cors');
-const cookieParser = require('cookie-parser');
-const crypto = require('crypto');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+let cookieParser = null;
+try { cookieParser = require('cookie-parser'); } catch (_) { console.warn('[BOOT] cookie-parser não encontrado; segue sem.'); }
+
 const { OAuth2Client } = require('google-auth-library');
-const marketingAutomator = require('./marketingAutomator');
+const admin = require('firebase-admin');
+
+// --- INÍCIO PATCH 1 (Duplo Check 4) ---
+// Torna marketingAutomator opcional (evita crash nos testes se o ficheiro não existir)
+let marketingAutomator = null;
+try {
+  marketingAutomator = require('./marketingAutomator');
+  console.log('[BOOT] Módulo marketingAutomator carregado com sucesso.');
+} catch (err) {
+  // Apenas avisa se não estiver em ambiente de teste
+  if (process.env.NODE_ENV !== 'test' && !process.env.JEST_WORKER_ID) {
+    console.error('[BOOT][ERRO] marketingAutomator não encontrado. A rota /api/send-guide falhará:', err.message);
+  } else {
+    console.warn('[BOOT] marketingAutomator não encontrado; usando stub no ambiente de teste.');
+  }
+  // Fornece um stub para evitar erros em 'require' ou chamadas posteriores
+  marketingAutomator = {
+    addSubscriberToFunnel: async (subscriberInfo) => {
+        console.warn('[STUB] marketingAutomator.addSubscriberToFunnel chamado com:', subscriberInfo ? subscriberInfo.email : 'dados ausentes');
+        // Retorna um erro simulado se não estiver em teste, ou sucesso se estiver
+        if (process.env.NODE_ENV !== 'test' && !process.env.JEST_WORKER_ID) {
+            throw new Error("Marketing automator module not loaded correctly.");
+        }
+        return { ok: true, message: 'stubbed_subscriber_added' };
+     }
+  };
+}
+// --- FIM PATCH 1 ---
+
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '5.0.6';
-const SERVER_DEPLOY_DATE = '2025-10-27';
-const PORT = process.env.PORT || 8080;
-const TRACE_ID_HEADER = 'x-request-trace-id';
-const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
+// fetch (fallback) - CORRIGIDO (PATCH E)
+const fetch = (typeof globalThis.fetch === 'function')
+  ? globalThis.fetch.bind(globalThis)
+  : ((...args) => import('node-fetch').then(({ default: f }) => f(...args))); // <-- Corrigido .args para ...args
 
-// 3) Configuração de CORS (Segurança)
-// Lista de origens permitidas (sem / no final)
-const allowedOrigins = [
-  'https://pzadvisors.com',
-  'https://www.pzadvisors.com',
-  'https://auth.pzadvisors.com', // (Exemplo, se o frontend estiver aqui)
-  // Adicione subdomínios se necessário
-];
-if (process.env.NODE_ENV !== 'production') {
-  allowedOrigins.push('http://localhost:8080'); // Dev local
-  allowedOrigins.push('http://127.0.0.1:8080');
-}
-const corsOptions = {
-  origin: (origin, callback) => {
-    // Permite REST tools (sem origin) ou origens na lista
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: Origem não permitida: ${origin}`));
-    }
-  },
-  credentials: true,
-};
-
-// 4) Configuração de Clientes Google Auth
-// (Permite múltiplos frontends/apps usarem a mesma API)
-const GOOGLE_CLIENT_IDS = [
-  process.env.GOOGLE_CLIENT_ID_PZADVISORS, // Ex: pzadvisors.com
-  process.env.GOOGLE_CLIENT_ID_LANDER_B,  // Ex: outrolander.com
-].filter(Boolean); // Remove IDs não definidos
-
-if (!GOOGLE_CLIENT_IDS.length) {
-  console.warn('[AUTH] Aviso: Nenhum GOOGLE_CLIENT_ID_* configurado.');
-}
-const googleAuthClients = GOOGLE_CLIENT_IDS.map(id => new OAuth2Client(id));
-
-// 5) Configuração de Tracking (Tokens de API)
-const TRACK_TOKEN_ENABLED = !!process.env.TRACK_TOKEN;
-const TRACK_TOKEN_DEBUG_ENABLED = !!process.env.TRACK_TOKEN_DEBUG;
-const TRACK_OPEN = process.env.TRACK_OPEN === 'true'; // Se 'true', permite tracking sem token
-
-// 6) Configuração do Firebase Admin SDK (com fallback robusto)
-let admin;
-let db;
-let FIRESTORE_SOURCE_LOG = 'N/A';
-
-function ensureSA() {
-  // Padrão Railway/Fly.io (JSON numa só linha)
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    try {
-      const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-      FIRESTORE_SOURCE_LOG = 'env_json';
-      return sa;
-    } catch (e) {
-      console.error('[FS][ERRO] Falha ao parsear FIREBASE_SERVICE_ACCOUNT_JSON:', e?.message);
-    }
-  }
-  // Padrão Vercel (Split)
-  if (process.env.GCP_PROJECT_ID && process.env.GCP_SA_EMAIL && process.env.GCP_SA_PRIVATE_KEY) {
-     try {
-       const sa = {
-         project_id: process.env.GCP_PROJECT_ID,
-         client_email: process.env.GCP_SA_EMAIL,
-         // Corrige formatação da private key (comum em Vercel/Netlify)
-         private_key: process.env.GCP_SA_PRIVATE_KEY.replace(/\\n/g, '\n'),
-       };
-       FIRESTORE_SOURCE_LOG = 'env_split';
-       return sa;
-     } catch (e) {
-       console.error('[FS][ERRO] Falha ao montar SA das Vercel vars:', e?.message);
-     }
-  }
-  // Padrão GCloud Run / Functions (automático)
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-     FIRESTORE_SOURCE_LOG = 'gcp_auto';
-     return null; // Deixa o SDK descobrir sozinho
-  }
-  throw new Error('sa_not_configured');
-}
-
-function initAdmin() {
-  try {
-    const serviceAccount = ensureSA(); // Pode ser null (gcp_auto) ou o objeto
-    
-    initializeApp(serviceAccount ? { credential: cert(serviceAccount) } : {});
-    
-    admin = true;
-    db = getFirestore();
-    db.settings({ ignoreUndefinedProperties: true }); // Boa prática
-    console.log(`[ADMIN] Firebase SDK OK (Proj: ${process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || 'default'})`);
-  } catch (e) {
-    admin = false;
-    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message);
-    if (e.message.includes('sa_not_configured')) {
-        console.error('[ADMIN][FATAL] Nenhuma credencial (FIREBASE_SERVICE_ACCOUNT_JSON ou GCP_*) foi encontrada.');
-    }
-  }
-}
-
-// 7) Inicialização dos Adapters (Factory)
-// (Isto irá falhar e crashar o boot se os adapters não carregarem, o que é bom)
-let ADAPTERS_LOADED = false;
-try {
-  PlatformAdapterBase.getInstance('clickbank'); // Pré-aquece o adapter
-  PlatformAdapterBase.getInstance('digistore24'); // Pré-aquece o adapter
-  ADAPTERS_LOADED = true;
-  console.log('[BOOT] Módulos Adapter carregados com sucesso.');
-} catch (e) {
-  console.error('[BOOT][FATAL] Falha ao carregar Adapters:', e.message);
-  // O server.js irá crashar aqui se uma chave (ex: CLICKBANK_WEBHOOK_SECRET_KEY) faltar
-  throw e;
-}
-try {
-  if (marketingAutomator) console.log('[BOOT] Módulo marketingAutomator carregado com sucesso.');
-} catch (e) {}
-
-// 8) Middlewares
 const app = express();
-app.set('trust proxy', 1); // Confia no proxy (Railway, Fly, GCloud)
-app.use(cors(corsOptions)); // Aplica CORS
-app.use(cookieParser()); // Habilita parser de cookies
 
-// Middleware de Logging e Trace ID
-app.use((req, res, next) => {
-  const traceId = req.headers[TRACE_ID_HEADER] || crypto.randomUUID();
-  req.traceId = traceId;
-  res.setHeader(TRACE_ID_HEADER, traceId);
-  
-  const start = process.hrtime.bigint();
-  
-  res.on('finish', () => {
-    const end = process.hrtime.bigint();
-    const duration = (end - start) / 1_000_000n; // ms
-    console.log(`[${req.method}] ${req.path} (${res.statusCode}) - ${duration}ms - [Trace: ${traceId}]`);
-  });
-  next();
-});
+/* ──────────────────────────────────────────────────────────────
+   1) Config / Vars
+─────────────────────────────────────────────────────────────── */
+const VERSION = '5.0.5'; // ATUALIZADO
+const BUILD_DATE = '2025-10-26'; // ATUALIZADO
+const PORT = process.env.PORT || 8080;
+const CLIENT_IDS = [ process.env.GOOGLE_CLIENT_ID,...process.env.GOOGLE_CLIENT_IDS?String(process.env.GOOGLE_CLIENT_IDS).split(","):[],'270930304722-pbl5cmp53omohrmfkf9dmicutknf3q95.apps.googleusercontent.com'].map(s=>(s||"").trim()).filter(Boolean);
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o=>o.trim()).filter(Boolean); if(allowedOrigins.length===0){allowedOrigins.push('https://pzadvisors.com','https://www.pzadvisors.com','https://auth.pzadvisors.com','https://api.pzadvisors.com','http://localhost:3000','http://127.0.0.1:3000','http://127.0.0.1:8080','http://127.0.0.1:8081')}
+const TRACK_OPEN = (process.env.TRACK_OPEN||'false').toLowerCase()==='true'; const TRACK_TOKEN = process.env.TRACK_TOKEN||''; const DEBUG_TOKEN = process.env.DEBUG_TOKEN||''; const GUIDE_DYNAMIC_URL_BASE = process.env.GUIDE_DYNAMIC_URL_BASE||'https://pzadvisors.com/bridge/';
 
-// Middleware de Verificação de Token de API (para rotas protegidas)
-const verifyApiToken = (req, res, next) => {
-  if (TRACK_OPEN) return next(); // API aberta
+app.set('trust proxy', true);
 
-  const token = req.headers['x-api-token'] || req.query.token;
-  
-  if (TRACK_TOKEN_ENABLED && token === process.env.TRACK_TOKEN) {
-    return next(); // Token principal
-  }
-  if (TRACK_TOKEN_DEBUG_ENABLED && token === process.env.TRACK_TOKEN_DEBUG) {
-    return next(); // Token de debug
-  }
-  
-  console.warn(`[AUTH][401] Token de API inválido ou ausente. [Trace: ${req.traceId}]`);
-  return res.status(401).json({ error: 'unauthorized', traceId: req.traceId });
-};
+/* ──────────────────────────────────────────────────────────────
+   1.1) CORS (no topo) - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+function isAllowedOrigin(origin) { if(!origin)return!0;try{const{hostname:host,protocol}=new URL(origin.trim()),hostname=String(host||"").toLowerCase();if(protocol==="http:"&&(hostname==="localhost"||hostname==="127.0.0.1"))return!0;if(protocol==="https:"&&(hostname==="pzadvisors.com"||hostname==="www.pzadvisors.com"||hostname.endsWith(".pzadvisors.com")))return!0;return allowedOrigins.includes(origin.trim())}catch{return!1} }
+app.use(cors({ origin(origin,cb){const ok=isAllowedOrigin(origin);if(!ok&&origin)try{console.warn(JSON.stringify({tag:"cors_denied",origin}))}catch{}cb(null,ok)},methods:["GET","POST","OPTIONS","HEAD"],allowedHeaders:["Content-Type","Authorization","X-PZ-Version","x-pz-version","X-Trace-Id","x-trace-id","X-Api-Token","x-api-token","X-Debug-Token","x-debug-token","X-Debug-Verbose","x-debug-verbose"],optionsSuccessStatus:204}));
+
+/* ──────────────────────────────────────────────────────────────
+   1.2) Service Account / Firebase Admin SDK - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+let SA_SOURCE = 'nenhuma'; let SA_JSON = null; const SA_RAW_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON; if (SA_RAW_JSON) { try { SA_JSON = JSON.parse(SA_RAW_JSON); SA_SOURCE = 'env_json'; console.log('[BOOT] SA carregado de JSON.'); } catch (e) { console.error('[BOOT][ERRO] SA JSON inválido:', e?.message || e); } } let GCP_PROJECT_ID = '', GCP_SA_EMAIL = '', GCP_SA_PRIVATE_KEY = ''; if (!SA_JSON) { GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || ''; GCP_SA_EMAIL = process.env.GCP_SA_EMAIL || ''; GCP_SA_PRIVATE_KEY = process.env.GCP_SA_PRIVATE_KEY || ''; if (GCP_PROJECT_ID && GCP_SA_EMAIL && GCP_SA_PRIVATE_KEY) { SA_SOURCE = 'env_split'; if (GCP_SA_PRIVATE_KEY) GCP_SA_PRIVATE_KEY = String(GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n'); console.log('[BOOT] SA carregado de split env.'); } else { console.warn('[BOOT][AVISO] Nenhuma SA encontrada.'); } } else { GCP_PROJECT_ID = SA_JSON.project_id || ''; GCP_SA_EMAIL = SA_JSON.client_email || ''; GCP_SA_PRIVATE_KEY = SA_JSON.private_key || ''; } function ensureSA() { const hasKey = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY'); const miss = { project: !!GCP_PROJECT_ID, email: !!GCP_SA_EMAIL, key: hasKey }; if (!miss.project || !miss.email || !miss.key) { const msg = `[FS][ERRO] SA incompleta: ${JSON.stringify(miss)} (Fonte: ${SA_SOURCE})`; console.error(msg); const err = new Error('sa_not_configured'); err.code = 'sa_not_configured'; err.meta = { ...miss, source: SA_SOURCE }; throw err; } return { projectId: GCP_PROJECT_ID, clientEmail: GCP_SA_EMAIL, privateKey: GCP_SA_PRIVATE_KEY }; } let _adminInited = false; let _db = null; function initAdmin() { if (_adminInited) return; try { const credentials = ensureSA(); admin.initializeApp({ credential: admin.credential.cert(credentials), projectId: credentials.projectId }); _adminInited = true; _db = admin.firestore(); console.log('[ADMIN] Firebase SDK OK (Proj:', credentials.projectId, ')'); } catch (error) { console.error('[ADMIN][ERRO FATAL] Init Firebase:', error.message || error); } } function getDB() { if (!_adminInited) { initAdmin(); if (!_adminInited) { const err = new Error('DB não inicializado.'); err.code = 'DB_NOT_INITIALIZED'; throw err; } } return _db; } const FieldValue = admin.firestore.FieldValue;
 
 
-// 9) Rotas da API
+/* ──────────────────────────────────────────────────────────────
+   2) Middlewares (PARTE 1) - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+if (cookieParser) { app.use(cookieParser()); } else { app.use((req, res, next) => { const raw=req.headers.cookie||"";req.cookies={};raw.split(";").forEach(p=>{const[k,...v]=p.split("=");if(!k)return;const keyTrimmed=k.trim(),valueJoined=(v.join("=")||"").trim();try{req.cookies[keyTrimmed]=decodeURIComponent(valueJoined)}catch(e){console.warn(`[Cookie Fallback] Decode falhou "${keyTrimmed}":`,e.message);req.cookies[keyTrimmed]=valueJoined}});next()}); }
+app.use((req, res, next) => { const rid=req.headers["x-trace-id"]||`${Date.now()}-${Math.random().toString(36).slice(2,8)}`;req.rid=rid;res.setHeader("X-Trace-Id",rid);res.setHeader("X-PZ-Version",`PZ Auth+API Backend v${VERSION} (${BUILD_DATE})`);res.setHeader("Vary","Origin, Access-Control-Request-Method, Access-Control-Request-Headers");next() });
+app.use((req, res, next) => { const t0=Date.now();res.on("finish",()=>{try{if(req.path.startsWith("/webhook/"))return;console.log(JSON.stringify({rid:req.rid,method:req.method,path:req.path,status:res.statusCode,ms:Date.now()-t0,origin:req.headers.origin||null}))}catch{}});next() });
 
-// --- Rotas Públicas (Health & Version) ---
+/* ──────────────────────────────────────────────────────────────
+   2.1) Rotas de Webhook (ANTES dos parsers globais) - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.get('/webhook/digistore24', async (req, res) => { const logPrefix=`[WEBHOOK /dg24](rid:${req.rid})`;try{console.log(`${logPrefix} Recebido...`);const adapter=PlatformAdapterBase.getInstance("digistore24"),normalizedData=await adapter.verifyWebhook(req.query,req.headers);if(!normalizedData){console.warn(`${logPrefix} Verificação falhou.`);return res.status(400).send("Webhook verification failed.")}console.log(`${logPrefix} OK. TxID:${normalizedData.transactionId}`);await logAffiliateTransaction(normalizedData);return res.status(200).send("OK")}catch(error){console.error(`${logPrefix} Erro:`,error.message||error);return res.status(500).send("Internal Server Error.")} });
+app.post('/webhook/clickbank', express.raw({ type: '*/*' }), async (req, res) => { const logPrefix=`[WEBHOOK /cb](rid:${req.rid})`;try{console.log(`${logPrefix} Recebido...`);if(!req.body||!(req.body instanceof Buffer)||req.body.length===0){console.warn(`${logPrefix} Erro: req.body Buffer inválido.`);return res.status(400).send("Invalid request body.")}const adapter=PlatformAdapterBase.getInstance("clickbank"),normalizedData=await adapter.verifyWebhook(req.body,req.headers);if(!normalizedData){console.warn(`${logPrefix} Verificação falhou.`);return res.status(400).send("Webhook verification failed.")}console.log(`${logPrefix} OK. TxID:${normalizedData.transactionId}`);await logAffiliateTransaction(normalizedData);return res.status(200).send("OK")}catch(error){console.error(`${logPrefix} Erro:`,error.message||error);return res.status(500).send("Internal Server Error.")} });
 
-// (Usado pelo Railway/GCloud para health check)
-app.get('/healthz', (req, res) => res.status(200).send('OK'));
-app.get('/api/healthz', (req, res) => res.status(200).send('OK'));
+/* ──────────────────────────────────────────────────────────────
+   2.2) Middlewares (PARTE 2 - PARSERS GLOBAIS) - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.use(express.json({ limit: '2mb', type: ['application/json', 'application/*+json'] }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use((req, res, next) => { if(req.method==="GET"||req.method==="HEAD"||req.method==="OPTIONS"||(req.body&&typeof req.body==="object"))return next();let data="";req.on("data",c=>{data+=c;if(data.length>2097152)req.destroy()});req.on("end",()=>{if(!req.body||typeof req.body!=="object"){if(data&&/^[\s{\[]/.test(data))try{req.body=JSON.parse(data)}catch{}}next()}) });
 
-app.get('/api/version', (req, res) => {
-  res.status(200).json({
-    service: 'PZ Auth+API Backend',
-    version: SERVER_VERSION,
-    deploy_date: SERVER_DEPLOY_DATE,
-    status: 'online',
-    firestore: admin ? 'connected' : 'disconnected',
-    firestore_source: FIRESTORE_SOURCE_LOG,
-    adapters_loaded: ADAPTERS_LOADED,
-    tracking_open: TRACK_OPEN,
-  });
-});
+/* ──────────────────────────────────────────────────────────────
+   3) Utilitários Daily Facts & Transactions - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+function zeroPad(n, w = 2) { return String(n).padStart(w,"0") }
+function deriveDayParts(tsISO, tzOffsetMin) { let d=tsISO?new Date(tsISO):new Date;const tz=Number.isFinite(+tzOffsetMin)?+tzOffsetMin:0;if(tz!==0)d=new Date(d.getTime()+tz*60*1000);return{y:d.getUTCFullYear(),m:zeroPad(d.getUTCMonth()+1),d:zeroPad(d.getUTCDate())} }
+function deriveDayLabel(tsISO, tzOffsetMin) { const p=deriveDayParts(tsISO,tzOffsetMin);return`${p.y}-${p.m}-${p.d}` }
+function parseClientTimestamp(val) { try{if(!val)return null;const d=new Date(val);if(isNaN(d.getTime()))return null;return admin.firestore.Timestamp.fromDate(d)}catch{return null} }
+function toPlainJSON(obj) { try{return JSON.parse(JSON.stringify(obj||null))}catch{return null} }
+async function upsertDailyFact({ db = null, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) { if(!db)try{db=getDB()}catch(dbError){console.error(`[upsertDailyFact][ERRO] DB:`,dbError.message||dbError);throw dbError} const safeAnon=anon_id&&typeof anon_id==="string"?anon_id:"anon_unknown",tz=Number.isFinite(+tz_offset)?+tz_offset:0,day=deriveDayLabel(tsISO,tz),docId=`${safeAnon}_${day}`,docRef=db.collection("daily_facts").doc(docId);const event_id=`${Date.now()}-${Math.random().toString(36).slice(2,10)}`,newEvent=toPlainJSON({event,event_id,ts_server:FieldValue.serverTimestamp(),ts_client:parseClientTimestamp(tsISO),tz_offset:Number.isFinite(tz)?tz:null,page,session_id,payload}),updatePayload={updated_at:FieldValue.serverTimestamp(),events:FieldValue.arrayUnion(newEvent),["counters."+event]:FieldValue.increment(1),...(user_id?{user_id,person_id:user_id}:{})};try{await docRef.update(updatePayload)}catch(error){const notFound=error?.code===5||error?.code==="not-found"||/NOT_FOUND/i.test(error?.message||"");if(notFound){const seedPayload={kind:"user",date:day,entity_id:safeAnon,anon_id:safeAnon,person_id:user_id&&typeof user_id==="string"?user_id:safeAnon,...user_id?{user_id}:{},...Number.isFinite(tz)?{tz_offset:tz}:{},events:[newEvent],counters:{[event]:1},created_at:FieldValue.serverTimestamp(),updated_at:FieldValue.serverTimestamp()};await docRef.set(seedPayload)}else{console.error(JSON.stringify({tag:"upsert_daily_fact_failed",docId,error:error.message||String(error),code:error.code}));throw error}}return{ok:!0,id:docId} }
+async function logAffiliateTransaction(normalizedData) { if(!normalizedData?.platform||!normalizedData?.transactionId){console.warn("[logAffiliateTransaction] Skip: Dados inválidos.");return} let db;try{db=getDB()}catch(dbError){console.error(`[logAffiliateTransaction][ERRO] DB:`,dbError.message||dbError);return} try{const platform=normalizedData.platform,txId=normalizedData.transactionId,safeTxId=String(txId).replace(/[^a-zA-Z0-9_-]/g,"_"),docId=`${platform}_${safeTxId}`,docRef=db.collection("affiliate_transactions").doc(docId);const docSnap=await docRef.get(),updateData={...normalizedData,_log_last_updated_at:FieldValue.serverTimestamp(),_log_doc_id:docId};if(!docSnap.exists){await docRef.set({...updateData,_log_first_seen_at:FieldValue.serverTimestamp()});console.log(`[logAffiliateTransaction] Logado (Novo): ${docId}`)}else{await docRef.update(updateData);console.log(`[logAffiliateTransaction] Logado (Update): ${docId}`)}}catch(error){console.error(JSON.stringify({tag:"log_affiliate_transaction_failed",error:error.message||String(error),platform,txId}))} }
 
-// --- Rota Pública (Google Auth) ---
+/* ──────────────────────────────────────────────────────────────
+   4) Rotas básicas / Health / Versão - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.get('/', (_req, res) => res.status(200).send('🚀 PZ Auth+API Backend ativo.'));
+app.get('/healthz', (_req, res) => res.status(200).json({ ok:true, uptime:process.uptime(), ts:new Date().toISOString() })); app.head('/healthz', (_req, res) => res.sendStatus(200));
+app.get('/api/healthz', (_req, res) => res.status(200).json({ ok:true, uptime:process.uptime(), ts:new Date().toISOString() })); app.head('/api/healthz', (_req, res) => res.sendStatus(200));
+app.get('/api/version', (_req, res) => { res.status(200).json({service:"PZ Auth+API Backend",version:VERSION,build_date:BUILD_DATE,adapters_loaded:typeof PlatformAdapterBase?.getInstance==="function",client_ids:CLIENT_IDS,origins:allowedOrigins,track_open:TRACK_OPEN,track_token:!!TRACK_TOKEN,debug_token:!!DEBUG_TOKEN,fs_auth:"AdminSDK",fs_init:_adminInited,fs_project:GCP_PROJECT_ID||"(N/A)",fs_sa_source:SA_SOURCE,facts_coll:"daily_facts",tx_coll:"affiliate_transactions",facts_doc_pattern:"${anon_id}_${YYYY-MM-DD}"}) });
+app.get('/api/cors-check', (req, res) => { const origin=req.headers.origin||null;return res.status(200).json({ok:!0,rid:req.rid,origin,allowed:isAllowedOrigin(origin),ua:req.headers["user-agent"]||null,ts:(new Date).toISOString()}) });
 
-/**
- * Rota: /auth/google
- * Método: POST
- * Body: { credential: "..." }
- * Desc: Recebe o ID Token (JWT) do Google (GSI), verifica,
- * cria/atualiza o user no Firestore e retorna o user_id (sub).
- */
-app.post('/auth/google', express.json(), async (req, res) => {
-  const { credential } = req.body;
-  if (!credential) {
-    return res.status(400).json({ error: 'credential_missing', traceId: req.traceId });
-  }
+/* ──────────────────────────────────────────────────────────────
+   4.1) Debug – Credenciais SA / Firestore - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+function assertDebugAccess(req, res) { const tok=req.headers["x-debug-token"]||req.headers["X-Debug-Token"];if(!DEBUG_TOKEN||tok!==DEBUG_TOKEN){res.status(403).json({ok:!1,error:"forbidden"});return!1}return!0 }
+app.get('/api/debug/env-has-sa', (_req, res) => { const hasProj=!!GCP_PROJECT_ID,hasEmail=!!GCP_SA_EMAIL,hasKey=!!GCP_SA_PRIVATE_KEY&&String(GCP_SA_PRIVATE_KEY).includes("BEGIN PRIVATE KEY");res.status(200).json({hasProj,hasEmail,hasKey,sa_source:SA_SOURCE}) });
+app.get('/api/debug/fs-token', (req, res) => { if(!assertDebugAccess(req,res))return;console.warn("[API /debug/fs-token] Rota chamada, diag helpers não implementados.");return res.status(200).json({ok:!0,note:"Diag helpers not available.",scope:"firestore.default",expiry_date:null,expires_in_s:null}) });
+app.post('/api/debug/ping-fs', async (req, res) => { const verbose=(String(req.query.verbose||req.headers["x-debug-verbose"]||"")==="1");try{if(!assertDebugAccess(req,res))return res.status(403).json({ok:!1,error:"forbidden"});const db=getDB();const out=await upsertDailyFact({db,anon_id:req.body?.anon_id||"anon_debug",user_id:req.body?.user_id,tz_offset:req.body?.tz_offset,event:"debug_write",page:"/debug",session_id:null,payload:{note:req.body?.note||"manual"},tsISO:(new Date).toISOString()});return res.status(200).json({ok:!0,rid:req.rid,doc:out.id})}catch(e){const payload={route:"/api/debug/ping-fs",rid:req.rid,error:e.message||String(e)};console.error(JSON.stringify(payload));if(e.code==="sa_not_configured"||e.code==='DB_NOT_INITIALIZED')return res.status(503).json({ok:!1,error:e.code||'db_init_failed',meta:e.meta});return res.status(500).json(verbose?{ok:!1,...payload}:{ok:!1,error:"ping_failed"})} });
 
-  let ticket;
-  let verified = false;
-  
-  // Tenta verificar o token contra TODOS os Client IDs configurados
-  for (const client of googleAuthClients) {
+/* ──────────────────────────────────────────────────────────────
+   5) Google OAuth – One Tap - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+const oauthClient = new OAuth2Client(CLIENT_IDS[0] || 'YOUR_DEFAULT_CLIENT_ID');
+app.options('/auth/google', (_req, res) => res.sendStatus(204)); app.options('/api/auth/google', (_req, res) => res.sendStatus(204));
+async function handleAuthGoogle(req, res) { try{const ct=(req.headers["content-type"]||"").toLowerCase(),body=req.body||{},credential=typeof body.credential==="string"&&body.credential||typeof body.id_token==="string"&&body.id_token||null,context=body.context||{};console.log(JSON.stringify({route:"/auth/google",rid:req.rid,ct,has_cred:!!credential}));if(!credential)return res.status(400).json({error:"missing_credential"});const csrfCookie=req.cookies?.g_csrf_token,csrfBody=body?.g_csrf_token;if(csrfCookie&&csrfBody&&csrfCookie!==csrfBody){console.warn(`[AUTH] CSRF Mismatch: Cookie:"${csrfCookie}" vs Body:"${csrfBody}"`);return res.status(400).json({error:"csrf_mismatch"})}res.set({"Cache-Control":"no-store,no-cache,must-revalidate,private",Pragma:"no-cache",Expires:"0"});const ticket=await oauthClient.verifyIdToken({idToken:credential,audience:CLIENT_IDS}),payload=ticket.getPayload();if(!payload)return res.status(401).json({error:"invalid_token"});const{sub,email,name,picture,email_verified}=payload,user_id=String(sub);try{const db=getDB();const docRef=db.collection("users").doc(user_id);await docRef.set({user_id,sub,email:email||null,name:name||null,picture:picture||null,email_verified:!!email_verified},{merge:!0});await docRef.set({last_seen:FieldValue.serverTimestamp(),updated_at:FieldValue.serverTimestamp()},{merge:!0})}catch(e){console.error(JSON.stringify({route:"/auth/google",rid:req.rid,warn:"users_upsert_fail",error:e.message||String(e)}))}try{const db=getDB();const anon_id=context.anon_id||body.anon_id||"anon_unknown";await upsertDailyFact({db,anon_id,user_id,tz_offset:context.tz_offset,event:"auth_google_success",page:context.page||"/onetap",session_id:context.session_id,payload:{email:email||null,name:name||null,pic:picture||null,verified:!!email_verified},tsISO:(new Date).toISOString()})}catch(e){console.error(JSON.stringify({route:"/auth/google",rid:req.rid,warn:"daily_facts_log_fail",error:e.message||String(e)}))}return res.status(200).json({user_id,email:email||null,name:name||null,picture:picture||null})}catch(err){const msg=err?.message||String(err||"");let code="auth_failed";if(/audience/.test(msg))code="audience_mismatch";if(/expired/i.test(msg))code="token_expired";if(/invalid/i.test(msg))code="invalid_token";console.error(JSON.stringify({route:"/auth/google",rid:req.rid,error:msg,code}));return res.status(401).json({error:code})} }
+app.post('/auth/google', handleAuthGoogle); app.post('/api/auth/google', handleAuthGoogle);
+
+/* ──────────────────────────────────────────────────────────────
+   6) Endpoints auxiliares - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.post('/api/echo', (req, res) => { res.set({"Cache-Control":"no-store,no-cache,must-revalidate,private",Pragma:"no-cache",Expires:"0"});return res.status(200).json({ok:!0,rid:req.rid,echo:req.body||null,ts:(new Date).toISOString()}) });
+app.post('/api/track', async (req, res) => { try{if(!TRACK_OPEN){const tok=req.headers["x-api-token"]||req.headers["X-Api-Token"];if(!TRACK_TOKEN||tok!==TRACK_TOKEN)return res.status(403).json({ok:!1,error:"forbidden"})}const{event,payload}=req.body||{};if(!event||typeof event!=="string")return res.status(400).json({ok:!1,error:"missing_event"});const anon_id=payload?.anon_id||req.body?.anon_id||"anon_unknown",user_id=payload?.user_id||null,tz_offset=payload?.tz_offset,tsISO=payload?.ts||null,page=payload?.page||payload?.context?.page,sessionId=payload?.session_id;const db=getDB();await upsertDailyFact({db,anon_id,user_id,tz_offset,event,page,session_id:sessionId,payload:(()=>{const p={...payload};delete p.ts;delete p.tz_offset;delete p.page;delete p.session_id;delete p.user_id;delete p.anon_id;delete p.context;return toPlainJSON(p)})(),tsISO:tsISO||(new Date).toISOString()});return res.status(200).json({ok:!0,rid:req.rid})}catch(e){console.error(JSON.stringify({route:"/api/track",rid:req.rid,error:e.message||String(e)}));if(e.code==='DB_NOT_INITIALIZED')return res.status(503).json({ok:!1,error:e.code});return res.status(500).json({ok:!1,error:"track_failed"})} });
+
+/* ──────────────────────────────────────────────────────────────
+   7) ENDPOINT DO FUNIL DE LEAD MAGNET - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.post('/api/send-guide', async (req, res) => {
     try {
-      ticket = await client.verifyIdToken({
-          idToken: credential,
-          // Não é necessário 'audience' aqui se estamos apenas validando,
-          // mas se tivéssemos múltiplos, usaríamos:
-          // audience: GOOGLE_CLIENT_IDS, 
-      });
-      if (ticket) {
-        verified = true;
-        break; // Sucesso
-      }
+        const { user_id, anon_id, utms, context: reqContext } = req.body;
+        if (!user_id) return res.status(400).json({ ok: false, error: 'missing_user_id' });
+        const db = getDB();
+        const userDoc = await db.collection('users').doc(String(user_id)).get();
+        if (!userDoc.exists) return res.status(404).json({ ok: false, error: 'user_not_found' });
+        const userData = userDoc.data(); const { email, name } = userData;
+        if (!email) return res.status(400).json({ ok: false, error: 'user_has_no_email' });
+        let firstName=name||'';let lastName='';const nameParts=(name||'').trim().split(/\s+/);if(nameParts.length>1){firstName=nameParts[0];lastName=nameParts.slice(1).join(' ')}
+        let dynamicUrl = GUIDE_DYNAMIC_URL_BASE; try { const baseUrl = new URL(GUIDE_DYNAMIC_URL_BASE); const params = new URLSearchParams({ uid: user_id, anon_id: anon_id || 'anon_from_guide_api', utm_source: utms?.utm_source || 'convertkit', utm_medium: utms?.utm_medium || 'ebook-cta', utm_campaign: utms?.utm_campaign || 'lead-magnet-guide' }); for (const [k, v] of params) { baseUrl.searchParams.set(k, v); } dynamicUrl = baseUrl.toString(); } catch (urlError) { console.error(`[API /send-guide] Falha URL base '${GUIDE_DYNAMIC_URL_BASE}':`, urlError.message); }
+        const subscriberData = { email: email, first_name: firstName, fields: { last_name: lastName, dynamic_cta_url: dynamicUrl } };
+        if (!marketingAutomator?.addSubscriberToFunnel) { console.error("[API /send-guide] Erro: marketingAutomator.addSubscriberToFunnel não definido."); throw new Error("Marketing automator module not loaded."); }
+        await marketingAutomator.addSubscriberToFunnel(subscriberData);
+        await upsertDailyFact({ anon_id: anon_id || 'anon_unknown', user_id: user_id, event: 'convertkit_subscribe_success', page: reqContext?.page || '/api/send-guide', session_id: reqContext?.session_id, payload: { email, tagId: process.env.CONVERTKIT_TAG_ID, urlSent: dynamicUrl }, tsISO: new Date().toISOString() });
+        res.status(200).json({ ok: true, message: 'subscriber_added_to_funnel' });
     } catch (e) {
-      // Ignora erro (ex: "Invalid audience") e tenta o próximo client
+        console.error(JSON.stringify({ route: '/api/send-guide', rid: req.rid, error: e.message || String(e) }));
+        if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).json({ ok: false, error: e.code });
+        if (e.message?.includes('ConvertKit') || e.response?.data || e.message?.includes("Marketing automator")) { return res.status(e.response?.status || 500).json({ ok: false, error: 'convertkit_integration_failed', details: e.response?.data || e.message }); }
+        res.status(500).json({ ok: false, error: 'funnel_integration_failed' });
     }
-  }
-
-  if (!verified || !ticket) {
-    console.warn(`[AUTH][401] Google Token Inválido (nenhum Client ID correspondeu). [Trace: ${req.traceId}]`);
-    return res.status(401).json({ error: 'google_token_invalid', traceId: req.traceId });
-  }
-
-  const payload = ticket.getPayload();
-  const { sub, email, name, given_name, family_name, picture } = payload;
-
-  if (!sub || !email) {
-    console.error(`[AUTH][400] Payload do Google sem 'sub' ou 'email'. [Trace: ${req.traceId}]`);
-    return res.status(400).json({ error: 'google_payload_incomplete', traceId: req.traceId });
-  }
-  
-  // Salva no Firestore
-  try {
-    const userRef = db.collection('users').doc(sub);
-    const userData = {
-      user_id: sub,
-      email: email,
-      name: name || '',
-      first_name: given_name || '',
-      last_name: family_name || '',
-      picture: picture || '',
-      auth_provider: 'google',
-      last_seen_at: new Date(),
-    };
-    
-    // 'set' com 'merge: true' (Upsert)
-    await userRef.set(userData, { merge: true });
-
-    // Retorna apenas os dados essenciais
-    res.status(200).json({
-      status: 'ok',
-      user_id: sub,
-      email: email,
-    });
-
-  } catch (fsError) {
-    console.error(`[AUTH][500] Erro ao salvar user no Firestore (User: ${sub}):`, fsError);
-    res.status(500).json({ error: 'firestore_error', traceId: req.traceId });
-  }
 });
 
-
-// --- Rota Pública (API de Marketing / Send Guide) ---
-// (Esta rota é PÚBLICA, pois lida com a captura de leads
-// que acabaram de se autenticar)
-
-/**
- * Rota: /api/send-guide
- * Método: POST
- * Body: { user_id: "..." } (O ID do Google 'sub')
- * Desc: Busca o e-mail do user no Firestore (usando o user_id)
- * e o envia para o funil de automação (ConvertKit).
- */
-app.post('/api/send-guide', express.json(), async (req, res) => {
-  const { user_id } = req.body;
-  if (!user_id) {
-    return res.status(400).json({ error: 'user_id_missing', traceId: req.traceId });
-  }
-
-  try {
-    // 1. Buscar dados do user no Firestore
-    const userRef = db.collection('users').doc(user_id);
-    const userDoc = await userRef.get();
-
-    if (!userDoc.exists) {
-      console.error(`[GUIDE][404] User (User: ${user_id}) não encontrado no Firestore. [Trace: ${req.traceId}]`);
-      return res.status(404).json({ error: 'user_not_found', traceId: req.traceId });
-    }
-    
-    const userData = userDoc.data();
-    const { email, first_name } = userData;
-
-    if (!email) {
-       console.error(`[GUIDE][400] User (User: ${user_id}) existe mas não tem e-mail. [Trace: ${req.traceId}]`);
-      return res.status(400).json({ error: 'user_email_missing', traceId: req.traceId });
-    }
-
-    // 2. Enviar para o Marketing Automator (ConvertKit)
-    // (O automator lida com seus próprios erros internos)
-    const subscriberInfo = {
-      email: email,
-      first_name: first_name || '',
-      fields: {
-        // Campos customizados (se houver)
-        user_id_google: user_id,
-        // ... outros dados (anon_id, attribution_history)
-        // (Nota: o automator não usa estes campos na v5.1.0)
-      }
-    };
-
-    const ckResponse = await marketingAutomator.addSubscriberToFunnel(subscriberInfo);
-
-    res.status(200).json({
-      status: 'ok',
-      message: 'Guide request processed.',
-      subscriber: ckResponse, // Retorna resposta do ConvertKit
-    });
-
-  } catch (error) {
-    console.error(`[GUIDE][500] Falha ao processar guia (User: ${user_id}):`, error?.message || error);
-    if (error.response) { // Erro do Axios (ConvertKit)
-       return res.status(error.response.status || 502).json({ 
-         error: 'marketing_api_error', 
-         details: error.response.data,
-         traceId: req.traceId 
-       });
-    }
-    res.status(500).json({ error: 'internal_server_error', traceId: req.traceId });
-  }
-});
-
-// --- Rota Protegida (API de Checkout / Adapter Factory) ---
-
-/**
- * Rota: /api/checkout
- * Método: POST
- * Body: { offerData: { ... }, trackingParams: { ... } }
- * Desc: Recebe dados da oferta e parâmetros de tracking,
- * usa a Factory (AdapterBase) para instanciar o adapter correto
- * e chama buildCheckoutUrl().
- */
-app.post('/api/checkout', express.json(), async (req, res) => {
-  const { offerData, trackingParams } = req.body;
-
-  if (!offerData || !offerData.affiliate_platform) {
-    return res.status(400).json({ error: 'offerData.affiliate_platform_missing', traceId: req.traceId });
-  }
-  
-  const platform = offerData.affiliate_platform;
-
-  try {
-    // 1. Usa a Factory para obter o Adapter
-    const adapter = PlatformAdapterBase.getInstance(platform);
-    
-    // 2. Chama o método do Adapter
-    const checkoutUrl = await adapter.buildCheckoutUrl(offerData, trackingParams);
-
-    if (checkoutUrl) {
-      res.status(200).json({
-        status: 'ok',
-        checkout_url: checkoutUrl,
-        platform: platform,
-        adapter_version: adapter.version || 'N/A',
-      });
-    } else {
-       console.warn(`[CHECKOUT][400] Adapter ${platform} retornou URL nula. [Trace: ${req.traceId}]`);
-       res.status(400).json({ error: 'checkout_url_generation_failed', platform: platform, traceId: req.traceId });
-    }
-
-  } catch (error) {
-    console.error(`[CHECKOUT][500] Falha na Factory ou Adapter (${platform}):`, error?.message || error);
-    res.status(500).json({ 
-      error: 'adapter_error', 
-      platform: platform, 
-      details: error.message,
-      traceId: req.traceId 
-    });
-  }
-});
+/* ──────────────────────────────────────────────────────────────
+   8) Funil de Afiliados (Adapters v1.1.4) - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+app.post('/api/checkout', async (req, res) => { const logPrefix=`[API /checkout](rid:${req.rid})`;let platform="unknown";try{const{offerData,trackingParams}=req.body;if(!offerData?.affiliate_platform){console.warn(`${logPrefix} Falta offerData.affiliate_platform.`);return res.status(400).json({ok:!1,error:"missing_offerData"})}if(!trackingParams){console.warn(`${logPrefix} Falta trackingParams.`);return res.status(400).json({ok:!1,error:"missing_trackingParams"})}platform=offerData.affiliate_platform;console.log(`${logPrefix} Plataforma: ${platform}`);const adapter=PlatformAdapterBase.getInstance(platform),finalCheckoutUrl=await adapter.buildCheckoutUrl(offerData,trackingParams);if(!finalCheckoutUrl||typeof finalCheckoutUrl!=="string"){console.error(`${logPrefix} Adapter.buildCheckoutUrl() inválido:`,finalCheckoutUrl);throw new Error(`Adapter ${platform} falhou.`)}console.log(`${logPrefix} URL gerada.`);return res.status(200).json({ok:!0,finalCheckoutUrl})}catch(error){console.error(`${logPrefix} Falha ${platform}:`,error.message||error);return res.status(500).json({ok:!1,error:"checkout_url_generation_failed",platform})} });
 
 
-// --- Rota Protegida (API de Tracking / Eventos) ---
+/* ──────────────────────────────────────────────────────────────
+   9) Erros globais - Idêntico v5.0.4
+─────────────────────────────────────────────────────────────── */
+process.on('unhandledRejection', (reason, promise) => { console.error('[UNHANDLED_REJECTION] Reason:', reason); });
+process.on('uncaughtException', (err, origin) => { console.error('[UNCAUGHT_EXCEPTION] Error:', err, 'Origin:', origin); });
 
-/**
- * Rota: /api/track
- * Método: POST
- * Auth: X-Api-Token
- * Body: { event: "...", payload: { ... } }
- * Desc: Rota genérica para receber eventos de tracking do frontend
- * e salvá-los no Firestore (ex: 'daily_facts').
- */
-app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
-  const { event, payload } = req.body;
-  if (!event || !payload) {
-    return res.status(400).json({ error: 'event_or_payload_missing', traceId: req.traceId });
-  }
+/* ──────────────────────────────────────────────────────────────
+   10) Start - Modificado para exportar 'app' em teste (PATCH 1 OK)
+─────────────────────────────────────────────────────────────── */
+initAdmin(); // Tenta inicializar no boot
 
-  // Define a coleção (ex: 'daily_facts', 'page_views', 'clicks')
-  const collectionName = 'daily_facts'; 
-
-  try {
-    const docData = {
-      ...payload,
-      event_name: event,
-      server_timestamp: new Date(),
-      trace_id: req.traceId,
-      // (Opcional: Adicionar IP, User-Agent se necessário)
-    };
-    
-    // Adiciona o documento (o Firestore gera o ID)
-    const docRef = await db.collection(collectionName).add(docData);
-
-    res.status(201).json({ 
-      status: 'created',
-      doc_id: docRef.id 
-    });
-
-  } catch (fsError) {
-    console.error(`[TRACK][500] Erro ao salvar evento '${event}' no Firestore:`, fsError);
-    res.status(500).json({ error: 'firestore_error', traceId: req.traceId });
-  }
-});
-
-
-// --- Rotas Públicas (Webhooks S2S das Plataformas) ---
-// (Estas rotas NÃO podem ter verifyApiToken)
-
-/**
- * Rota: /webhook/digistore24
- * Método: GET (Digistore usa GET S2S)
- * Desc: Recebe o webhook S2S (Server-to-Server) do Digistore24.
- * Usa o Digistore24Adapter para verificar o 'auth_key' e
- * normalizar o payload, depois salva no Firestore.
- */
-app.get('/webhook/digistore24', async (req, res) => {
-  const query = req.query;
-  const headers = req.headers;
-
-  try {
-    const adapter = PlatformAdapterBase.getInstance('digistore24');
-    
-    // O adapter é responsável pela validação (auth_key) e normalização
-    const normalizedData = await adapter.verifyWebhook(query, headers);
-    
-    if (normalizedData) {
-      // Sucesso: Salva no Firestore
-      const docId = `ds24_${normalizedData.transactionId || normalizedData.orderId || Date.now()}`;
-      await db.collection('affiliate_transactions').doc(docId).set(normalizedData, { merge: true });
-      
-      console.log(`[WEBHOOK][DS24] Webhook S2S ${docId} processado.`);
-      res.status(200).send('OK'); // Resposta OK para o Digistore24
-    } else {
-      // Falha (ex: auth_key inválida)
-      console.warn(`[WEBHOOK][DS24] Webhook S2S falhou na verificação do Adapter. [Trace: ${req.traceId}]`);
-      res.status(401).send('Unauthorized');
-    }
-
-  } catch (error) {
-    console.error(`[WEBHOOK][DS24] Erro crítico no Adapter Digistore24:`, error?.message || error);
-    res.status(500).send('Internal Server Error');
-  }
-});
-
-/**
- * Rota: /webhook/clickbank
- * Método: POST (Clickbank usa POST)
- * Desc: Recebe o webhook (INS) do Clickbank.
- * Usa o ClickbankAdapter para verificar o HMAC (assinatura)
- * e decifrar o payload AES-256-CBC, normalizar e salvar.
- */
-// (Middleware específico para ler o Buffer raw do body)
-app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async (req, res) => {
-  // O Adapter do Clickbank espera o Buffer raw, não o JSON parseado
-  const rawBodyBuffer = req.body; 
-  const headers = req.headers;
-
-  if (!rawBodyBuffer || rawBodyBuffer.length === 0) {
-      console.warn(`[WEBHOOK][CB] Recebido body vazio. [Trace: ${req.traceId}]`);
-      return res.status(400).send('Bad Request: Empty payload');
-  }
-
-  try {
-    const adapter = PlatformAdapterBase.getInstance('clickbank');
-    
-    // O adapter é responsável pela validação (HMAC, Decrypt) e normalização
-    const normalizedData = await adapter.verifyWebhook(rawBodyBuffer, headers);
-    
-    if (normalizedData) {
-      // Sucesso: Salva no Firestore
-      const docId = `cb_${normalizedData.transactionId || normalizedData.orderId}`;
-      await db.collection('affiliate_transactions').doc(docId).set(normalizedData, { merge: true });
-      
-      console.log(`[WEBHOOK][CB] Webhook INS ${docId} processado.`);
-      res.status(200).send('OK'); // Resposta OK para o Clickbank
-    } else {
-      // Falha (ex: HMAC inválido)
-      console.warn(`[WEBHOOK][CB] Webhook INS falhou na verificação (HMAC/Decrypt). [Trace: ${req.traceId}]`);
-      res.status(401).send('Unauthorized');
-    }
-
-  } catch (error) {
-    console.error(`[WEBHOOK][CB] Erro crítico no Adapter Clickbank:`, error?.message || error);
-    res.status(500).send('Internal Server Error');
-  }
-});
-
-
-// 10) Start
-try {
-  // Inicializa o Firebase (síncrono no boot)
-  initAdmin(); 
-  
-  if (!admin && process.env.NODE_ENV === 'production') {
-    // Não permite boot em produção sem DB
-    throw new Error('Firestore (Admin SDK) falhou ao inicializar. Abortando.');
-  }
-
-  // --- ALTERAÇÃO v5.0.6: Força o binding 0.0.0.0 (Host) ---
-  // (Necessário para o Railway/Fly.io health check se conectar)
-  app.listen(PORT, '0.0.0.0', () => { // Inicia servidor, FORÇA binding 0.0.0.0
-    console.log('\n' + '─'.repeat(60));
-    // Log atualizado para confirmar a mudança:
-    console.log(`✅ Server UP on port ${PORT} (Binding: 0.0.0.0)`);
-    console.log(`📦 Version: ${SERVER_VERSION} (${SERVER_DEPLOY_DATE})`);
+if (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) {
+  console.log('[BOOT] Ambiente teste. Exportando "app".');
+  module.exports = app; // Exporta para supertest
+} else {
+  app.listen(PORT, () => { // Inicia servidor normalmente
+    console.log('──────────────────────────────────────────────────────────────');
+    console.log(`✅ Server UP on port ${PORT}`);
+    console.log(`📦 Version: v${VERSION} (${BUILD_DATE})`);
     console.log('🔧 Config:');
-    console.log(`   - CORS Origens : ${allowedOrigins.slice(0, 3).join(', ')}...`);
-    console.log(`   - Google Auth  : ${GOOGLE_CLIENT_IDS.length} Client ID(s)`);
+    console.log(`   - CORS Origens : ${allowedOrigins.slice(0,3).join(", ")}...`);
+    console.log(`   - Google Auth  : ${CLIENT_IDS.length} Client ID(s)`);
     console.log(`   - Track Aberto : ${TRACK_OPEN}`);
-    console.log(`   - Track Token  : ${TRACK_TOKEN_ENABLED ? 'Sim' : 'Não'}`);
-    console.log(`   - Debug Token  : ${TRACK_TOKEN_DEBUG_ENABLED ? 'Sim' : 'Não'}`);
-    console.log(`   - Firestore    : ${admin ? `Admin SDK (Fonte: ${FIRESTORE_SOURCE_LOG}) ✅` : 'Desconectado ❌'}`);
-    console.log(`   - Adapters     : ${ADAPTERS_LOADED ? '✅' : '❌'}`);
-    console.log(`   - Guia URL Base: ${process.env.GUIDE_REDIRECT_BASE_URL || 'N/A'}`);
-    console.log(`   - NODE_ENV     : ${process.env.NODE_ENV || 'undefined'}`);
-    console.log('─'.repeat(60));
+    console.log(`   - Track Token  : ${TRACK_TOKEN?'Sim':'Não'}`);
+    console.log(`   - Debug Token  : ${DEBUG_TOKEN?'Sim':'Não'}`);
+    console.log(`   - Firestore    : Admin SDK (Fonte: ${SA_SOURCE}) ${_adminInited ? '✅' : '❌'}`); // Indica se inicializou
+    console.log(`   - Adapters     : ${typeof PlatformAdapterBase?.getInstance==="function" ? '✅' : '❌'}`);
+    console.log(`   - Guia URL Base: ${GUIDE_DYNAMIC_URL_BASE}`);
+    console.log(`   - NODE_ENV     : ${process.env.NODE_ENV||"(N/A)"}`);
+    console.log('──────────────────────────────────────────────────────────────');
   });
-} catch (e) {
-  console.error('[FATAL] Erro ao iniciar servidor:', e?.message || e);
-  process.exit(1);
 }
