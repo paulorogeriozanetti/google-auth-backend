@@ -1,22 +1,24 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.2.2 ---'); 
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.1.19 ---'); 
 /**
  * PZ Advisors - Clickbank Adapter
- * Versão: 1.2.2 (Patch de Diagnóstico)
+ * Versão: 1.1.19 (Rollback - Sem Scraper + Beacon)
  * Data: 2025-10-27
- * Desc: Adiciona log de diagnóstico ('[BOOT CHECK]') na linha 1
- * para verificar qual versão está sendo carregada no Railway.
- * - Mantém a lógica v1.2.1 (Scraper de Múltiplos Links).
+ * Desc:
+ * - REVERTE para a lógica simples (sem scraper 'axios'/'cheerio') que apenas
+ * adiciona o 'tid' ao 'hoplink' fornecido. (Baseado na funcionalidade v1.1.17).
+ * - Adiciona log de diagnóstico ('[BOOT CHECK]') na linha 1.
+ * - Mantém o patch v1.1.17 (verificação de SECRET_KEY movida para 'verifyWebhook').
  */
-const axios = require('axios');
+// const axios = require('axios'); // Removido
+// const cheerio = require('cheerio'); // Removido
 const crypto = require('crypto');
-const cheerio = require('cheerio'); 
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
 class ClickbankAdapter extends PlatformAdapterBase {
     constructor() {
         super();
-        this.version = '1.2.2'; // Atualizado
-        this.logPrefix = '[ClickbankAdapter v1.2.2]';
+        this.version = '1.1.19'; // Atualizado
+        this.logPrefix = '[ClickbankAdapter v1.1.19]';
         
         // A verificação da WEBHOOK_SECRET_KEY fica em verifyWebhook()
         this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
@@ -24,11 +26,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
     /**
      * @override
-     * Constrói a URL final (HopLink ou Checkout Direto).
-     * 1. Adiciona 'tid' (user_id) ao HopLink.
-     * 2. (v1.2.1) Tenta visitar (scrape) o HopLink para encontrar *TODAS* as URLs
-     * de checkout direto e retorna um ARRAY.
-     * 3. Se falhar, retorna o HopLink rastreado como fallback (string).
+     * Constrói a URL final (HopLink) com o parâmetro de tracking 'tid'.
+     * (Versão simples, sem scraper)
      */
     async buildCheckoutUrl(offerData, trackingParams) {
         const userId = trackingParams?.user_id;
@@ -45,7 +44,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
             return baseUrl;
         }
 
-        // --- ETAPA 1: Construir o HopLink rastreado ---
+        // ETAPA ÚNICA: Construir o HopLink rastreado
         let trackedHoplink;
         try {
             if (baseUrl.includes('[TRACKING_ID]')) {
@@ -58,46 +57,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
                 }
                 trackedHoplink = urlObj.toString();
             }
+            console.log(`${this.logPrefix} URL de hoplink rastreada construída: ${trackedHoplink}`);
+            return trackedHoplink; // Retorna apenas o hoplink rastreado
+
         } catch (e) {
             console.error(`${this.logPrefix} URL de hoplink inválida: ${baseUrl}`, e);
             return null;
-        }
-        
-        // --- ETAPA 2: Tentar Scrape para Checkout Direto ---
-        try {
-            console.log(`${this.logPrefix} Tentando scrape do HopLink: ${trackedHoplink}`);
-            const response = await axios.get(trackedHoplink, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                },
-                maxRedirects: 5,
-                timeout: 7000
-            });
-
-            const html = response.data;
-            const $ = cheerio.load(html);
-
-            // Lógica v1.2.1 (retorna array)
-            const checkoutLinks = []; 
-            $('a[href*="pay.clickbank.net"]').each((i, elem) => {
-                const link = $(elem).attr('href');
-                if (link) {
-                    checkoutLinks.push(link); 
-                }
-            });
-
-            if (checkoutLinks.length > 0) {
-                console.log(`${this.logPrefix} SUCESSO. ${checkoutLinks.length} links de checkout encontrados.`);
-                return checkoutLinks; 
-            } else {
-                console.warn(`${this.logPrefix} Scrape falhou (nenhum link 'pay.clickbank.net' encontrado). Usando fallback.`);
-                return trackedHoplink;
-            }
-
-        } catch (scrapeError) {
-            console.error(`${this.logPrefix} Erro durante o scrape:`, scrapeError.message);
-            console.warn(`${this.logPrefix} Usando fallback (HopLink rastreado) devido a erro.`);
-            return trackedHoplink;
         }
     }
 
