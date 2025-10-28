@@ -1,59 +1,58 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.2.2 ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.2.3 (lazy-scraper) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Versão: 1.2.2 (Patch de Diagnóstico)
- * Data: 2025-10-27
- * Desc: Adiciona log de diagnóstico ('[BOOT CHECK]') na linha 1
- * para verificar qual versão está sendo carregada no Railway.
- * - Mantém a lógica v1.2.1 (Scraper de Múltiplos Links).
+ * Versão: 1.2.3 (Lazy Scraper + Feature Flag)
+ * Data: 2025-10-28
+ * Desc:
+ * - Implementa carregamento dinâmico ('lazy loading') para 'axios' e 'cheerio'
+ * dentro do 'buildCheckoutUrl', controlado pela variável de ambiente 'CB_SCRAPER_MODE'.
+ * - Objetivo: Evitar o erro 'File is not defined' (do 'undici') durante o 'require'
+ * do módulo, carregando as dependências apenas quando o scraper está ativo ('on').
+ * - Se 'CB_SCRAPER_MODE=off' (padrão), retorna apenas o hoplink rastreado (estável).
+ * - Se 'CB_SCRAPER_MODE=on', tenta o scrape; se falhar, retorna o hoplink (fallback).
+ * - Mantém patches anteriores (v1.1.17 - Secret Key, v1.2.1 - Array de links no scrape).
  */
-const axios = require('axios');
+// const axios = require('axios'); // Removido do topo
+// const cheerio = require('cheerio'); // Removido do topo
 const crypto = require('crypto');
-const cheerio = require('cheerio');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
 class ClickbankAdapter extends PlatformAdapterBase {
     constructor() {
         super();
-        this.version = '1.2.2'; // Atualizado
-        this.logPrefix = '[ClickbankAdapter v1.2.2]';
-
-        // A verificação da WEBHOOK_SECRET_KEY fica em verifyWebhook()
+        this.version = '1.2.3';
+        this.logPrefix = '[ClickbankAdapter v1.2.3]';
         this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
+        // Lê a feature flag; padrão 'off' se não definida
+        this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
+        console.log(`${this.logPrefix} Scraper Mode inicializado como: ${this.SCRAPER_MODE}`);
     }
 
     /**
      * @override
-     * Constrói a URL final (HopLink ou Checkout Direto).
-     * 1. Adiciona 'tid' (user_id) ao HopLink.
-     * 2. (v1.2.1) Tenta visitar (scrape) o HopLink para encontrar *TODAS* as URLs
-     * de checkout direto e retorna um ARRAY.
-     * 3. Se falhar, retorna o HopLink rastreado como fallback (string).
+     * Constrói a URL final.
+     * 1. Sempre constrói o hoplink rastreado com 'tid'.
+     * 2. Se SCRAPER_MODE=on, tenta carregar dependências (axios/cheerio) e fazer o scrape.
+     * 3. Retorna array de links (scrape ok), hoplink (scrape off/falha) ou null (erro).
      */
     async buildCheckoutUrl(offerData, trackingParams) {
         const userId = trackingParams?.user_id;
+        const baseUrl = offerData?.hoplink;
 
-        if (!offerData?.hoplink) {
-            console.warn(`${this.logPrefix} 'hoplink' ausente no offerData para buildCheckoutUrl.`);
+        if (!baseUrl) {
+            console.warn(`${this.logPrefix} 'hoplink' ausente no offerData.`);
             return null;
         }
 
-        let baseUrl = offerData.hoplink;
-
-        if (!userId) {
-            console.warn(`${this.logPrefix} 'user_id' ausente. Retornando URL base (hoplink) sem rastreamento.`);
-            return baseUrl;
-        }
-
-        // --- ETAPA 1: Construir o HopLink rastreado ---
+        // --- ETAPA 1: Sempre construir o HopLink rastreado (caminho estável) ---
         let trackedHoplink;
         try {
             if (baseUrl.includes('[TRACKING_ID]')) {
-                const safeTid = userId.substring(0, 100).replace(/[^a-zA-Z0-9_-]/g, '_');
+                const safeTid = (userId || 'NO_USER_ID').substring(0, 100).replace(/[^a-zA-Z0-9_-]/g, '_');
                 trackedHoplink = baseUrl.replace('[TRACKING_ID]', encodeURIComponent(safeTid));
             } else {
                 const urlObj = new URL(baseUrl);
-                if (!urlObj.searchParams.has('tid')) {
+                if (userId && !urlObj.searchParams.has('tid')) {
                     urlObj.searchParams.set('tid', userId.substring(0, 100));
                 }
                 trackedHoplink = urlObj.toString();
@@ -63,15 +62,29 @@ class ClickbankAdapter extends PlatformAdapterBase {
             return null;
         }
 
-        // --- ETAPA 2: Tentar Scrape para Checkout Direto ---
+        // --- ETAPA 2: Se o scraper estiver DESLIGADO, retorna o hoplink estável ---
+        if (this.SCRAPER_MODE !== 'on') {
+            console.log(`${this.logPrefix} SCRAPER_MODE=off -> Retornando hoplink rastreado.`);
+            return trackedHoplink;
+        }
+
+        // --- ETAPA 3: SCRAPER_MODE=on -> Tentar import dinâmico e scrape ---
+        console.log(`${this.logPrefix} SCRAPER_MODE=on -> Tentando import dinâmico...`);
         try {
-            console.log(`${this.logPrefix} Tentando scrape do HopLink: ${trackedHoplink}`);
+            // Carrega axios e cheerio dinamicamente AQUI
+            const [{ default: axios }, cheerio] = await Promise.all([
+                import('axios'),
+                import('cheerio')
+            ]);
+            console.log(`${this.logPrefix} Axios e Cheerio carregados dinamicamente.`);
+
+            console.log(`${this.logPrefix} Iniciando scrape do HopLink: ${trackedHoplink}`);
             const response = await axios.get(trackedHoplink, {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/5.37.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                 },
                 maxRedirects: 5,
-                timeout: 7000 // Aumentado ligeiramente o timeout para robustez
+                timeout: 10000 // Aumentado para 10s
             });
 
             const html = response.data;
@@ -82,10 +95,16 @@ class ClickbankAdapter extends PlatformAdapterBase {
             $('a[href*="pay.clickbank.net"]').each((i, elem) => {
                 const link = $(elem).attr('href');
                 if (link) {
-                    // Garante que a URL é absoluta
                     try {
                        const absoluteUrl = new URL(link, response.request.res.responseUrl || trackedHoplink).toString();
-                       checkoutLinks.push(absoluteUrl);
+                       // Garante que o TID está presente (caso a página o tenha removido)
+                       const urlObj = new URL(absoluteUrl);
+                       if (userId && !urlObj.searchParams.has('tid')) {
+                           urlObj.searchParams.set('tid', userId.substring(0, 100));
+                           checkoutLinks.push(urlObj.toString());
+                       } else {
+                           checkoutLinks.push(absoluteUrl);
+                       }
                     } catch (urlError) {
                        console.warn(`${this.logPrefix} Ignorando link inválido encontrado no scrape: ${link}`);
                     }
@@ -93,23 +112,26 @@ class ClickbankAdapter extends PlatformAdapterBase {
             });
 
             if (checkoutLinks.length > 0) {
-                console.log(`${this.logPrefix} SUCESSO. ${checkoutLinks.length} links de checkout encontrados.`);
-                return checkoutLinks;
+                console.log(`${this.logPrefix} SCRAPE SUCESSO. ${checkoutLinks.length} links de checkout encontrados.`);
+                return checkoutLinks; // Retorna o ARRAY
             } else {
-                console.warn(`${this.logPrefix} Scrape falhou (nenhum link 'pay.clickbank.net' encontrado). Usando fallback.`);
-                return trackedHoplink;
+                console.warn(`${this.logPrefix} SCRAPE FALHOU (nenhum link 'pay.clickbank.net' encontrado). Usando fallback (hoplink).`);
+                return trackedHoplink; // Retorna STRING (fallback)
             }
 
         } catch (scrapeError) {
-            console.error(`${this.logPrefix} Erro durante o scrape:`, scrapeError.message);
-            // Log adicional para erros de timeout ou rede
+            // Este catch agora pega erros do import() E do axios/cheerio
+            console.error(`${this.logPrefix} Erro durante import dinâmico ou scrape:`, scrapeError?.message || scrapeError);
             if (scrapeError.code === 'ECONNABORTED') {
-                 console.error(`${this.logPrefix} Scrape falhou devido a TIMEOUT (${scrapeError.config?.timeout}ms).`);
+                 console.error(`${this.logPrefix} Scrape falhou devido a TIMEOUT.`);
             } else if (scrapeError.response) {
                  console.error(`${this.logPrefix} Scrape falhou com status HTTP ${scrapeError.response.status}.`);
+            } else if (scrapeError instanceof ReferenceError && scrapeError.message.includes('File is not defined')) {
+                 console.error(`${this.logPrefix} ERRO CRÍTICO: 'File is not defined' ainda ocorre, mesmo com lazy loading. Desativando scraper.`);
+                 // Poderia desativar permanentemente aqui se necessário
             }
-            console.warn(`${this.logPrefix} Usando fallback (HopLink rastreado) devido a erro.`);
-            return trackedHoplink;
+            console.warn(`${this.logPrefix} Usando fallback (HopLink rastreado) devido a erro no scrape/import.`);
+            return trackedHoplink; // Retorna STRING (fallback seguro)
         }
     }
 

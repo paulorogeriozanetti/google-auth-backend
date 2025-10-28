@@ -1,6 +1,6 @@
 {
   "name": "google-auth-backend",
-  "version": "5.0.9",
+  "version": "5.0.8",
   "private": true,
   "description": "Backend for PZ Auth+API (Requires Node 20+)",
   "main": "server.js",
