@@ -1,14 +1,17 @@
 {
   "name": "google-auth-backend",
-  "version": "5.0.7",
+  "version": "5.0.8",
+  "private": true,
   "description": "Backend for PZ Auth+API (Requires Node 20+)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start:prod": "NODE_ENV=production node server.js",
+    "node:version": "node -v",
+    "test": "echo \"(no tests configured)\" && exit 0"
   },
   "engines": {
-    "node": "20"
+    "node": "20.x"
   },
   "keywords": [],
   "author": "",
