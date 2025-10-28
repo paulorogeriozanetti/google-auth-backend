@@ -1,5 +1,5 @@
 # Usa a imagem oficial Node.js 20 Alpine Linux como base
-FROM node:20-alpine AS builder # <-- CORRIGIDO para Node 20
+FROM node:20-alpine AS builder
 
 # Define o diretório de trabalho dentro do container
 WORKDIR /app
@@ -14,9 +14,10 @@ RUN npm install --only=production # Otimizado para produção
 COPY . .
 
 # Define a variável PORT (o Railway irá sobrescrever com a porta dinâmica)
-# e expõe a porta que a aplicação usará
-ENV PORT=3000 # Define um padrão, mas Railway usa o seu
-EXPOSE ${PORT} # <-- ADICIONADO para expor a porta dinâmica
+# Define um padrão, mas Railway usa o seu <-- COMENTÁRIO MOVIDO
+ENV PORT=3000 
+# Expõe a porta que a aplicação usará
+EXPOSE ${PORT}
 
 # Define o comando padrão para rodar a aplicação
 CMD [ "node", "server.js" ]
