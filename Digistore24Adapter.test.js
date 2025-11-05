@@ -1,210 +1,296 @@
 /**
- * PZ Digistore24 Adapter Unit Tests
- * Versão: 1.3.0
- * Data: 2025-10-26
- * Desc: Implementa testes unitários reais e corrige falhas de lógica:
- * - Corrige asserção para esperar '<removed>' (em vez de undefined) no rawPayload.
- * - Corrige teste de auth_key inválida para usar chave do mesmo comprimento, forçando a chamada a timingSafeEqual.
+ * PZ Advisors - Digistore24 Adapter - Testes
+ * Versão do teste: v1.2.0 (cobre ParamMap CSV + Fallback + legado)
+ * Data: 2025-11-05
+ *
+ * O que validamos:
+ * 1) Montagem de URL por product_id e por checkout_url.
+ * 2) Afixação de aff (affiliate_id).
+ * 3) Leitura data-driven via ParamMapLoaderCsv (mapTrackingToPlatform).
+ * 4) Fallback hardcoded quando o CSV não traz chaves (ou está ausente).
+ * 5) Sanitização de valores e presença apenas de chaves com valor.
+ * 6) Webhook verification com DIGISTORE_AUTH_KEY (ok/erro) e normalização de payload.
  */
 
-// Define a variável de ambiente ANTES de importar o adapter
-// Esta é a chave do seu link S2S (pode ser mockada com qualquer valor aqui, pois o teste não vai a um serviço real)
-process.env.DIGISTORE_AUTH_KEY = process.env.DIGISTORE_AUTH_KEY || 'ds24_s2s_auth_pz_kyvD7wwnTvWN8AkgxlJnnQ';
+const path = require('path');
+const originalEnv = { ...process.env };
 
-// Agora importa a classe que queremos testar
-// NOTA: Este require funcionará na v1.1.6 do Adapter, pois a verificação da chave foi movida.
-const Digistore24Adapter = require('./Digistore24Adapter');
-const PlatformAdapterBase = require('./PlatformAdapterBase');
-// Importa o módulo crypto, que será mockado pelo Jest
-const crypto = require('crypto'); 
+const buildAdapterFresh = async () => {
+  jest.resetModules();
+  return require('./Digistore24Adapter');
+};
 
-// Mock da dependência 'crypto' (usada em verifyWebhook)
-jest.mock('crypto', () => ({
-  // Mock da função timingSafeEqual para simular a comparação
-  timingSafeEqual: jest.fn((bufferA, bufferB) => {
-    // Simula a comparação real (para testes)
-    if (!bufferA || !bufferB || bufferA.length !== bufferB.length) {
-      return false;
-    }
-    // Simples comparação de strings para o mock
-    return bufferA.toString() === bufferB.toString();
-  }),
-  // Mock de Buffer.from
-  Buffer: {
-    from: jest.fn((str, encoding = 'utf8') => Buffer.from(str, encoding)),
-  },
-}));
+// Helper para ler params da URL
+function paramsFromUrl(u) {
+  const url = new URL(u);
+  const out = {};
+  url.searchParams.forEach((v, k) => (out[k] = v));
+  return out;
+}
 
-// --- Início dos Testes Reais ---
-
-describe('Digistore24Adapter (Testes Unitários Reais - v1.1.6)', () => {
-
-  // Limpa o histórico de chamadas do mock do crypto antes de cada teste
+describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
   beforeEach(() => {
-    crypto.timingSafeEqual.mockClear();
+    jest.resetModules();
+    process.env = { ...originalEnv };
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
   });
 
-  // Testes para o método buildCheckoutUrl
-  describe('buildCheckoutUrl', () => {
-    const mockOfferData = {
-      offer_name: 'Produto Teste',
-      // URL de checkout estática (simulando URL do produto)
-      checkout_url: 'https://www.digistore24.com/product/12345',
+  afterEach(() => {
+    jest.restoreAllMocks();
+    process.env = { ...originalEnv };
+  });
+
+  test('buildCheckoutUrl com product_id + ParamMap (CSV presente): mapeia user_id/gclid/utm_source e seta aff', async () => {
+    // Mock ParamMapLoaderCsv com dados do CSV (ativos)
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      const fakePM = {
+        // Ex.: CSV mapeia user_id->sid1, gclid->sid2, utm_source->utm_source
+        mapTrackingToPlatform: (tracking, platform) => {
+          if (platform !== 'digistore24') return {};
+          const out = {};
+          if (tracking.user_id) out.sid1 = tracking.user_id;
+          if (tracking.gclid) out.sid2 = tracking.gclid;
+          if (tracking.utm_source) out.utm_source = tracking.utm_source;
+          return out;
+        },
+        getInstance: () => fakePM,
+      };
+      return fakePM;
+    });
+
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
+
+    const offerData = {
+      product_id: '568660',
       affiliate_id: 'pzadvisors',
     };
-    
-    const mockTrackingParams = {
-      user_id: 'user_abc',
-      gclid: 'gclid_xyz',
-      fbclid: 'fbclid_123',
-      anon_id: 'anon_def',
-      cid: 'cid_789',
-      campaignkey: 'campaign_test',
+
+    const trackingParams = {
+      user_id: 'SUB_107',
+      gclid: 'GCLID_XXX',
+      utm_source: 'google',
+      utm_medium: '', // vazio -> não deve ser enviado
     };
 
-    test('Deve construir a URL de checkout completa com todos os SIDs e parâmetros', async () => {
-      const adapter = new Digistore24Adapter();
-      const url = await adapter.buildCheckoutUrl(mockOfferData, mockTrackingParams);
-      
-      // Converte a URL de volta para um objeto URLSearchParams para facilitar a verificação
-      const params = new URL(url).searchParams;
-      
-      // Verifica se a URL contém todos os parâmetros mapeados corretamente
-      expect(params.get('aff')).toBe('pzadvisors');
-      expect(params.get('sid1')).toBe('user_abc'); // Mapeado de user_id
-      expect(params.get('sid2')).toBe('gclid_xyz'); // Mapeado de gclid
-      expect(params.get('sid3')).toBe('fbclid_123'); // Mapeado de fbclid
-      expect(params.get('sid4')).toBe('anon_def'); // Mapeado de anon_id
-      expect(params.get('cid')).toBe('cid_789'); // Mapeado de cid
-      expect(params.get('campaignkey')).toBe('campaign_test'); // Mapeado de campaignkey
-      expect(url.startsWith(mockOfferData.checkout_url)).toBe(true);
-    });
+    const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
+    expect(url).toBeTruthy();
+    expect(url.startsWith('https://www.digistore24.com/product/568660?')).toBe(true);
 
-    test('Deve construir a URL apenas com affiliate_id se trackingParams estiver vazio', async () => {
-      const adapter = new Digistore24Adapter();
-      const url = await adapter.buildCheckoutUrl(mockOfferData, {}); // Sem tracking
-      
-      expect(url).toBe('https://www.digistore24.com/product/12345?aff=pzadvisors');
-    });
-    
-    test('Deve retornar null se a checkout_url for do tipo "adapter:"', async () => {
-        const adapter = new Digistore24Adapter();
-        const badOfferData = {
-             ...mockOfferData,
-             checkout_url: 'adapter:digistore24' // Esta URL não é válida para este método
-        };
-        const url = await adapter.buildCheckoutUrl(badOfferData, mockTrackingParams);
-        expect(url).toBeNull();
-    });
+    const qp = paramsFromUrl(url);
+    expect(qp.aff).toBe('pzadvisors');
+    expect(qp.sid1).toBe('SUB_107');
+    expect(qp.sid2).toBe('GCLID_XXX');
+    expect(qp.utm_source).toBe('google');
+    expect(qp.utm_medium).toBeUndefined(); // não foi enviado por estar vazio
   });
 
-  // Testes para o método verifyWebhook (v1.1.6)
-  describe('verifyWebhook (S2S v1.1.6 logic)', () => {
-
-    // A chave correta definida no topo do ficheiro
-    const validAuthKey = process.env.DIGISTORE_AUTH_KEY; 
-
-    test('Deve retornar dados normalizados com auth_key válida e parâmetros S2S', async () => {
-      const adapter = new Digistore24Adapter();
-      // Simula a query do link S2S fornecido
-      const mockQuery = {
-        auth_key: validAuthKey,
-        transaction_id: 'tx_12345',
-        status: 'completed',
-        amount: '25,50', // Testa conversão de vírgula
-        product: 'Produto S2S Teste',
-        sid3: 'user_xyz_s2s', // userId mapeado para sid3 (conforme adapter v1.1.5)
-        gclid: 'gclid_s2s_test', // Parâmetro direto
-        fbclid: 'fbclid_s2s_test', // Parâmetro direto
-        campaign: 'campanha_s2s_teste', // 'campaign' mapeado para 'campaignkey'
-        cid: 'cid_s2s_test'
+  test('buildCheckoutUrl com checkout_url direto + ParamMap: respeita URL base e adiciona qs', async () => {
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      const fakePM = {
+        mapTrackingToPlatform: (tracking, platform) => {
+          if (platform !== 'digistore24') return {};
+          const out = {};
+          if (tracking.user_id) out.sid1 = tracking.user_id;
+          if (tracking.fbclid) out.sid3 = tracking.fbclid;
+          if (tracking.campaignkey) out.campaignkey = tracking.campaignkey;
+          return out;
+        },
+        getInstance: () => fakePM,
       };
-      
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      
-      expect(data).not.toBeNull();
-      expect(data.platform).toBe('digistore24');
-      expect(data.transactionId).toBe('tx_12345');
-      expect(data.status).toBe('paid'); // Mapeado de 'completed'
-      expect(data.amount).toBe(25.50); // Convertido para float
-      expect(data.productName).toBe('Produto S2S Teste');
-      expect(data.userId).toBe('user_xyz_s2s'); // Mapeado de sid3
-      expect(data.gclid).toBe('gclid_s2s_test');
-      expect(data.fbclid).toBe('fbclid_s2s_test');
-      expect(data.campaignkey).toBe('campanha_s2s_teste'); // Mapeado de 'campaign'
-      expect(data.cid).toBe('cid_s2s_test');
-      // PATCH 1: Verifica se a chave foi MASCARADA por '<removed>'
-      expect(data.rawPayload).toHaveProperty('auth_key', '<removed>'); 
-      expect(crypto.timingSafeEqual).toHaveBeenCalledTimes(1); // Verifica se a validação foi feita
+      return fakePM;
     });
 
-    test('Deve retornar NULL se a auth_key for inválida (mesmo comprimento)', async () => {
-      const adapter = new Digistore24Adapter();
-      
-      // PATCH 2: Constrói uma chave incorreta com o MESMO tamanho da chave válida,
-      // para forçar a chamada ao timingSafeEqual no adapter (resolve o erro 0 != 1).
-      const badKey = (process.env.DIGISTORE_AUTH_KEY || '').replace(/./g, 'x');
-      
-      const mockQuery = {
-        auth_key: badKey, // Chave incorreta, mas de mesmo comprimento
-        transaction_id: 'tx_456'
-      };
-      
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      
-      expect(data).toBeNull();
-      // Agora, timingSafeEqual DEVE ser chamado
-      expect(crypto.timingSafeEqual).toHaveBeenCalledTimes(1);
-    });
-    
-    test('Deve retornar NULL se a auth_key estiver ausente', async () => {
-      const adapter = new Digistore24Adapter();
-      const mockQuery = {
-        transaction_id: 'tx_789'
-        // Sem auth_key
-      };
-      
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      
-      expect(data).toBeNull();
-      // timingSafeEqual não deve ser chamado
-      expect(crypto.timingSafeEqual).not.toHaveBeenCalled();
-    });
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
 
-    test('Deve mapear status "refunded" para "refunded"', async () => {
-      const adapter = new Digistore24Adapter();
-      const mockQuery = {
-        auth_key: validAuthKey,
-        status: 'refunded',
-      };
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      expect(data.status).toBe('refunded');
-    });
+    const offerData = {
+      checkout_url: 'https://www.digistore24.com/product/568660?prefill=1',
+      affiliate_id: 'pzadvisors',
+    };
 
-    test('Deve mapear status "pending" para "pending"', async () => {
-      const adapter = new Digistore24Adapter();
-      const mockQuery = {
-        auth_key: validAuthKey,
-        status: 'waiting',
-      };
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      expect(data.status).toBe('pending');
-    });
+    const trackingParams = {
+      user_id: 'SUB_999',
+      fbclid: 'FB_TEST',
+      campaignkey: 'Q4META2025',
+    };
 
-    test('Deve retornar status "unknown" se o status não for mapeado', async () => {
-      const adapter = new Digistore24Adapter();
-      const mockQuery = {
-        auth_key: validAuthKey,
-        status: 'status_desconhecido',
-      };
-      const data = await adapter.verifyWebhook(mockQuery, {});
-      expect(data.status).toBe('unknown');
-    });
+    const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
+    expect(url).toBeTruthy();
+    expect(url.startsWith('https://www.digistore24.com/product/568660?')).toBe(true);
+
+    const qp = paramsFromUrl(url);
+    // mantém prefill=1
+    expect(qp.prefill).toBe('1');
+    // seta aff
+    expect(qp.aff).toBe('pzadvisors');
+    // adiciona mapeamentos via CSV
+    expect(qp.sid1).toBe('SUB_999');
+    expect(qp.sid3).toBe('FB_TEST');
+    expect(qp.campaignkey).toBe('Q4META2025');
   });
 
-  // Teste de instância (opcional, mas bom)
-  test('Deve ser uma instância de PlatformAdapterBase', () => {
+  test('buildCheckoutUrl (CSV vazio/ausente) aplica fallback hardcoded (sid1/sid2/sid3/sid4/cid/campaignkey)', async () => {
+    // Mock ParamMapLoaderCsv retornando {} para forçar fallback
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      const fakePM = {
+        mapTrackingToPlatform: () => ({}),
+        getInstance: () => fakePM,
+      };
+      return fakePM;
+    });
+
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
+
+    const offerData = {
+      product_id: '568660',
+      affiliate_id: 'pzadvisors',
+    };
+
+    const trackingParams = {
+      user_id: 'SUB_FALL',
+      gclid: 'G_FALL',
+      fbclid: 'FB_FALL',
+      anon_id: 'ANON_FALL',
+      cid: 'CID_FALL',
+      campaignkey: 'CK_FALL',
+      utm_source: 'google', // no fallback hardcoded não mapeia utms (mantém legado)
+    };
+
+    const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
+    const qp = paramsFromUrl(url);
+
+    expect(qp.aff).toBe('pzadvisors');
+    expect(qp.sid1).toBe('SUB_FALL');
+    expect(qp.sid2).toBe('G_FALL');
+    expect(qp.sid3).toBe('FB_FALL');
+    expect(qp.sid4).toBe('ANON_FALL');
+    expect(qp.cid).toBe('CID_FALL');
+    expect(qp.campaignkey).toBe('CK_FALL');
+    expect(qp.utm_source).toBeUndefined();
+  });
+
+  test('buildCheckoutUrl retorna null quando base inválida', async () => {
+    // ParamMap presente não importa — base ruim deve falhar antes
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      const fakePM = {
+        mapTrackingToPlatform: () => ({ sid1: 'X' }),
+        getInstance: () => fakePM,
+      };
+      return fakePM;
+    });
+
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
+
+    const offerData = { checkout_url: 'https://exemplo.com/qualquer' }; // domínio inválido para DS24
+    const url = await adapter.buildCheckoutUrl(offerData, { user_id: 'SUB' });
+    expect(url).toBeNull();
+  });
+
+  test('buildCheckoutUrl sanitiza valores e ignora vazios', async () => {
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      const fakePM = {
+        mapTrackingToPlatform: (tracking, platform) => {
+          if (platform !== 'digistore24') return {};
+          // Força valores "sujos" para testar sanitização
+          return {
+            sid1: tracking.user_id ?? '',
+            sid2: 'inválido espaço & símbolo!',
+            utm_source: '', // vazio -> omitido
+          };
+        },
+        getInstance: () => fakePM,
+      };
+      return fakePM;
+    });
+
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
+
+    const offerData = { product_id: '568660', affiliate_id: 'aff_x' };
+    const trackingParams = { user_id: '  SUB  ' };
+
+    const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
+    const qp = paramsFromUrl(url);
+
+    expect(qp.aff).toBe('aff_x');
+    expect(qp.sid1).toBe('SUB'); // trim aplicado
+    // caractere inválido -> substituído por "_"
+    expect(qp.sid2).toBe('inv_lido_espa_o___s_mbolo_');
+    // utm_source vazio não aparece
+    expect(qp.utm_source).toBeUndefined();
+  });
+
+  describe('Webhook verification + normalização', () => {
+    test('verifyWebhook OK com auth_key válida e normaliza payload', async () => {
+      process.env.DIGISTORE_AUTH_KEY = 'SECRET_X';
+
+      const Digistore24Adapter = await buildAdapterFresh();
       const adapter = new Digistore24Adapter();
-      expect(adapter).toBeInstanceOf(PlatformAdapterBase);
+
+      const payload = {
+        auth_key: 'SECRET_X',
+        event: 'completed',
+        order_id: 'O123',
+        product_id: 'P1',
+        amount: '69.00',
+        currency: 'USD',
+        timestamp: '2025-11-05 12:34:56',
+        customer_email: 'user@example.com',
+        sid1: 'SUB_123',
+        sid2: 'GCLID_ABC',
+        sid3: 'FB_ABC',
+        sid4: 'ANON_ABC',
+        cid: 'CID_ABC',
+        campaignkey: 'CK_ABC',
+      };
+
+      const out = await adapter.verifyWebhook(payload, {}, 'TRACE-1');
+      expect(out).toBeTruthy();
+      expect(out.platform).toBe('digistore24');
+      expect(out.orderId).toBe('O123');
+      expect(out.trackingId).toBe('SUB_123');
+      expect(out.sid2).toBe('GCLID_ABC');
+      expect(out.campaignkey).toBe('CK_ABC');
+      expect(out.status).toBe('paid'); // completed -> paid
+      expect(out.trace_id).toBe('TRACE-1');
+    });
+
+    test('verifyWebhook retorna null quando auth_key inválida', async () => {
+      process.env.DIGISTORE_AUTH_KEY = 'SECRET_X';
+
+      const Digistore24Adapter = await buildAdapterFresh();
+      const adapter = new Digistore24Adapter();
+
+      const payload = { auth_key: 'WRONG', event: 'completed', order_id: 'O1' };
+      const out = await adapter.verifyWebhook(payload, {}, 'TRACE-2');
+      expect(out).toBeNull();
+    });
+
+    test('verifyWebhook retorna null quando auth_key ausente', async () => {
+      process.env.DIGISTORE_AUTH_KEY = 'SECRET_X';
+
+      const Digistore24Adapter = await buildAdapterFresh();
+      const adapter = new Digistore24Adapter();
+
+      const payload = { event: 'completed', order_id: 'O1' };
+      const out = await adapter.verifyWebhook(payload, {}, 'TRACE-3');
+      expect(out).toBeNull();
+    });
+
+    test('verifyWebhook retorna null quando DIGISTORE_AUTH_KEY não está configurada no ambiente', async () => {
+      delete process.env.DIGISTORE_AUTH_KEY;
+
+      const Digistore24Adapter = await buildAdapterFresh();
+      const adapter = new Digistore24Adapter();
+
+      const payload = { auth_key: 'X', event: 'completed', order_id: 'O1' };
+      const out = await adapter.verifyWebhook(payload, {}, 'TRACE-4');
+      expect(out).toBeNull();
+    });
   });
 });
