@@ -1,16 +1,12 @@
 /**
  * PZ Advisors - Digistore24 Adapter
- * Versão: 1.2.0 (ParamMap CSV + Fallback seguro)
+ * Versão: 1.2.1 (Sanitize com trim)
  * Data: 2025-11-05
  * Desc:
- * - Integra mapeamento data-driven de parâmetros a partir do pz_parameter_map.csv
- *   através do ParamMapLoaderCsv (P0.4), eliminando hardcode sempre que possível.
- * - Mantém compatibilidade com:
- *     • product_id (v1.1.7)
- *     • mapeamento completo aff/sid1..sid4/cid/campaignkey (v1.1.6)
- * - Se o CSV não estiver acessível ou não trouxer chaves ativas, aplica fallback
- *   hardcoded idêntico às versões anteriores (não perde funcionalidade).
- * - Mantém logs de diagnóstico e verificação de Webhook S2S com DIGISTORE_AUTH_KEY.
+ * - Ajusta sanitização para aplicar `.trim()` antes do replace, evitando
+ *   converter espaços em "_" (corrige teste "sanitiza valores e ignora vazios").
+ * - Mantém integração ParamMap CSV (P0.4) + fallback hardcoded e toda a
+ *   compatibilidade anterior (product_id, aff/sidX/cid/campaignkey).
  */
 
 const crypto = require('crypto');
@@ -34,7 +30,7 @@ function getParamMap() {
   }
 }
 
-// Fallback estrito às versões anteriores (v1.1.6/1.1.8)
+// Fallback estrito às versões anteriores (v1.1.6/1.1.8) com sanitize + trim
 function fallbackHardcodedMap(trackingParams = {}) {
   const map = {
     user_id: 'sid1',
@@ -47,8 +43,11 @@ function fallbackHardcodedMap(trackingParams = {}) {
   const out = {};
   for (const [pzKey, dsKey] of Object.entries(map)) {
     const v = trackingParams[pzKey];
-    if (v !== undefined && v !== null && String(v).trim() !== '') {
-      out[dsKey] = String(v).substring(0, 100).replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (v !== undefined && v !== null) {
+      const trimmed = String(v).trim();
+      if (trimmed !== '') {
+        out[dsKey] = trimmed.substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
+      }
     }
   }
   return out;
@@ -57,7 +56,7 @@ function fallbackHardcodedMap(trackingParams = {}) {
 class Digistore24Adapter extends PlatformAdapterBase {
   constructor() {
     super();
-    this.version = '1.2.0';
+    this.version = '1.2.1';
     this.logPrefix = `[Digistore24Adapter v${this.version}]`;
 
     // Chave de Autenticação S2S (webhook)
@@ -100,10 +99,10 @@ class Digistore24Adapter extends PlatformAdapterBase {
     try {
       const urlObj = new URL(baseUrl);
 
-      // 3) Affiliate ID (compatível com v1.1.6)
+      // 3) Affiliate ID
       const affiliateId = offerData.affiliate_id;
       if (affiliateId) {
-        urlObj.searchParams.set('aff', String(affiliateId));
+        urlObj.searchParams.set('aff', String(affiliateId).trim());
       } else {
         console.warn(`${this.logPrefix} affiliate_id não encontrado em offerData (param 'aff' não será setado).`);
       }
@@ -123,11 +122,12 @@ class Digistore24Adapter extends PlatformAdapterBase {
         qs = fallbackHardcodedMap(trackingParams);
       }
 
-      // 4.2) Saneamento final e set na URL
+      // 4.2) Saneamento final e set na URL (agora com trim antes do replace)
       for (const [k, v] of Object.entries(qs)) {
-        // segurança: parâmetros somente com string curta e sem caracteres estranhos
-        const safeValue = String(v).substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
-        urlObj.searchParams.set(k, safeValue);
+        const safeValue = String(v).trim().substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
+        if (safeValue !== '') {
+          urlObj.searchParams.set(k, safeValue);
+        }
       }
 
       const finalUrl = urlObj.toString();
