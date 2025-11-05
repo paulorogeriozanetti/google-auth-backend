@@ -1,23 +1,24 @@
 /**
  * PZ Advisors - ParamMapLoaderCsv
- * Versão: v1.0.0 (Loader CSV + Mapeamento de Parâmetros)
+ * Versão: v1.1.0 (CommonJS exports + helpers p/ testes + retrocompat)
  * Data: 2025-11-05
  * Descrição:
+ * - Mantém a classe ParamMapLoaderCsv (loader CSV + mapeamento de parâmetros).
+ * - Adiciona **exports CommonJS** esperados pelos testes/unit (loadParamMapCsv, mapParamsForPlatform, __resetCache).
+ * - Mantém retrocompatibilidade: adapters podem continuar usando `getInstance()`.
  * - Lê pz_parameter_map.csv (separador ';') e disponibiliza:
- *   1) Mapa dos parâmetros internos (pz_id_parameter) -> chaves por plataforma
- *      (ex.: digistore24_id_parameter, clickbank_id_parameter).
- *   2) Apenas linhas com status=active são consideradas.
- *   3) Normaliza placeholders no CSV: "{sid1}" -> "sid1".
- *   4) Retorna um objeto de query pronto para compor URLs de plataforma
- *      a partir de um trackingParams canónico (user_id, gclid, utms, etc.).
- * - Inclui cache + hot-reload (por mtime do arquivo).
+ *   1) index por pz_id_parameter (apenas status=active).
+ *   2) mapeamento p/ cada plataforma (colunas *_id_parameter), normalizando placeholders "{sid1}" -> "sid1".
+ *   3) função para construir objeto de query da plataforma a partir de trackingParams canónico.
  *
- * Uso típico nos Adapters:
+ * Uso típico nos Adapters (retrocompat):
  *    const ParamMap = require('./ParamMapLoaderCsv').getInstance();
- *    // Constrói query específica da plataforma a partir do trackingParams canónico
  *    const q = ParamMap.mapTrackingToPlatform(trackingParams, 'digistore24');
- *    // q => { sid1: '107...', sid2: 'TEST_GCLID', utm_source: 'google', ... }
- *    // Depois, anexe q na URL final conforme a regra da plataforma.
+ *
+ * Uso típico nos testes (helpers):
+ *    const loader = require('./ParamMapLoaderCsv');
+ *    const map = loader.loadParamMapCsv({ csvPath: '.../pz_parameter_map.csv' });
+ *    const out = loader.mapParamsForPlatform('digistore24', payload);
  */
 
 const fs = require('fs');
@@ -25,14 +26,15 @@ const path = require('path');
 
 class ParamMapLoaderCsv {
   constructor(csvPath) {
-    this.version = '1.0.0';
+    this.version = '1.1.0';
     this.logPrefix = `[ParamMapLoaderCsv v${this.version}]`;
     this.csvPath = csvPath || process.env.PZ_PARAM_MAP_PATH || path.resolve('./pz_parameter_map.csv');
 
-    this._cache = null;       // estrutura parseada
+    this._cache = null;       // linhas parseadas
     this._mtimeMs = null;     // última modificação observada
     this._headers = null;     // cabeçalhos do CSV (normalizados)
-    this._platformColumns = [ // colunas de plataforma suportadas
+    this._byPzId = {};        // índice por pz_id_parameter
+    this._platformColumns = [
       'digistore24_id_parameter',
       'clickbank_id_parameter',
       'clickgenius_id_parameter',
@@ -45,48 +47,39 @@ class ParamMapLoaderCsv {
     this._loadOrReload(true);
   }
 
-  // Singleton simples
+  // Singleton
   static getInstance(csvPath) {
-    if (!this._instance) {
-      this._instance = new ParamMapLoaderCsv(csvPath);
+    if (!ParamMapLoaderCsv._instance) {
+      ParamMapLoaderCsv._instance = new ParamMapLoaderCsv(csvPath);
     } else {
-      // Hot reload se mudou
-      this._instance._loadOrReload(false);
+      // Se trocou o caminho, atualiza e força reload
+      if (csvPath && ParamMapLoaderCsv._instance.csvPath !== csvPath) {
+        ParamMapLoaderCsv._instance.csvPath = csvPath;
+        ParamMapLoaderCsv._instance._mtimeMs = null; // força reload
+      }
+      ParamMapLoaderCsv._instance._loadOrReload(false);
     }
-    return this._instance;
+    return ParamMapLoaderCsv._instance;
   }
 
-  // --- API pública ---
+  // --- API da classe ---
 
-  /**
-   * Retorna o nome da coluna da plataforma (normalizada) a partir de uma string de plataforma.
-   * Ex.: 'digistore24' -> 'digistore24_id_parameter'
-   */
   getPlatformColumn(platform) {
     if (!platform) return null;
-    const p = String(platform).toLowerCase();
+    const p = String(platform).toLowerCase().trim();
     const col = `${p}_id_parameter`;
     return this._platformColumns.includes(col) ? col : null;
   }
 
-  /**
-   * Dado um pz_id_parameter (ex.: 'user_id') e a plataforma ('digistore24' | 'clickbank' | ...),
-   * retorna a chave da plataforma (ex.: 'sid1' | 'aff_sub1' | 'utm_source' ...).
-   * Considera apenas linhas status=active.
-   */
   getPlatformKeyFor(pzId, platform) {
     const col = this.getPlatformColumn(platform);
     if (!col || !pzId) return null;
     const row = this._byPzId[pzId];
     if (!row || row.status !== 'active') return null;
     const raw = row[col] || '';
-    return this._normalizePlaceholderToKey(raw); // "{sid1}" -> "sid1"
+    return this._normalizePlaceholderToKey(raw);
   }
 
-  /**
-   * Retorna um objeto com o mapeamento (apenas ativos) pz_id_parameter -> { [platformKey]: string }
-   * útil para depuração ou *export*.
-   */
   getActiveMap(platform) {
     const col = this.getPlatformColumn(platform);
     if (!col) return {};
@@ -99,40 +92,28 @@ class ParamMapLoaderCsv {
     return out;
   }
 
-  /**
-   * Constrói o objeto de query da plataforma a partir do trackingParams canónico.
-   * - Usa apenas linhas status=active.
-   * - Apenas define chaves cujo valor (em trackingParams) exista (string/number/boolean não vazio).
-   * - Normaliza e recorta valores (trim).
-   */
   mapTrackingToPlatform(trackingParams = {}, platform) {
     const col = this.getPlatformColumn(platform);
     if (!col) {
       console.warn(`${this.logPrefix} Plataforma não suportada: ${platform}`);
       return {};
     }
-
     const query = {};
     for (const [pzId, row] of Object.entries(this._byPzId)) {
       if (row.status !== 'active') continue;
 
-      // valor canónico vindo do front (pz_track ou fallbacks do head)
       const rawVal = trackingParams[pzId];
       const val = this._sanitizeVal(rawVal);
-      if (val === '') continue; // não envia vazio
+      if (val === '') continue;
 
-      // chave da plataforma (placeholder -> chave real)
       const platformKey = this._normalizePlaceholderToKey(row[col] || '');
-      if (!platformKey) continue; // não mapeado para a plataforma
+      if (!platformKey) continue;
 
       query[platformKey] = val;
     }
     return query;
   }
 
-  /**
-   * Retorna uma visão completa da linha para um pz_id_parameter (para auditoria).
-   */
   getRow(pzId) {
     return this._byPzId[pzId] || null;
   }
@@ -145,7 +126,7 @@ class ParamMapLoaderCsv {
       const mtimeMs = stat.mtimeMs;
       const mustReload = initial || this._mtimeMs === null || mtimeMs !== this._mtimeMs;
 
-      if (!mustReload && this._cache) return; // nada mudou
+      if (!mustReload && this._cache) return;
 
       const raw = fs.readFileSync(this.csvPath, 'utf8');
       const { headers, rows } = this._parseCsvSemicolon(raw);
@@ -153,38 +134,30 @@ class ParamMapLoaderCsv {
       this._cache = rows;
       this._mtimeMs = mtimeMs;
 
-      // index por pz_id_parameter (chave mestra)
+      // Reindexa por pz_id_parameter
       this._byPzId = {};
       for (const r of rows) {
         const pzId = r['pz_id_parameter'];
         if (!pzId) continue;
-        // normaliza status para 'active' / 'inactive' (case-insensitive)
         r.status = String(r.status || '').toLowerCase().trim() === 'active' ? 'active' : 'inactive';
         this._byPzId[pzId] = r;
       }
 
       console.log(`${this.logPrefix} CSV carregado (${rows.length} linhas). Path: ${this.csvPath}`);
-
     } catch (e) {
       console.error(`${this.logPrefix} Falha ao carregar CSV em "${this.csvPath}":`, e?.message || e);
-      // Mantém cache anterior se houver; caso contrário, inicializa vazio
       this._cache = this._cache || [];
       this._byPzId = this._byPzId || {};
     }
   }
 
   _parseCsvSemicolon(content) {
-    // Parser simples para CSV separado por ';' com tolerância a aspas duplas.
-    // 1) separa por quebras de linha
     const lines = String(content || '').replace(/\r\n/g, '\n').split('\n').filter(l => l.trim().length > 0);
-
     if (lines.length === 0) return { headers: [], rows: [] };
 
-    // Cabeçalho
     const headerLine = lines[0];
     const headers = this._splitSemicolon(headerLine).map(h => this._normHeader(h));
 
-    // Linhas
     const rows = [];
     for (let i = 1; i < lines.length; i++) {
       const cols = this._splitSemicolon(lines[i]);
@@ -199,7 +172,6 @@ class ParamMapLoaderCsv {
   }
 
   _splitSemicolon(line) {
-    // Suporta ; como separador e campos entre aspas duplas contendo ; dentro
     const out = [];
     let cur = '';
     let inQuotes = false;
@@ -208,10 +180,9 @@ class ParamMapLoaderCsv {
       const ch = line[i];
 
       if (ch === '"') {
-        // toggle aspas (considera escape de aspas duplas "")
         const nextCh = line[i + 1];
         if (inQuotes && nextCh === '"') {
-          cur += '"'; // aspas escapada
+          cur += '"';
           i++;
         } else {
           inQuotes = !inQuotes;
@@ -240,25 +211,79 @@ class ParamMapLoaderCsv {
   }
 
   _normalizePlaceholderToKey(v) {
-    // Converte "{sid1}" -> "sid1"; "{utm_source}" -> "utm_source"
-    // Se vier vazio ou sem chaves, retorna limpo.
     if (!v) return '';
     const s = String(v).trim();
     const m = /^\{([^}]+)\}$/.exec(s);
     if (m && m[1]) return m[1].trim();
-    // aceita também algo já “cru” (ex: sid1, utm_source)
     return s.replace(/^\{|\}$/g, '').trim();
   }
 
   _sanitizeVal(v) {
     if (v === null || v === undefined) return '';
     if (typeof v === 'string') return v.trim();
-    try {
-      return String(v).trim();
-    } catch {
-      return '';
-    }
+    try { return String(v).trim(); } catch { return ''; }
   }
 }
 
-module.exports = ParamMapLoaderCsv;
+/* =========================
+ * Exports CommonJS esperados
+ * =========================
+ * - loadParamMapCsv({ csvPath }) -> { byPzKey, platforms }
+ * - mapParamsForPlatform(platform, payload) -> { <key>=<value> ... }
+ * - __resetCache() -> limpa singleton (para testes)
+ * - getInstance() -> retrocompat com adapters
+ * - ParamMapLoaderCsv (classe) -> export adicional
+ */
+
+// helper interno p/ montar { byPzKey, platforms } no formato usado nos testes
+function _buildExportedMapStruct(instance) {
+  // byPzKey = índice completo (todas as linhas), porém os testes focam em "ativas"
+  const byPzKey = instance._byPzId || {};
+
+  // platforms = por plataforma (apenas ativos)
+  const platforms = {};
+  for (const col of instance._platformColumns) {
+    const platName = col.replace(/_id_parameter$/, '');
+    platforms[platName] = {};
+    for (const [pzId, row] of Object.entries(instance._byPzId)) {
+      if (row.status !== 'active') continue;
+      const key = instance._normalizePlaceholderToKey(row[col] || '');
+      if (key) platforms[platName][pzId] = key;
+    }
+  }
+
+  return { byPzKey, platforms };
+}
+
+function loadParamMapCsv({ csvPath } = {}) {
+  const inst = ParamMapLoaderCsv.getInstance(csvPath);
+  return _buildExportedMapStruct(inst);
+}
+
+function mapParamsForPlatform(platform, payload = {}) {
+  const inst = ParamMapLoaderCsv.getInstance();
+  return inst.mapTrackingToPlatform(payload, platform);
+}
+
+function __resetCache() {
+  // Zera singleton e estados internos (usado pelos testes)
+  if (ParamMapLoaderCsv._instance) {
+    try {
+      ParamMapLoaderCsv._instance._cache = null;
+      ParamMapLoaderCsv._instance._byPzId = {};
+      ParamMapLoaderCsv._instance._mtimeMs = null;
+    } catch { /* ignore */ }
+  }
+  ParamMapLoaderCsv._instance = null;
+}
+
+module.exports = {
+  // helpers p/ testes
+  loadParamMapCsv,
+  mapParamsForPlatform,
+  __resetCache,
+  // retrocompat
+  getInstance: ParamMapLoaderCsv.getInstance,
+  // export adicional da classe (útil para debug avançado)
+  ParamMapLoaderCsv
+};
