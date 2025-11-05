@@ -1,10 +1,11 @@
 /**
  * PZ Advisors - Digistore24 Adapter
- * Versão: 1.2.1 (Sanitize com trim)
+ * Versão: 1.2.2 (ParamMap diag log + sanitize trim)
  * Data: 2025-11-05
  * Desc:
- * - Ajusta sanitização para aplicar `.trim()` antes do replace, evitando
- *   converter espaços em "_" (corrige teste "sanitiza valores e ignora vazios").
+ * - Adiciona log de diagnóstico do ParamMap no buildCheckoutUrl para confirmar,
+ *   em runtime, se o CSV foi aplicado e quais chaves vieram no QS.
+ * - Mantém sanitização com trim antes do replace (v1.2.1).
  * - Mantém integração ParamMap CSV (P0.4) + fallback hardcoded e toda a
  *   compatibilidade anterior (product_id, aff/sidX/cid/campaignkey).
  */
@@ -56,7 +57,7 @@ function fallbackHardcodedMap(trackingParams = {}) {
 class Digistore24Adapter extends PlatformAdapterBase {
   constructor() {
     super();
-    this.version = '1.2.1';
+    this.version = '1.2.2';
     this.logPrefix = `[Digistore24Adapter v${this.version}]`;
 
     // Chave de Autenticação S2S (webhook)
@@ -116,13 +117,21 @@ class Digistore24Adapter extends PlatformAdapterBase {
         qs = PM.mapTrackingToPlatform(trackingParams, 'digistore24') || {};
       }
 
+      // >>> LOG DE DIAGNÓSTICO (confirma uso do CSV e chaves geradas)
+      try {
+        const qsKeys = qs && typeof qs === 'object' ? Object.keys(qs).join(',') : '';
+        console.log(`${this.logPrefix} ParamMap ativo? ${!!PM}; QS CSV keys: ${qsKeys || '(vazio)'}`);
+      } catch (_) {
+        // ignora erros de log
+      }
+
       // 4.1) Fallback se CSV não trouxe nada (mantém funcionalidade legada)
       if (!qs || Object.keys(qs).length === 0) {
         console.warn(`${this.logPrefix} ParamMap CSV ausente/vazio para Digistore24. Aplicando fallback hardcoded.`);
         qs = fallbackHardcodedMap(trackingParams);
       }
 
-      // 4.2) Saneamento final e set na URL (agora com trim antes do replace)
+      // 4.2) Saneamento final e set na URL (trim antes do replace)
       for (const [k, v] of Object.entries(qs)) {
         const safeValue = String(v).trim().substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
         if (safeValue !== '') {
