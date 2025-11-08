@@ -1,0 +1,287 @@
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.2.4 (robust-scraper) ---');
+/**
+ * PZ Advisors - Clickbank Adapter
+ * Versão: 1.2.4 (Scraper Robusto + Lazy Loading)
+ * Data: 2025-10-28
+ * Desc:
+ * - Implementa scraper robusto sugerido pelo "outro chat".
+ * - Busca URLs de checkout em <a>, <form>, <iframe>, <script> e HTML bruto (Regex).
+ * - Aceita múltiplos domínios ClickBank ('pay.clickbank.net', 'clkbank.com').
+ * - Adiciona headers 'Accept-Language' e 'Referer' à requisição axios.
+ * - Normaliza URLs, garante 'tid', deduzplica e limita a 3 resultados.
+ * - Mantém o carregamento dinâmico ('lazy loading') de 'axios'/'cheerio'
+ * controlado pela flag 'CB_SCRAPER_MODE' (padrão 'off').
+ * - Mantém o fallback para hoplink rastreado se o scrape falhar ou estiver 'off'.
+ * - Mantém patches anteriores (v1.1.17 - Secret Key JIT).
+ */
+// const axios = require('axios'); // Removido do topo
+// const cheerio = require('cheerio'); // Removido do topo
+const crypto = require('crypto');
+const PlatformAdapterBase = require('./PlatformAdapterBase');
+
+class ClickbankAdapter extends PlatformAdapterBase {
+    constructor() {
+        super();
+        this.version = '1.2.4';
+        this.logPrefix = '[ClickbankAdapter v1.2.4]';
+        this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY;
+        // Lê a feature flag; padrão 'off' se não definida
+        this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
+        console.log(`${this.logPrefix} Scraper Mode inicializado como: ${this.SCRAPER_MODE}`);
+    }
+
+    /**
+     * @override
+     * Constrói a URL final.
+     * 1. Sempre constrói o hoplink rastreado com 'tid'.
+     * 2. Se SCRAPER_MODE=on, tenta carregar dependências e fazer o scrape robusto.
+     * 3. Retorna array de links (scrape ok, max 3), hoplink (scrape off/falha) ou null (erro).
+     */
+    async buildCheckoutUrl(offerData, trackingParams) {
+        const userId = trackingParams?.user_id;
+        const baseUrl = offerData?.hoplink;
+
+        if (!baseUrl) {
+            console.warn(`${this.logPrefix} 'hoplink' ausente no offerData.`);
+            return null;
+        }
+
+        // --- ETAPA 1: Sempre construir o HopLink rastreado (caminho estável) ---
+        let trackedHoplink;
+        try {
+            if (baseUrl.includes('[TRACKING_ID]')) {
+                const safeTid = (userId || 'NO_USER_ID').substring(0, 100).replace(/[^a-zA-Z0-9_-]/g, '_');
+                trackedHoplink = baseUrl.replace('[TRACKING_ID]', encodeURIComponent(safeTid));
+            } else {
+                const urlObj = new URL(baseUrl);
+                if (userId && !urlObj.searchParams.has('tid')) {
+                    urlObj.searchParams.set('tid', userId.substring(0, 100));
+                }
+                trackedHoplink = urlObj.toString();
+            }
+        } catch (e) {
+            console.error(`${this.logPrefix} URL de hoplink inválida: ${baseUrl}`, e);
+            return null;
+        }
+
+        // --- ETAPA 2: Se o scraper estiver DESLIGADO, retorna o hoplink estável ---
+        if (this.SCRAPER_MODE !== 'on') {
+            console.log(`${this.logPrefix} SCRAPER_MODE=off -> Retornando hoplink rastreado.`);
+            return trackedHoplink;
+        }
+
+        // --- ETAPA 3: SCRAPER_MODE=on -> Tentar import dinâmico e scrape robusto ---
+        console.log(`${this.logPrefix} SCRAPER_MODE=on -> Tentando import dinâmico...`);
+        try {
+            // Carrega axios e cheerio dinamicamente AQUI
+            const [{ default: axios }, cheerio] = await Promise.all([
+                import('axios'),
+                import('cheerio')
+            ]);
+            console.log(`${this.logPrefix} Axios e Cheerio carregados dinamicamente.`);
+
+            console.log(`${this.logPrefix} Iniciando scrape do HopLink: ${trackedHoplink}`);
+            const response = await axios.get(trackedHoplink, {
+                headers: { // Headers aprimorados (v1.2.4)
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': trackedHoplink // Adiciona Referer
+                },
+                maxRedirects: 5,
+                timeout: 10000 // Timeout 10s
+            });
+
+            const html = response.data;
+            const $ = cheerio.load(html);
+            const finalUrlAfterRedirect = response.request?.res?.responseUrl || trackedHoplink; // URL base para links relativos
+
+            // --- Lógica de Scrape Robusto (v1.2.4) ---
+            const CANDIDATE_SELECTORS = [ 'a[href]', 'form[action]', 'iframe[src]' ];
+            const CB_PATTERNS = [ 'pay.clickbank.net', 'clkbank.com' ]; // Domínios alvo
+            const foundUrls = new Set(); // Usar Set para deduplicação automática
+
+            // Helper para tornar URL absoluta
+            const toAbsoluteUrl = (rawUrl) => {
+                if (!rawUrl || typeof rawUrl !== 'string') return null;
+                try {
+                    // new URL() resolve URLs relativas em relação à URL base
+                    return new URL(rawUrl, finalUrlAfterRedirect).toString();
+                } catch { return null; }
+            };
+
+            // Helper para verificar se a URL é do ClickBank
+            const isClickbankCheckoutUrl = (url) => {
+                if (!url) return false;
+                try {
+                  const hostname = new URL(url).hostname;
+                  return CB_PATTERNS.some(pattern => hostname.includes(pattern));
+                } catch { return false; }
+            };
+
+            // 1) Varredura por elementos HTML
+            for (const selector of CANDIDATE_SELECTORS) {
+                $(selector).each((_, element) => {
+                    const rawUrl = $(element).attr('href') || $(element).attr('action') || $(element).attr('src');
+                    const absoluteUrl = toAbsoluteUrl(rawUrl);
+                    if (absoluteUrl && isClickbankCheckoutUrl(absoluteUrl)) {
+                        foundUrls.add(absoluteUrl);
+                    }
+                });
+            }
+
+            // 2) Busca em <script> e no HTML bruto (regex)
+            const scriptContent = $('script').map((_, s) => $(s).html() || '').get().join('\n');
+            const combinedText = `${html}\n${scriptContent}`;
+            // Regex mais abrangente para encontrar URLs HTTP/HTTPS
+            const urlRegex = /\b(https?:\/\/[^\s"'<>]+(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*)/gi;
+            let match;
+            while ((match = urlRegex.exec(combinedText)) !== null) {
+                const absoluteUrl = toAbsoluteUrl(match[0]); // Usa match[0] que é a URL completa
+                 if (absoluteUrl && isClickbankCheckoutUrl(absoluteUrl)) {
+                    foundUrls.add(absoluteUrl);
+                }
+            }
+
+            // 3) Normaliza, garante TID e limita a 3
+            const ensureTid = (urlStr) => {
+                if (!urlStr) return null;
+                try {
+                    const urlObj = new URL(urlStr);
+                    if (userId && !urlObj.searchParams.has('tid')) {
+                        urlObj.searchParams.set('tid', userId.substring(0, 100));
+                    }
+                    return urlObj.toString();
+                } catch { return null; }
+            };
+
+            const finalCheckoutLinks = Array.from(foundUrls)
+                .map(ensureTid)    // Garante que o TID está presente
+                .filter(Boolean)   // Remove nulls (URLs inválidas)
+                .slice(0, 3);      // Limita aos 3 primeiros encontrados
+
+            // --- Fim da Lógica de Scrape Robusto ---
+
+            if (finalCheckoutLinks.length > 0) {
+                console.log(`${this.logPrefix} SCRAPE SUCESSO. ${finalCheckoutLinks.length} link(s) de checkout encontrados.`);
+                return finalCheckoutLinks; // Retorna o ARRAY
+            } else {
+                console.warn(`${this.logPrefix} SCRAPE FALHOU (nenhum link de checkout encontrado). Usando fallback (hoplink).`);
+                return trackedHoplink; // Retorna STRING (fallback)
+            }
+
+        } catch (scrapeError) {
+            console.error(`${this.logPrefix} Erro durante import dinâmico ou scrape:`, scrapeError?.message || scrapeError);
+             if (scrapeError.code === 'ECONNABORTED') {
+                 console.error(`${this.logPrefix} Scrape falhou devido a TIMEOUT.`);
+            } else if (scrapeError.response) {
+                 console.error(`${this.logPrefix} Scrape falhou com status HTTP ${scrapeError.response.status}.`);
+            } else if (scrapeError instanceof ReferenceError && scrapeError.message.includes('File is not defined')) {
+                 // Este erro não deve mais acontecer com Node 20, mas mantemos o log
+                 console.error(`${this.logPrefix} ERRO CRÍTICO: 'File is not defined' ainda ocorre! Verifique o ambiente Node.`);
+            }
+            console.warn(`${this.logPrefix} Usando fallback (HopLink rastreado) devido a erro no scrape/import.`);
+            return trackedHoplink; // Retorna STRING (fallback seguro)
+        }
+    }
+
+    /**
+     * @override
+     * Verifica e descriptografa o webhook (INS) do Clickbank.
+     */
+    async verifyWebhook(rawBodyBuffer, headers) {
+        // Verificação JIT da chave secreta (v1.1.17)
+        if (!this.WEBHOOK_SECRET_KEY) {
+            console.error(`${this.logPrefix} Webhook falhou: Variável de ambiente CLICKBANK_WEBHOOK_SECRET_KEY não configurada.`);
+            return null;
+        }
+
+        if (!rawBodyBuffer || !headers) {
+            console.warn(`${this.logPrefix} Webhook recebido sem body ou headers.`);
+            return null;
+        }
+
+        const ivHeader = headers['x-clickbank-cbsig-iv'];
+        const signatureHeader = headers['x-clickbank-signature'];
+
+        if (!ivHeader || !signatureHeader) {
+            console.warn(`${this.logPrefix} Webhook sem headers IV ou Signature.`);
+            return null;
+        }
+
+        try {
+            // 1. Validação HMAC
+            const hmac = crypto.createHmac('sha256', this.WEBHOOK_SECRET_KEY);
+            hmac.update(rawBodyBuffer);
+            const calculatedSignature = hmac.digest('hex');
+
+            const sigBuf = Buffer.from(signatureHeader, 'hex');
+            const calcSigBuf = Buffer.from(calculatedSignature, 'hex');
+
+            if (sigBuf.length !== calcSigBuf.length || !crypto.timingSafeEqual(sigBuf, calcSigBuf)) {
+                console.warn(`${this.logPrefix} Falha na validação HMAC do Webhook.`);
+                return null;
+            }
+            console.log(`${this.logPrefix} Validação HMAC do Webhook OK.`);
+
+            // 2. Descriptografia
+            const iv = Buffer.from(ivHeader, 'base64');
+            const key = crypto.createHash('sha256').update(this.WEBHOOK_SECRET_KEY).digest();
+
+            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+            let decryptedPayload = decipher.update(rawBodyBuffer, 'base64', 'utf8');
+            decryptedPayload += decipher.final('utf8');
+
+            const jsonData = JSON.parse(decryptedPayload);
+
+            // 3. Normalização
+            const normalizedData = this._normalizeWebhookPayload(jsonData);
+
+            const safeData = this.safeLog(jsonData);
+            console.log(`${this.logPrefix} Webhook descriptografado e normalizado com sucesso.`, safeData);
+
+            return normalizedData;
+
+        } catch (error) {
+            console.error(`${this.logPrefix} Erro crítico ao processar webhook Clickbank:`, error?.message || error);
+            return null;
+        }
+    }
+
+    // --- Helpers Internos ---
+
+    _extractUserIdFromTid(tid = '') {
+        return tid || null;
+    }
+
+    _normalizeWebhookPayload(payload) {
+        const { transactionType, receipt, vendorVariables, lineItems } = payload;
+        const trackingId = vendorVariables?.tid_ || null;
+
+        let unifiedStatus = 'other';
+        switch (transactionType) {
+            case 'SALE': case 'TEST_SALE': unifiedStatus = 'paid'; break;
+            case 'RFND': case 'TEST_RFND': unifiedStatus = 'refunded'; break;
+            case 'CGBK': case 'TEST_CGBK': unifiedStatus = 'chargeback'; break;
+        }
+
+        const firstItem = lineItems && lineItems.length > 0 ? lineItems[0] : {};
+
+        return {
+            platform: 'clickbank',
+            transactionId: receipt,
+            orderId: receipt,
+            trackingId: this._extractUserIdFromTid(trackingId),
+            transactionTypeRaw: transactionType,
+            status: unifiedStatus,
+            productSku: firstItem.itemNo || 'N/A',
+            amount: payload.totalOrderAmount || 0,
+            currency: payload.currency || 'USD',
+            customerEmail: payload.customer?.billing?.email || null,
+            eventTimestamp: new Date(payload.transactionTime),
+            receivedTimestamp: new Date(),
+            _rawPayload: this.safeLog(payload),
+        };
+    }
+}
+
+module.exports = ClickbankAdapter;
