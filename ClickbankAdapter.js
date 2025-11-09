@@ -1,48 +1,54 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.3-DR6e (CSV single-source + strict offerAllow override) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.4-DR6f (CSV single-source + strict offerAllow + placeholder hardening) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.3.3-DR6e
+ * Nome/Versão: ClickbankAdapter v1.3.4-DR6f
  * Data: 2025-11-09
  *
- * Alterações vs v1.3.1-DR6c / v1.3.2-DR6d
- * - Corrige a REGRESSÃO no "OfferData override": quando offer.parameterAllowlist (ou parameterMap) existe,
- *   o allowlist passa a ser ESTRITO ao definido pelo offer (∪ keys(parameterMap) ∪ sinônimos de affiliate ∪ ['tid','user_id']),
- *   sem herdar CSV/heurística (elimina inclusão indevida, ex.: utm_medium).
- * - Mantém: CSV como fonte única (quando disponível), loader flexível, FORCE_HEURISTIC, scraper opcional,
- *   HMAC hardening, guard de body vazio, extração correta de gclid_/fbclid_/tid_.
+ * Alterações vs v1.3.3-DR6e
+ * - Hardening de _appendParamsToUrl para suportar corretamente hoplinks com placeholder:
+ *   • "?tid=[TRACKING_ID]" → remove o par "tid=[TRACKING_ID]" antes de montar a URL e repõe tid via searchParams.
+ *   • "?[TRACKING_ID]"     → remove o placeholder “nu” e injeta tid via searchParams (evita "U999=" fantasma).
+ * - Mantém: Fonte Única CSV (ParamMapLoaderCsv), override estrito do offerAllow, alias do offer,
+ *   webhook HMAC+AES endurecido, extração gclid_/fbclid_/tid_, e SCRAPER opcional.
  */
 
 const crypto = require('crypto');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// Resolve diferentes "shapes" possíveis do módulo ParamMapLoaderCsv
+// Resolve o loader do CSV, aceitando várias "formas"
 function _resolveParamLoaderModule() {
   try {
     const mod = require('./ParamMapLoaderCsv');
     const cand = mod?.default || mod;
 
-    // Objeto/singleton com .load
+    // 1) Objeto com .load
     if (cand && typeof cand.load === 'function') return cand;
 
-    // Classe/fábrica que fornece instância com .load
+    // 2) Classe / construtora
     if (typeof cand === 'function') {
       try {
         const inst = new cand();
-        if (inst && typeof inst.load === 'function') return { load: (url) => inst.load(url) };
+        if (inst && typeof inst.load === 'function') {
+          return { load: (url) => inst.load(url) };
+        }
       } catch (_) {
         try {
           const inst2 = cand();
-          if (inst2 && typeof inst2.load === 'function') return { load: (url) => inst2.load(url) };
-        } catch (_) { /* ignore */ }
+          if (inst2 && typeof inst2.load === 'function') {
+            return { load: (url) => inst2.load(url) };
+          }
+        } catch (_) {}
       }
     }
 
-    // Padrão getInstance()
+    // 3) getInstance()
     if (cand && typeof cand.getInstance === 'function') {
       const inst3 = cand.getInstance();
-      if (inst3 && typeof inst3.load === 'function') return { load: (url) => inst3.load(url) };
+      if (inst3 && typeof inst3.load === 'function') {
+        return { load: (url) => inst3.load(url) };
+      }
     }
-  } catch (_) { /* ignore */ }
+  } catch (_) {}
   return null;
 }
 
@@ -53,7 +59,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.3.3-DR6e';
+    this.version = '1.3.4-DR6f';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
     this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
@@ -91,7 +97,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
     // 2) Monta QS data-driven
     const paramsData = this._buildQueryParamsDataDriven(trackingParams, rules);
 
-    // 3) Hoplink final (respeita placeholder [TRACKING_ID])
+    // 3) Hoplink final (respeita placeholder, agora endurecido)
     let trackedHoplink;
     try {
       trackedHoplink = this._appendParamsToUrl(baseUrl, paramsData);
@@ -132,12 +138,20 @@ class ClickbankAdapter extends PlatformAdapterBase {
       const CB_HOSTS = ['pay.clickbank.net', 'clkbank.com'];
       const found = new Set();
 
-      const toAbs = (u) => { try { return new URL(u, base).toString(); } catch { return null; } };
+      const toAbs = (u) => {
+        try {
+          return new URL(u, base).toString();
+        } catch {
+          return null;
+        }
+      };
       const isCb = (url) => {
         try {
           const h = new URL(url).hostname;
           return CB_HOSTS.some((p) => h.includes(p));
-        } catch { return false; }
+        } catch {
+          return false;
+        }
       };
 
       for (const sel of CANDIDATES) {
@@ -148,9 +162,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
         });
       }
 
-      const scripts = $('script').map((_, s) => $(s).html() || '').get().join('\n');
+      const scripts = $('script')
+        .map((_, s) => $(s).html() || '')
+        .get()
+        .join('\n');
       const bodyText = `${html}\n${scripts}`;
-      const urlRegex = /\bhttps?:\/\/[^\s"'<>]+?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*/gi;
+      const urlRegex =
+        /\bhttps?:\/\/[^\s"'<>]+?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*/gi;
       let m;
       while ((m = urlRegex.exec(bodyText)) !== null) {
         const abs = toAbs(m[0]);
@@ -173,23 +191,17 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
   /**
    * Lê allowlist/aliases do CSV (fonte única). Se indisponível ou FORCE_HEURISTIC=1, usa heurística.
-   * Regras de fusão:
-   *  - Sem override do offer: allowlist = CSV.allowlist (ou heurística); alias = CSV.alias ∪ heurística.
-   *  - Com override (parameterAllowlist OU parameterMap): allowlist é ESTRITO ao offer:
-   *      allowlist = offer.parameterAllowlist ∪ keys(offer.parameterMap) ∪ ['tid','user_id'] ∪ sinônimosAffiliate
-   *      alias     = { ...baseAlias, ...offer.parameterMap } // offer tem prioridade
    */
   async _loadParamRules(offerData) {
-    // overrides do offer (maior prioridade)
     const offerAllow = this._safeArray(offerData?.parameterAllowlist);
     const offerMap =
       offerData?.parameterMap && typeof offerData.parameterMap === 'object'
         ? offerData.parameterMap
         : null;
 
-    // 1) Coleta base (CSV ou heurística)
     let csvAllow = new Set();
     let csvAlias = {};
+
     if (!this.FORCE_HEURISTIC) {
       try {
         if (!this.paramLoader || typeof this.paramLoader.load !== 'function') {
@@ -223,25 +235,18 @@ class ClickbankAdapter extends PlatformAdapterBase {
     const baseAllow = csvAllow.size ? csvAllow : this._heuristicAllowlist();
     const baseAlias = Object.keys(csvAlias).length ? csvAlias : this._heuristicAliasMap();
 
-    // 2) Offer override: allowlist ESTRITO ao offer
+    // Se há override por oferta, ele é a base (restritivo); senão usa CSV/heurístico
+    const allowlistBase = offerAllow.length ? new Set(offerAllow) : baseAllow;
+
+    // Garante que chaves de alias e sinônimos de affiliate entram na allowlist final
     const affiliateSynonyms = ['affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid', 'aff'];
     const offerAliasKeys = offerMap ? Object.keys(offerMap) : [];
-    const hasOfferOverride = (offerAllow.length > 0) || (offerAliasKeys.length > 0);
+    const allowlistFinal = new Set([...allowlistBase, ...offerAliasKeys, ...affiliateSynonyms]);
 
-    if (hasOfferOverride) {
-      const allowlistFinal = new Set([
-        ...offerAllow,
-        ...offerAliasKeys,
-        'tid',
-        'user_id',
-        ...affiliateSynonyms, // só permite entrada; destino via alias abaixo
-      ]);
-      const aliasMapFinal = { ...baseAlias, ...(offerMap || {}) }; // offer vence
-      return { allowlist: allowlistFinal, aliasMap: aliasMapFinal };
-    }
+    // Alias final: base + offer (offer tem prioridade)
+    const aliasMapFinal = { ...baseAlias, ...(offerMap || {}) };
 
-    // 3) Sem override → usa base
-    return { allowlist: new Set([...baseAllow]), aliasMap: { ...baseAlias } };
+    return { allowlist: allowlistFinal, aliasMap: aliasMapFinal };
   }
 
   _heuristicAllowlist() {
@@ -287,7 +292,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
     };
   }
 
-  _safeArray(v) { return Array.isArray(v) ? v : []; }
+  _safeArray(v) {
+    return Array.isArray(v) ? v : [];
+  }
 
   _toBool(v) {
     if (typeof v === 'boolean') return v;
@@ -314,13 +321,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
     for (const [k, v] of Object.entries(trackingParams)) {
       if (k === 'user_id') continue;
-      if (!allowlist.has(k)) continue;       // valida pela chave de ENTRADA
+      if (!allowlist.has(k)) continue;
       if (this._isNullishValue(v)) continue;
-      const target = aliasMap[k] || k;       // aplica alias (offer tem prioridade)
+      const target = aliasMap[k] || k;
       out[target] = String(v);
     }
 
-    // fallback gentil para affiliate → aff
+    // normalização tardia (compatibilidade)
     if (out.affiliate && !out.aff) {
       out.aff = out.affiliate;
       delete out.affiliate;
@@ -328,25 +335,51 @@ class ClickbankAdapter extends PlatformAdapterBase {
     return out;
   }
 
+  /**
+   * Hardening para placeholders:
+   * - Remove "tid=[TRACKING_ID]" (com ? ou &) antes de montar a URL.
+   * - Remove "?[TRACKING_ID]" (placeholder nu) antes de montar a URL.
+   * - Injeta sempre 'tid' via searchParams (sem criar chave fantasma "U999=").
+   */
   _appendParamsToUrl(base, params = {}) {
-    const hasPlaceholder = base.includes('[TRACKING_ID]');
     const tid = params.tid || '';
+    let cleanBase = base;
 
-    if (hasPlaceholder) {
-      const replaced = base.replace('[TRACKING_ID]', encodeURIComponent(tid || 'NO_USER_ID'));
-      const u = new URL(replaced);
-      for (const [k, v] of Object.entries(params)) {
-        if (k === 'tid') continue;
-        if (!u.searchParams.has(k)) u.searchParams.set(k, v);
-      }
-      return u.toString();
+    if (base.includes('[TRACKING_ID]')) {
+      // Remove pares "tid=[TRACKING_ID]" precedidos por ? ou &, preservando corretamente a query
+      cleanBase = cleanBase.replace(/([?&])tid=\[TRACKING_ID\](?:&)?/i, (m, sep) => {
+        // se havia apenas "?tid=[TRACKING_ID]" no fim, substitui por ""; se havia "&", também limpa
+        return sep === '?' ? '?' : '';
+      });
+
+      // Remove placeholder nu "?[TRACKING_ID]" (no início da query)
+      cleanBase = cleanBase.replace(/\?\[TRACKING_ID\](?:&)?/i, (m) => {
+        // se só havia o placeholder, remove completamente o '?'
+        return '';
+      });
+
+      // Remove placeholder nu "&[TRACKING_ID]" se aparecer no meio (por segurança)
+      cleanBase = cleanBase.replace(/&\[TRACKING_ID\](?:&)?/i, '');
+
+      // Limpa possíveis finais inválidos '?', '&' ou '?&'
+      cleanBase = cleanBase.replace(/[?&]$/, '');
+      cleanBase = cleanBase.replace(/\?&/, '?');
     }
 
-    const url = new URL(base);
+    const u = new URL(cleanBase);
+
+    // Garante 'tid' (se ainda não presente na URL)
+    if (tid && !u.searchParams.has('tid')) {
+      u.searchParams.set('tid', tid);
+    }
+
+    // Injeta os demais parâmetros (sem duplicar 'tid')
     for (const [k, v] of Object.entries(params)) {
-      if (!url.searchParams.has(k)) url.searchParams.set(k, v);
+      if (k === 'tid') continue;
+      if (!u.searchParams.has(k)) u.searchParams.set(k, v);
     }
-    return url.toString();
+
+    return u.toString();
   }
 
   // =========================================================
@@ -409,7 +442,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
   _decodeSignature(sig) {
     const hexRe = /^[0-9a-f]+$/i;
     try {
-      // Preferimos base64 quando contém '=' ou não é hexa puro
       if (!hexRe.test(sig) || sig.includes('=')) {
         const b64 = Buffer.from(sig, 'base64');
         if (b64.length) return b64;
@@ -429,9 +461,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
     for (const sRaw of codes) {
       const s = String(sRaw || '');
       if (!out.gclid && /^gclid_/i.test(s)) {
-        out.gclid = s.replace(/^gclid_/i, ''); // remove "gclid_"
+        out.gclid = s.replace(/^gclid_/i, '');
       } else if (!out.fbclid && /^fbclid_/i.test(s)) {
-        out.fbclid = s.replace(/^fbclid_/i, ''); // remove "fbclid_"
+        out.fbclid = s.replace(/^fbclid_/i, '');
       } else if (!out.tidFromCodes && /^tid_/i.test(s)) {
         out.tidFromCodes = s.replace(/^tid_/i, '');
       }
@@ -465,13 +497,16 @@ class ClickbankAdapter extends PlatformAdapterBase {
     switch (transactionType) {
       case 'SALE':
       case 'TEST_SALE':
-        status = 'paid'; break;
+        status = 'paid';
+        break;
       case 'RFND':
       case 'TEST_RFND':
-        status = 'refunded'; break;
+        status = 'refunded';
+        break;
       case 'CGBK':
       case 'TEST_CGBK':
-        status = 'chargeback'; break;
+        status = 'chargeback';
+        break;
     }
 
     const first = Array.isArray(lineItems) && lineItems.length ? lineItems[0] : {};
