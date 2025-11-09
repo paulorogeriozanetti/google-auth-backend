@@ -1,15 +1,15 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.1-DR6c (CSV single-source + override fix) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.3-DR6e (CSV single-source + strict offerAllow override) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.3.1-DR6c
+ * Nome/Versão: ClickbankAdapter v1.3.3-DR6e
  * Data: 2025-11-09
  *
- * Alterações vs v1.3.0-DR6b
- * - Corrige fusão DATA-DRIVEN (Prioridade 4): allowlist final = CSV ∪ offer.parameterAllowlist ∪ keys(offer.parameterMap).
- * - Alias final = { ...CSV.aliasMap, ...offer.parameterMap } (offer tem prioridade). Removida normalização tardia que
- *   sobrescrevia alias; sinônimos de affiliate agora entram apenas na allowlist (não no aliasMap).
- * - Mantém: carregador CSV flexível, FORCE_HEURISTIC, scraper opcional, HMAC hardening, guard para body vazio,
- *   extração correta de gclid_/fbclid_/tid_.
+ * Alterações vs v1.3.1-DR6c / v1.3.2-DR6d
+ * - Corrige a REGRESSÃO no "OfferData override": quando offer.parameterAllowlist (ou parameterMap) existe,
+ *   o allowlist passa a ser ESTRITO ao definido pelo offer (∪ keys(parameterMap) ∪ sinônimos de affiliate ∪ ['tid','user_id']),
+ *   sem herdar CSV/heurística (elimina inclusão indevida, ex.: utm_medium).
+ * - Mantém: CSV como fonte única (quando disponível), loader flexível, FORCE_HEURISTIC, scraper opcional,
+ *   HMAC hardening, guard de body vazio, extração correta de gclid_/fbclid_/tid_.
  */
 
 const crypto = require('crypto');
@@ -22,31 +22,25 @@ function _resolveParamLoaderModule() {
     const cand = mod?.default || mod;
 
     // Objeto/singleton com .load
-    if (cand && typeof cand.load === 'function') {
-      return cand;
-    }
+    if (cand && typeof cand.load === 'function') return cand;
+
     // Classe/fábrica que fornece instância com .load
     if (typeof cand === 'function') {
       try {
         const inst = new cand();
-        if (inst && typeof inst.load === 'function') {
-          return { load: (url) => inst.load(url) };
-        }
+        if (inst && typeof inst.load === 'function') return { load: (url) => inst.load(url) };
       } catch (_) {
         try {
           const inst2 = cand();
-          if (inst2 && typeof inst2.load === 'function') {
-            return { load: (url) => inst2.load(url) };
-          }
+          if (inst2 && typeof inst2.load === 'function') return { load: (url) => inst2.load(url) };
         } catch (_) { /* ignore */ }
       }
     }
+
     // Padrão getInstance()
     if (cand && typeof cand.getInstance === 'function') {
       const inst3 = cand.getInstance();
-      if (inst3 && typeof inst3.load === 'function') {
-        return { load: (url) => inst3.load(url) };
-      }
+      if (inst3 && typeof inst3.load === 'function') return { load: (url) => inst3.load(url) };
     }
   } catch (_) { /* ignore */ }
   return null;
@@ -59,7 +53,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.3.1-DR6c';
+    this.version = '1.3.3-DR6e';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
     this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
@@ -138,9 +132,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
       const CB_HOSTS = ['pay.clickbank.net', 'clkbank.com'];
       const found = new Set();
 
-      const toAbs = (u) => {
-        try { return new URL(u, base).toString(); } catch { return null; }
-      };
+      const toAbs = (u) => { try { return new URL(u, base).toString(); } catch { return null; } };
       const isCb = (url) => {
         try {
           const h = new URL(url).hostname;
@@ -181,9 +173,11 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
   /**
    * Lê allowlist/aliases do CSV (fonte única). Se indisponível ou FORCE_HEURISTIC=1, usa heurística.
-   * Regras de fusão (consistentes com Prioridade 4):
-   *   allowlistFinal = CSV.allowlist ∪ offer.parameterAllowlist ∪ keys(offer.parameterMap) ∪ sinônimosAffiliate
-   *   aliasMapFinal  = { ...CSV.aliasMap, ...offer.parameterMap }       // offer tem prioridade
+   * Regras de fusão:
+   *  - Sem override do offer: allowlist = CSV.allowlist (ou heurística); alias = CSV.alias ∪ heurística.
+   *  - Com override (parameterAllowlist OU parameterMap): allowlist é ESTRITO ao offer:
+   *      allowlist = offer.parameterAllowlist ∪ keys(offer.parameterMap) ∪ ['tid','user_id'] ∪ sinônimosAffiliate
+   *      alias     = { ...baseAlias, ...offer.parameterMap } // offer tem prioridade
    */
   async _loadParamRules(offerData) {
     // overrides do offer (maior prioridade)
@@ -193,7 +187,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
         ? offerData.parameterMap
         : null;
 
-    // 1) Coleta CSV (ou heurística)
+    // 1) Coleta base (CSV ou heurística)
     let csvAllow = new Set();
     let csvAlias = {};
     if (!this.FORCE_HEURISTIC) {
@@ -229,21 +223,25 @@ class ClickbankAdapter extends PlatformAdapterBase {
     const baseAllow = csvAllow.size ? csvAllow : this._heuristicAllowlist();
     const baseAlias = Object.keys(csvAlias).length ? csvAlias : this._heuristicAliasMap();
 
-    // 2) Monta allowlist final (UNIÃO) + alias final (offer tem prioridade)
+    // 2) Offer override: allowlist ESTRITO ao offer
     const affiliateSynonyms = ['affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid', 'aff'];
     const offerAliasKeys = offerMap ? Object.keys(offerMap) : [];
+    const hasOfferOverride = (offerAllow.length > 0) || (offerAliasKeys.length > 0);
 
-    const allowlistFinal = new Set([
-      ...baseAllow,
-      ...offerAllow,
-      ...offerAliasKeys,
-      ...affiliateSynonyms, // apenas para permitir entrada; não mexe no destino
-    ]);
+    if (hasOfferOverride) {
+      const allowlistFinal = new Set([
+        ...offerAllow,
+        ...offerAliasKeys,
+        'tid',
+        'user_id',
+        ...affiliateSynonyms, // só permite entrada; destino via alias abaixo
+      ]);
+      const aliasMapFinal = { ...baseAlias, ...(offerMap || {}) }; // offer vence
+      return { allowlist: allowlistFinal, aliasMap: aliasMapFinal };
+    }
 
-    const aliasMapFinal = { ...baseAlias, ...(offerMap || {}) };
-    // (Sem normalização tardia que sobrescreva aliasMapFinal aqui!)
-
-    return { allowlist: allowlistFinal, aliasMap: aliasMapFinal };
+    // 3) Sem override → usa base
+    return { allowlist: new Set([...baseAllow]), aliasMap: { ...baseAlias } };
   }
 
   _heuristicAllowlist() {
@@ -316,13 +314,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
     for (const [k, v] of Object.entries(trackingParams)) {
       if (k === 'user_id') continue;
-      if (!allowlist.has(k)) continue;       // valida pela chave de entrada
+      if (!allowlist.has(k)) continue;       // valida pela chave de ENTRADA
       if (this._isNullishValue(v)) continue;
       const target = aliasMap[k] || k;       // aplica alias (offer tem prioridade)
       out[target] = String(v);
     }
 
-    // Caso ainda chegue 'affiliate' sem alias, normaliza gentilmente
+    // fallback gentil para affiliate → aff
     if (out.affiliate && !out.aff) {
       out.aff = out.affiliate;
       delete out.affiliate;
