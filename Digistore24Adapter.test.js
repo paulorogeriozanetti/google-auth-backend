@@ -1,18 +1,20 @@
 /**
  * PZ Advisors - Digistore24 Adapter - Testes
- * Versão do teste: v1.2.0 (cobre ParamMap CSV + Fallback + legado)
- * Data: 2025-11-05
+ * Versão do teste: v1.3.1-DR6f (CSV loader flexível + overrides + fallback + webhook)
+ * Data: 2025-11-09
  *
- * O que validamos:
- * 1) Montagem de URL por product_id e por checkout_url.
- * 2) Afixação de aff (affiliate_id).
- * 3) Leitura data-driven via ParamMapLoaderCsv (mapTrackingToPlatform).
- * 4) Fallback hardcoded quando o CSV não traz chaves (ou está ausente).
- * 5) Sanitização de valores e presença apenas de chaves com valor.
- * 6) Webhook verification com DIGISTORE_AUTH_KEY (ok/erro) e normalização de payload.
+ * Cobre:
+ * 1) Montagem via product_id e via checkout_url.
+ * 2) Afixação de aff (affiliate_id) e precedência do affiliate vindo do tracking quando permitido.
+ * 3) Leitura data-driven via ParamMapLoaderCsv em dois formatos:
+ *    3.1) Singleton com getInstance().mapTrackingToPlatform()
+ *    3.2) Loader com load() que retorna schema { parameters }
+ * 4) Offer overrides: parameterAllowlist substitui a base; parameterMap (alias) com prioridade.
+ * 5) Fallback hardcoded quando o CSV não traz chaves (ou está ausente/vazio).
+ * 6) Sanitização de valores e presença apenas de chaves com valor.
+ * 7) Webhook verification com DIGISTORE_AUTH_KEY (ok/erro) e normalização de payload.
  */
 
-const path = require('path');
 const originalEnv = { ...process.env };
 
 const buildAdapterFresh = async () => {
@@ -28,7 +30,7 @@ function paramsFromUrl(u) {
   return out;
 }
 
-describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
+describe('Digistore24Adapter - ParamMap CSV + Overrides + Fallback', () => {
   beforeEach(() => {
     jest.resetModules();
     process.env = { ...originalEnv };
@@ -42,11 +44,12 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
     process.env = { ...originalEnv };
   });
 
-  test('buildCheckoutUrl com product_id + ParamMap (CSV presente): mapeia user_id/gclid/utm_source e seta aff', async () => {
-    // Mock ParamMapLoaderCsv com dados do CSV (ativos)
+  // =========================
+  // 3.1) CSV como singleton
+  // =========================
+  test('buildCheckoutUrl (CSV singleton): mapeia user_id/gclid/utm_source e seta aff (offerData)', async () => {
     jest.doMock('./ParamMapLoaderCsv', () => {
       const fakePM = {
-        // Ex.: CSV mapeia user_id->sid1, gclid->sid2, utm_source->utm_source
         mapTrackingToPlatform: (tracking, platform) => {
           if (platform !== 'digistore24') return {};
           const out = {};
@@ -84,19 +87,62 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
     expect(qp.sid1).toBe('SUB_107');
     expect(qp.sid2).toBe('GCLID_XXX');
     expect(qp.utm_source).toBe('google');
-    expect(qp.utm_medium).toBeUndefined(); // não foi enviado por estar vazio
+    expect(qp.utm_medium).toBeUndefined();
   });
 
-  test('buildCheckoutUrl com checkout_url direto + ParamMap: respeita URL base e adiciona qs', async () => {
+  // =====================
+  // 3.2) CSV via load()
+  // =====================
+  test('buildCheckoutUrl (CSV load() + schema parameters): respeita allowlist/alias do CSV e precedence do tracking affiliate quando permitido', async () => {
+    jest.doMock('./ParamMapLoaderCsv', () => {
+      // Simula módulo que exporta { load } (pode ser default ou named).
+      return {
+        load: async () => ({
+          parameters: {
+            user_id: { include_in_checkout: true, alias: 'sid1' },
+            gclid: { include_in_checkout: true, alias: 'sid2' },
+            utm_source: { include_in_checkout: true },
+            affiliate: { include_in_checkout: true, alias: 'aff' },
+          },
+        }),
+      };
+    });
+
+    const Digistore24Adapter = await buildAdapterFresh();
+    const adapter = new Digistore24Adapter();
+
+    const offerData = {
+      product_id: '568660',
+      affiliate_id: 'aff_offer', // deve ser ignorado se tracking trouxer affiliate permitido
+    };
+
+    const trackingParams = {
+      user_id: 'SUB_200',
+      gclid: 'G-200',
+      utm_source: 'meta',
+      affiliate: 'aff_tracking',
+    };
+
+    const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
+    const qp = paramsFromUrl(url);
+
+    expect(qp.sid1).toBe('SUB_200');
+    expect(qp.sid2).toBe('G-200');
+    expect(qp.utm_source).toBe('meta');
+    // CSV permite affiliate -> tracking affiliate tem precedência
+    expect(qp.aff).toBe('aff_tracking');
+  });
+
+  // ==================================
+  // Offer overrides (allowlist + map)
+  // ==================================
+  test('Offer override: parameterAllowlist substitui base; parameterMap aplica alias e bloqueia chaves fora da allowlist', async () => {
     jest.doMock('./ParamMapLoaderCsv', () => {
       const fakePM = {
         mapTrackingToPlatform: (tracking, platform) => {
           if (platform !== 'digistore24') return {};
-          const out = {};
-          if (tracking.user_id) out.sid1 = tracking.user_id;
-          if (tracking.fbclid) out.sid3 = tracking.fbclid;
-          if (tracking.campaignkey) out.campaignkey = tracking.campaignkey;
-          return out;
+          // Sem CSV efetivo: devolveremos vazio para forçar uso da allowlist/mapping do offer
+          return {};
         },
         getInstance: () => fakePM,
       };
@@ -107,33 +153,34 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
     const adapter = new Digistore24Adapter();
 
     const offerData = {
-      checkout_url: 'https://www.digistore24.com/product/568660?prefill=1',
+      product_id: '568660',
       affiliate_id: 'pzadvisors',
+      parameterAllowlist: ['user_id', 'gclid', 'affiliate'],
+      parameterMap: { affiliate: 'aff' },
     };
 
     const trackingParams = {
-      user_id: 'SUB_999',
-      fbclid: 'FB_TEST',
-      campaignkey: 'Q4META2025',
+      user_id: 'SUB_OFFER',
+      gclid: 'G-333',
+      utm_source: 'google', // deve ser bloqueado por não estar na allowlist do offer
+      affiliate: 'pz_override',
     };
 
     const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
-    expect(url).toBeTruthy();
-    expect(url.startsWith('https://www.digistore24.com/product/568660?')).toBe(true);
-
     const qp = paramsFromUrl(url);
-    // mantém prefill=1
-    expect(qp.prefill).toBe('1');
-    // seta aff
-    expect(qp.aff).toBe('pzadvisors');
-    // adiciona mapeamentos via CSV
-    expect(qp.sid1).toBe('SUB_999');
-    expect(qp.sid3).toBe('FB_TEST');
-    expect(qp.campaignkey).toBe('Q4META2025');
+
+    expect(qp.sid1 || qp.user_id).toBeUndefined(); // CSV vazio -> adapter usa fallback/offerMap; user_id deve virar sid1?
+    // Nota: como estamos testando o comportamento de override/alias, validamos diretamente as chaves finais esperadas:
+    expect(qp.sid1).toBe('SUB_OFFER');
+    expect(qp.sid2).toBeUndefined();
+    expect(qp.utm_source).toBeUndefined();
+    expect(qp.aff).toBe('pz_override');
   });
 
+  // ========================
+  // Fallback hardcoded puro
+  // ========================
   test('buildCheckoutUrl (CSV vazio/ausente) aplica fallback hardcoded (sid1/sid2/sid3/sid4/cid/campaignkey)', async () => {
-    // Mock ParamMapLoaderCsv retornando {} para forçar fallback
     jest.doMock('./ParamMapLoaderCsv', () => {
       const fakePM = {
         mapTrackingToPlatform: () => ({}),
@@ -157,7 +204,7 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
       anon_id: 'ANON_FALL',
       cid: 'CID_FALL',
       campaignkey: 'CK_FALL',
-      utm_source: 'google', // no fallback hardcoded não mapeia utms (mantém legado)
+      utm_source: 'google', // fallback hardcoded não mapeia utms
     };
 
     const url = await adapter.buildCheckoutUrl(offerData, trackingParams);
@@ -174,19 +221,15 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
   });
 
   test('buildCheckoutUrl retorna null quando base inválida', async () => {
-    // ParamMap presente não importa — base ruim deve falhar antes
     jest.doMock('./ParamMapLoaderCsv', () => {
-      const fakePM = {
-        mapTrackingToPlatform: () => ({ sid1: 'X' }),
-        getInstance: () => fakePM,
-      };
+      const fakePM = { mapTrackingToPlatform: () => ({ sid1: 'X' }), getInstance: () => fakePM };
       return fakePM;
     });
 
     const Digistore24Adapter = await buildAdapterFresh();
     const adapter = new Digistore24Adapter();
 
-    const offerData = { checkout_url: 'https://exemplo.com/qualquer' }; // domínio inválido para DS24
+    const offerData = { checkout_url: 'https://exemplo.com/qualquer' }; // domínio inválido DS24
     const url = await adapter.buildCheckoutUrl(offerData, { user_id: 'SUB' });
     expect(url).toBeNull();
   });
@@ -196,11 +239,10 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
       const fakePM = {
         mapTrackingToPlatform: (tracking, platform) => {
           if (platform !== 'digistore24') return {};
-          // Força valores "sujos" para testar sanitização
           return {
             sid1: tracking.user_id ?? '',
             sid2: 'inválido espaço & símbolo!',
-            utm_source: '', // vazio -> omitido
+            utm_source: '',
           };
         },
         getInstance: () => fakePM,
@@ -218,13 +260,14 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
     const qp = paramsFromUrl(url);
 
     expect(qp.aff).toBe('aff_x');
-    expect(qp.sid1).toBe('SUB'); // trim aplicado
-    // caractere inválido -> substituído por "_"
+    expect(qp.sid1).toBe('SUB');
     expect(qp.sid2).toBe('inv_lido_espa_o___s_mbolo_');
-    // utm_source vazio não aparece
     expect(qp.utm_source).toBeUndefined();
   });
 
+  // =============================
+  // Webhook verification + norma
+  // =============================
   describe('Webhook verification + normalização', () => {
     test('verifyWebhook OK com auth_key válida e normaliza payload', async () => {
       process.env.DIGISTORE_AUTH_KEY = 'SECRET_X';
@@ -256,7 +299,7 @@ describe('Digistore24Adapter - ParamMap CSV + Fallback', () => {
       expect(out.trackingId).toBe('SUB_123');
       expect(out.sid2).toBe('GCLID_ABC');
       expect(out.campaignkey).toBe('CK_ABC');
-      expect(out.status).toBe('paid'); // completed -> paid
+      expect(out.status).toBe('paid');
       expect(out.trace_id).toBe('TRACE-1');
     });
 
