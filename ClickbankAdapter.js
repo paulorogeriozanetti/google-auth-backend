@@ -1,75 +1,65 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.0-DR6b (CSV single-source + flexible loader) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.3.1-DR6c (CSV single-source + override fix) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.3.0-DR6b
- * Data: 2025-11-08
+ * Nome/Versão: ClickbankAdapter v1.3.1-DR6c
+ * Data: 2025-11-09
  *
- * Alterações vs v1.2.9-DR6a
- * - Corrige integração com ParamMapLoaderCsv: suporta módulo exportado como objeto { load }, classe com .load(),
- *   função fábrica ou default export. Evita "ParamMapLoaderCsv.load is not a function" e garante leitura real do CSV.
- * - Mantém PRIORIDADE 4 (data-driven via CSV como Fonte Única), DI de loader, FORCE_HEURISTIC, scraper opcional,
- *   hardening de HMAC, guard de body vazio e extração correta de gclid_/fbclid_/tid_.
+ * Alterações vs v1.3.0-DR6b
+ * - Corrige fusão DATA-DRIVEN (Prioridade 4): allowlist final = CSV ∪ offer.parameterAllowlist ∪ keys(offer.parameterMap).
+ * - Alias final = { ...CSV.aliasMap, ...offer.parameterMap } (offer tem prioridade). Removida normalização tardia que
+ *   sobrescrevia alias; sinônimos de affiliate agora entram apenas na allowlist (não no aliasMap).
+ * - Mantém: carregador CSV flexível, FORCE_HEURISTIC, scraper opcional, HMAC hardening, guard para body vazio,
+ *   extração correta de gclid_/fbclid_/tid_.
  */
 
 const crypto = require('crypto');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// Tenta carregar o módulo do loader, mas a forma (shape) pode variar entre builds.
-// Este helper unifica a criação/uso do loader.
+// Resolve diferentes "shapes" possíveis do módulo ParamMapLoaderCsv
 function _resolveParamLoaderModule() {
   try {
     const mod = require('./ParamMapLoaderCsv');
     const cand = mod?.default || mod;
 
-    // Caso 1: objeto com .load (estático ou singleton)
+    // Objeto/singleton com .load
     if (cand && typeof cand.load === 'function') {
-      return cand; // usar cand.load(url)
+      return cand;
     }
-
-    // Caso 2: classe/função construtora com instância que tem .load
+    // Classe/fábrica que fornece instância com .load
     if (typeof cand === 'function') {
       try {
         const inst = new cand();
         if (inst && typeof inst.load === 'function') {
-          return {
-            // normaliza para shape { load(url) }
-            load: (url) => inst.load(url),
-          };
+          return { load: (url) => inst.load(url) };
         }
       } catch (_) {
-        // Se não aceita "new", tente como fábrica
         try {
           const inst2 = cand();
           if (inst2 && typeof inst2.load === 'function') {
             return { load: (url) => inst2.load(url) };
           }
-        } catch (_) {
-          // cai no null abaixo
-        }
+        } catch (_) { /* ignore */ }
       }
     }
-
-    // Caso 3: módulo expõe algo como { getInstance(){...} }
+    // Padrão getInstance()
     if (cand && typeof cand.getInstance === 'function') {
       const inst3 = cand.getInstance();
       if (inst3 && typeof inst3.load === 'function') {
         return { load: (url) => inst3.load(url) };
       }
     }
-  } catch (_) {
-    // ignorar, retornaremos null
-  }
+  } catch (_) { /* ignore */ }
   return null;
 }
 
 class ClickbankAdapter extends PlatformAdapterBase {
   /**
    * @param {Object} [opts]
-   * @param {{load:(url:string)=>Promise<any>}} [opts.paramLoader]  injeção para testes
+   * @param {{load:(url:string)=>Promise<any>}} [opts.paramLoader]
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.3.0-DR6b';
+    this.version = '1.3.1-DR6c';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
     this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
@@ -78,7 +68,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
       'https://pzadvisors.com/wp-content/uploads/pz_parameter_map.csv';
     this.FORCE_HEURISTIC = String(process.env.PZ_PARAMETER_FORCE_HEURISTIC || '0') === '1';
 
-    // DI tem prioridade; caso contrário, resolvemos o módulo dinamicamente e normalizamos sua interface.
     const resolved = _resolveParamLoaderModule();
     this.paramLoader =
       opts.paramLoader && typeof opts.paramLoader.load === 'function'
@@ -150,19 +139,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
       const found = new Set();
 
       const toAbs = (u) => {
-        try {
-          return new URL(u, base).toString();
-        } catch {
-          return null;
-        }
+        try { return new URL(u, base).toString(); } catch { return null; }
       };
       const isCb = (url) => {
         try {
           const h = new URL(url).hostname;
           return CB_HOSTS.some((p) => h.includes(p));
-        } catch {
-          return false;
-        }
+        } catch { return false; }
       };
 
       for (const sel of CANDIDATES) {
@@ -173,13 +156,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
         });
       }
 
-      const scripts = $('script')
-        .map((_, s) => $(s).html() || '')
-        .get()
-        .join('\n');
+      const scripts = $('script').map((_, s) => $(s).html() || '').get().join('\n');
       const bodyText = `${html}\n${scripts}`;
-      const urlRegex =
-        /\bhttps?:\/\/[^\s"'<>]+?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*/gi;
+      const urlRegex = /\bhttps?:\/\/[^\s"'<>]+?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*/gi;
       let m;
       while ((m = urlRegex.exec(bodyText)) !== null) {
         const abs = toAbs(m[0]);
@@ -202,18 +181,21 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
   /**
    * Lê allowlist/aliases do CSV (fonte única). Se indisponível ou FORCE_HEURISTIC=1, usa heurística.
+   * Regras de fusão (consistentes com Prioridade 4):
+   *   allowlistFinal = CSV.allowlist ∪ offer.parameterAllowlist ∪ keys(offer.parameterMap) ∪ sinônimosAffiliate
+   *   aliasMapFinal  = { ...CSV.aliasMap, ...offer.parameterMap }       // offer tem prioridade
    */
   async _loadParamRules(offerData) {
-    // offer overrides (maior prioridade)
+    // overrides do offer (maior prioridade)
     const offerAllow = this._safeArray(offerData?.parameterAllowlist);
     const offerMap =
       offerData?.parameterMap && typeof offerData.parameterMap === 'object'
         ? offerData.parameterMap
         : null;
 
+    // 1) Coleta CSV (ou heurística)
     let csvAllow = new Set();
     let csvAlias = {};
-
     if (!this.FORCE_HEURISTIC) {
       try {
         if (!this.paramLoader || typeof this.paramLoader.load !== 'function') {
@@ -244,18 +226,24 @@ class ClickbankAdapter extends PlatformAdapterBase {
       console.log(`${this.logPrefix} FORCE_HEURISTIC=1 -> ignorando CSV e usando heurística.`);
     }
 
-    let allowlist = csvAllow.size ? csvAllow : this._heuristicAllowlist();
-    let aliasMap = Object.keys(csvAlias).length ? csvAlias : this._heuristicAliasMap();
+    const baseAllow = csvAllow.size ? csvAllow : this._heuristicAllowlist();
+    const baseAlias = Object.keys(csvAlias).length ? csvAlias : this._heuristicAliasMap();
 
-    // offer overrides aplicam por último
-    if (offerAllow.length) allowlist = new Set(offerAllow);
-    if (offerMap) aliasMap = { ...aliasMap, ...offerMap };
+    // 2) Monta allowlist final (UNIÃO) + alias final (offer tem prioridade)
+    const affiliateSynonyms = ['affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid', 'aff'];
+    const offerAliasKeys = offerMap ? Object.keys(offerMap) : [];
 
-    // normaliza sinônimos → 'aff'
-    const affiliateKeys = ['affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid', 'aff'];
-    affiliateKeys.forEach((k) => (aliasMap[k] = 'aff'));
+    const allowlistFinal = new Set([
+      ...baseAllow,
+      ...offerAllow,
+      ...offerAliasKeys,
+      ...affiliateSynonyms, // apenas para permitir entrada; não mexe no destino
+    ]);
 
-    return { allowlist, aliasMap };
+    const aliasMapFinal = { ...baseAlias, ...(offerMap || {}) };
+    // (Sem normalização tardia que sobrescreva aliasMapFinal aqui!)
+
+    return { allowlist: allowlistFinal, aliasMap: aliasMapFinal };
   }
 
   _heuristicAllowlist() {
@@ -301,9 +289,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
     };
   }
 
-  _safeArray(v) {
-    return Array.isArray(v) ? v : [];
-  }
+  _safeArray(v) { return Array.isArray(v) ? v : []; }
 
   _toBool(v) {
     if (typeof v === 'boolean') return v;
@@ -330,13 +316,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
     for (const [k, v] of Object.entries(trackingParams)) {
       if (k === 'user_id') continue;
-      if (!allowlist.has(k)) continue;
+      if (!allowlist.has(k)) continue;       // valida pela chave de entrada
       if (this._isNullishValue(v)) continue;
-      const target = aliasMap[k] || k;
+      const target = aliasMap[k] || k;       // aplica alias (offer tem prioridade)
       out[target] = String(v);
     }
 
-    // normalização tardia
+    // Caso ainda chegue 'affiliate' sem alias, normaliza gentilmente
     if (out.affiliate && !out.aff) {
       out.aff = out.affiliate;
       delete out.affiliate;
@@ -445,9 +431,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
     for (const sRaw of codes) {
       const s = String(sRaw || '');
       if (!out.gclid && /^gclid_/i.test(s)) {
-        out.gclid = s.replace(/^gclid_/i, ''); // "gclid_" → remove prefixo
+        out.gclid = s.replace(/^gclid_/i, ''); // remove "gclid_"
       } else if (!out.fbclid && /^fbclid_/i.test(s)) {
-        out.fbclid = s.replace(/^fbclid_/i, ''); // "fbclid_" → remove prefixo
+        out.fbclid = s.replace(/^fbclid_/i, ''); // remove "fbclid_"
       } else if (!out.tidFromCodes && /^tid_/i.test(s)) {
         out.tidFromCodes = s.replace(/^tid_/i, '');
       }
@@ -481,16 +467,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
     switch (transactionType) {
       case 'SALE':
       case 'TEST_SALE':
-        status = 'paid';
-        break;
+        status = 'paid'; break;
       case 'RFND':
       case 'TEST_RFND':
-        status = 'refunded';
-        break;
+        status = 'refunded'; break;
       case 'CGBK':
       case 'TEST_CGBK':
-        status = 'chargeback';
-        break;
+        status = 'chargeback'; break;
     }
 
     const first = Array.isArray(lineItems) && lineItems.length ? lineItems[0] : {};
