@@ -1,36 +1,39 @@
 /**
- * PZ Auth+API Backend – server.js
- * Nome/Versão: v5.4.0 (Hotfix Firestore Init em base 5.0.8)
+ * PZ Auth+API Backend (v5.3.0 - Minimal Firestore Fix on top of 5.0.8)
+ * Versão: 5.3.0 cg
  * Data: 2025-11-10
  * Autor: PZ Advisors
  *
- * Objetivo desta versão:
- * - Manter 100% da lógica funcional da v5.0.8 (GOT / promoção de user_id, Checkout ClickBank, rotas e logs)
- * - Aplicar APENAS o patch de inicialização "dura" (hard init) do Firestore (padrão v5.0.7),
- *   eliminando a falha silenciosa de gravação.
- * - NENHUMA outra funcionalidade foi alterada.
+ * Objetivo: manter 100% das funcionalidades da v5.0.8 e aplicar APENAS o ajuste
+ * mínimo que restaurou as gravações no Firestore (como visto na v5.2.0),
+ * sem tocar em promoção de user_id (GOT) e nem no fluxo de checkout ClickBank.
+ *
+ * Mudança única vs 5.0.8:
+ * - Troca da inicialização do Firestore para usar `firebase-admin` direto
+ *   (admin.initializeApp + admin.firestore()), preservando o restante do código.
+ * - Mantém exatamente as mesmas rotas, logs e comportamentos da v5.0.8.
  */
 
-// 1) Imports (iguais à v5.0.8, trocando Admin SDK para versão completa)
+// 1) Imports
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
-const admin = require('firebase-admin'); // <— usar Admin completo (hard init)
+const admin = require('firebase-admin'); // <-- Alteração: usar admin direto
 const { OAuth2Client } = require('google-auth-library');
 
 // Carrega os módulos
 const marketingAutomator = require('./marketingAutomator');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// 2) Constantes e Configuração do Servidor (mantido)
-const SERVER_VERSION = '5.4.0';
+// 2) Constantes e Configuração do Servidor
+const SERVER_VERSION = '5.3.0'; // Atualizado
 const SERVER_DEPLOY_DATE = '2025-11-10';
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
 
-// 3) Configuração de CORS (mantido)
+// 3) Configuração de CORS
 const allowedOrigins = [
   'https://pzadvisors.com',
   'https://www.pzadvisors.com',
@@ -53,7 +56,7 @@ const corsOptions = {
   credentials: true,
 };
 
-// 4) Configuração de Clientes Google Auth (mantido)
+// 4) Configuração de Clientes Google Auth
 const GOOGLE_CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID_PZADVISORS,
   process.env.GOOGLE_CLIENT_ID_LANDER_B,
@@ -64,17 +67,17 @@ if (!GOOGLE_CLIENT_IDS.length) {
 }
 const googleAuthClients = GOOGLE_CLIENT_IDS.map(id => new OAuth2Client(id));
 
-// 5) Configuração de Tracking (mantido)
+// 5) Configuração de Tracking
 const TRACK_TOKEN_ENABLED = !!process.env.TRACK_TOKEN;
 const TRACK_TOKEN_DEBUG_ENABLED = !!process.env.TRACK_TOKEN_DEBUG;
 const TRACK_OPEN = process.env.TRACK_OPEN === 'true';
 
-// 6) Configuração do Firebase Admin SDK – HARD INIT (como v5.0.7)
+// 6) Configuração do Firebase Admin SDK (ajuste mínimo compatível)
+let FIRESTORE_ADMIN_READY = false; // <-- flag substitui o boolean "admin" da 5.0.8
+let db; // instancia do firestore
 let FIRESTORE_SOURCE_LOG = 'N/A';
 let FIRESTORE_PROJECT_ID = 'N/A';
 let FIRESTORE_INIT = false;
-let ADMIN_READY = false; // flag para /api/version
-let db; // referencia global ao Firestore
 
 function ensureSA() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
@@ -82,63 +85,55 @@ function ensureSA() {
       const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
       FIRESTORE_SOURCE_LOG = 'env_json';
       FIRESTORE_PROJECT_ID = sa.project_id;
-      return { projectId: sa.project_id, clientEmail: sa.client_email, privateKey: sa.private_key };
+      return sa;
     } catch (e) { console.error('[FS][ERRO] Falha ao parsear FIREBASE_SERVICE_ACCOUNT_JSON:', e?.message); }
   }
   if (process.env.GCP_PROJECT_ID && process.env.GCP_SA_EMAIL && process.env.GCP_SA_PRIVATE_KEY) {
      try {
        const sa = {
-         projectId: process.env.GCP_PROJECT_ID,
-         clientEmail: process.env.GCP_SA_EMAIL,
-         privateKey: String(process.env.GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n'),
+         project_id: process.env.GCP_PROJECT_ID,
+         client_email: process.env.GCP_SA_EMAIL,
+         private_key: process.env.GCP_SA_PRIVATE_KEY.replace(/\\n/g, '\n'),
        };
        FIRESTORE_SOURCE_LOG = 'env_split';
-       FIRESTORE_PROJECT_ID = sa.projectId;
+       FIRESTORE_PROJECT_ID = sa.project_id;
        return sa;
-     } catch (e) { console.error('[FS][ERRO] Falha ao montar SA (vars split):', e?.message); }
+     } catch (e) { console.error('[FS][ERRO] Falha ao montar SA das Vercel vars:', e?.message); }
   }
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
      FIRESTORE_SOURCE_LOG = 'gcp_auto';
      FIRESTORE_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || 'gcp_auto_project';
-     return null; // deixa Admin SDK resolver credenciais do ambiente
+     return null; // deixa o SDK localizar credenciais
   }
   console.error('[FS][FATAL] Nenhuma credencial (FIREBASE_SERVICE_ACCOUNT_JSON ou GCP_*) foi encontrada.');
-  const err = new Error('sa_not_configured');
-  err.code = 'sa_not_configured';
-  throw err;
+  throw new Error('sa_not_configured');
 }
 
 function initAdmin() {
   try {
-    const sa = ensureSA();
-    if (sa) {
-      admin.initializeApp({ credential: admin.credential.cert({
-        projectId: sa.projectId,
-        clientEmail: sa.clientEmail,
-        privateKey: sa.privateKey,
-      }) });
+    const serviceAccount = ensureSA();
+    if (serviceAccount) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     } else {
       admin.initializeApp({});
     }
+    FIRESTORE_ADMIN_READY = true;
     db = admin.firestore();
     db.settings({ ignoreUndefinedProperties: true });
-    ADMIN_READY = true;
     FIRESTORE_INIT = true;
-    console.log(`[ADMIN] Firebase SDK OK (Proj: ${FIRESTORE_PROJECT_ID}, Fonte: ${FIRESTORE_SOURCE_LOG})`);
+    console.log(`[ADMIN] Firebase SDK OK (Proj: ${FIRESTORE_PROJECT_ID} )`);
   } catch (e) {
-    ADMIN_READY = false;
+    FIRESTORE_ADMIN_READY = false;
     FIRESTORE_INIT = false;
-    db = null;
-    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message || e);
-    if (e?.code === 'sa_not_configured' && process.env.SA_OPTIONAL === 'true') {
-      console.warn('[ADMIN] SA_OPTIONAL=true. Servidor iniciando sem Firestore (gravações falharão).');
-      return; // mantém servidor UP, porém sem DB (as rotas lançarão erro ao gravar)
-    }
-    throw e; // comportamento hard: falha o boot se não for opcional
+    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message);
+    if (e.message === 'sa_not_configured') {
+       if(process.env.SA_OPTIONAL !== 'true') { throw e; }
+       console.warn('[ADMIN] SA_OPTIONAL=true. Servidor iniciando sem Firestore.');
+    } else { throw e; }
   }
 }
 
-// 7) Inicialização dos Adapters (mantido)
+// 7) Inicialização dos Adapters
 let ADAPTERS_LOADED = false;
 try {
   if (PlatformAdapterBase) {
@@ -153,13 +148,13 @@ try {
   if (marketingAutomator) console.log('[BOOT] Módulo marketingAutomator carregado com sucesso.');
 } catch (e) {}
 
-// 8) Middlewares (mantido)
+// 8) Middlewares
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 app.use(cookieParser());
 
-// Middleware de Logging e Trace ID (mantido)
+// Middleware de Logging e Trace ID
 app.use((req, res, next) => {
   const traceId = req.headers[TRACE_ID_HEADER] || crypto.randomUUID();
   req.traceId = traceId;
@@ -175,7 +170,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Middleware de Verificação de Token de API (mantido)
+// Middleware de Verificação de Token de API
 const verifyApiToken = (req, res, next) => {
   if (TRACK_OPEN) return next();
   const token = req.headers['x-api-token'] || req.query.token;
@@ -185,7 +180,7 @@ const verifyApiToken = (req, res, next) => {
   return res.status(401).json({ ok: false, error: 'unauthorized', rid: req.traceId });
 };
 
-// 9) Rotas da API (mantido – apenas dependem de "db" já inicializado)
+// 9) Rotas da API
 
 // --- Rotas Públicas (Health & Version) ---
 const HEALTHZ_TS = new Date().toISOString();
@@ -205,14 +200,14 @@ app.get('/api/version', (req, res) => {
     service: 'PZ Auth+API Backend', version: SERVER_VERSION, build_date: SERVER_DEPLOY_DATE,
     adapters_loaded: ADAPTERS_LOADED, client_ids: GOOGLE_CLIENT_IDS, origins: allowedOrigins,
     track_open: TRACK_OPEN, track_token: TRACK_TOKEN_ENABLED, debug_token: TRACK_TOKEN_DEBUG_ENABLED,
-    fs_auth: ADMIN_READY ? 'AdminSDK' : 'None', fs_init: FIRESTORE_INIT, fs_project: FIRESTORE_PROJECT_ID,
+    fs_auth: FIRESTORE_ADMIN_READY ? 'AdminSDK' : 'None', fs_init: FIRESTORE_INIT, fs_project: FIRESTORE_PROJECT_ID,
     fs_sa_source: FIRESTORE_SOURCE_LOG, facts_coll: process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts',
     tx_coll: process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions',
     facts_doc_pattern: process.env.FACTS_DOC_PATTERN || '${anon_id}_${YYYY-MM-DD}',
   });
 });
 
-// --- Rota Pública (Google Auth) --- (mantém body { credential })
+// --- Rota Pública (Google Auth) ---
 app.post('/auth/google', express.json(), async (req, res) => {
   const { credential } = req.body;
   if (!credential) {
@@ -253,7 +248,7 @@ app.post('/auth/google', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Pública (API de Marketing / Send Guide) --- (mantido)
+// --- Rota Pública (API de Marketing / Send Guide) ---
 app.post('/api/send-guide', express.json(), async (req, res) => {
   const { user_id } = req.body;
   if (!user_id) {
@@ -295,22 +290,27 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Checkout / Adapter Factory) --- (mantido)
+// --- Rota Protegida (API de Checkout / Adapter Factory) ---
 app.post('/api/checkout', express.json(), async (req, res) => {
   // Logs de Diagnóstico v5.0.8 mantidos
-  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body));
+  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body)); // Log 1
+  
   const { offerData, trackingParams } = req.body;
-  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData));
+  
+  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 2
 
   if (!offerData || !offerData.affiliate_platform) {
     res.locals.errorLog = 'platform_missing_checkout';
     return res.status(400).json({ ok: false, error: 'offerData.affiliate_platform_missing', rid: req.traceId });
   }
+  
   const platform = offerData.affiliate_platform;
 
   try {
     const adapter = PlatformAdapterBase.getInstance(platform);
-    console.log(`[SERVER CHECKOUT] Passando offerData para o adapter ${platform} (Trace: ${req.traceId}):`, JSON.stringify(offerData));
+    
+    console.log(`[SERVER CHECKOUT] Passando offerData para o adapter ${platform} (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 3
+    
     const finalCheckoutUrl = await adapter.buildCheckoutUrl(offerData, trackingParams);
 
     if (finalCheckoutUrl) {
@@ -329,7 +329,7 @@ app.post('/api/checkout', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Tracking / Eventos) --- (mantido)
+// --- Rota Protegida (API de Tracking / Eventos) ---
 app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
   const { event, payload } = req.body;
   if (!event || !payload) {
@@ -362,7 +362,7 @@ app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
   }
 });
 
-// --- Rotas Públicas (Webhooks S2S das Plataformas) --- (mantido)
+// --- Rotas Públicas (Webhooks S2S das Plataformas) ---
 app.get('/webhook/digistore24', async (req, res) => {
   const query = req.query; const headers = req.headers;
   try {
@@ -413,7 +413,7 @@ app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async 
   }
 });
 
-// 10) Start (mantido, apenas troca de flags impressas)
+// 10) Start
 try {
   initAdmin();
   app.listen(PORT, () => {
