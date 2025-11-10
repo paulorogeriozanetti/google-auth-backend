@@ -1,112 +1,79 @@
 /**
  * PZ Advisors - Digistore24 Adapter
- * Nome/Versão: Digistore24Adapter v1.3.4-DS7
- * Data: 2025-11-09
+ * Nome/Versão: Digistore24Adapter v1.3.5-DS6f
+ * Data: 2025-11-10
  *
- * Objetivo desta versão:
- * - Corrige regressão de "Offer override": quando a oferta define
- *   `parameterAllowlist` e `parameterMap`, o QS final deve ser
- *   reconstruído *estritamente* com base nesses overrides (o allowlist
- *   da oferta substitui o CSV/heurística). Alinha o fluxo com o
- *   ClickbankAdapter v1.3.3-DR6e (permitir→mapear) em vez de mapear→filtrar.
- * - Mantém compatibilidade com ParamMapLoaderCsv em diferentes formatos:
- *   `getInstance().mapTrackingToPlatform(...)`, classe com `.load()` que
- *   retorna schema `{ parameters: { key: { include_in_checkout, alias }}}`,
- *   ou objeto com `.load()`.
- * - Preserva *todas* as funcionalidades anteriores: construção via
- *   `product_id`/`checkout_url`, definição de `aff` (affiliate_id),
- *   fallback hardcoded (sid1/sid2/sid3/sid4/cid/campaignkey), sanitização
- *   e verificação de webhook via `DIGISTORE_AUTH_KEY`.
+ * Alterações vs v1.3.4-DR6e
+ * - Corrige fallback heurístico quando CSV está ausente/vazio: mapeia corretamente
+ *   user_id→sid1, gclid→sid2, fbclid→sid3, anon_id→sid4, cid/campaignkey 1:1 e
+ *   sinônimos de afiliado → aff; UTMs 1:1 (utm_source/utm_medium/...)
+ * - Mantém arquitetura data-driven: tenta ParamMap CSV (getInstance().mapTrackingToPlatform)
+ *   e também aceita loaders com .load() + schema { parameters }.
+ * - Mantém overrides da oferta: parameterAllowlist (substitui base) e parameterMap (prioridade)
+ * - Mantém precedência de afiliado do tracking sobre affiliate_id do offer
+ * - Mantém webhook S2S (auth_key) sem alterações funcionais
  */
 
 const crypto = require('crypto');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// --- Loader flexível (similar ao ClickbankAdapter) ---
-function _resolveParamLoaderModule() {
+// --- Utilidades CSV Loader ---------------------------------------------------
+function _resolveCsvModule() {
   try {
     const mod = require('./ParamMapLoaderCsv');
-    const cand = mod?.default || mod;
+    return mod?.default || mod || null;
+  } catch (_) {
+    return null;
+  }
+}
 
-    // Caso 1: singleton com mapTrackingToPlatform (API antiga usada nos testes)
-    if (cand && typeof cand.getInstance === 'function') {
-      const inst = cand.getInstance();
-      if (inst && typeof inst.mapTrackingToPlatform === 'function') {
-        return { type: 'mapper', map: (tracking, platform) => inst.mapTrackingToPlatform(tracking, platform) };
-      }
-      if (inst && typeof inst.load === 'function') {
-        return { type: 'loader', load: (url) => inst.load(url) };
-      }
-    }
-
-    // Caso 2: objeto/classe com .load() que retorna { parameters: { ... } }
-    if (cand && typeof cand.load === 'function') {
-      return { type: 'loader', load: (url) => cand.load(url) };
-    }
-
-    // Caso 3: classe/fábrica
-    if (typeof cand === 'function') {
-      try {
-        const inst = new cand();
-        if (inst && typeof inst.load === 'function') {
-          return { type: 'loader', load: (url) => inst.load(url) };
-        }
-      } catch (_) {
-        try {
-          const inst2 = cand();
-          if (inst2 && typeof inst2.load === 'function') {
-            return { type: 'loader', load: (url) => inst2.load(url) };
-          }
-        } catch (_) {}
-      }
+function _getParamMapSingleton() {
+  const M = _resolveCsvModule();
+  if (!M) return null;
+  try {
+    if (typeof M.getInstance === 'function') {
+      return M.getInstance();
     }
   } catch (_) {}
   return null;
 }
 
-// Fallback estrito às versões anteriores
-function fallbackHardcodedMap(trackingParams = {}) {
-  const map = {
-    user_id: 'sid1',
-    gclid: 'sid2',
-    fbclid: 'sid3',
-    anon_id: 'sid4',
-    cid: 'cid',
-    campaignkey: 'campaignkey',
-  };
-  const out = {};
-  for (const [pzKey, dsKey] of Object.entries(map)) {
-    const v = trackingParams[pzKey];
-    if (v !== undefined && v !== null) {
-      const trimmed = String(v).trim();
-      if (trimmed !== '') {
-        out[dsKey] = trimmed.substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
-      }
+async function _tryLoadCsvSchema() {
+  const M = _resolveCsvModule();
+  if (!M) return null;
+  try {
+    // suporte a módulo com .load(url) (assíncrono)
+    const loader = typeof M.load === 'function' ? M : (typeof M === 'function' ? new M() : null);
+    if (loader && typeof loader.load === 'function') {
+      const url = process.env.PZ_PARAMETER_MAP_URL || 'https://pzadvisors.com/wp-content/uploads/pz_parameter_map.csv';
+      const schema = await loader.load(url);
+      if (schema && typeof schema === 'object') return schema;
     }
-  }
-  return out;
+  } catch (_) {}
+  return null;
 }
 
+// --- Adapter ----------------------------------------------------------------
 class Digistore24Adapter extends PlatformAdapterBase {
-  constructor(opts = {}) {
+  constructor() {
     super();
-    this.version = '1.3.4-DS7';
+    this.version = '1.3.5-DS6f';
     this.logPrefix = `[Digistore24Adapter v${this.version}]`;
 
-    // Webhook
+    // Webhook (S2S)
     this.AUTH_KEY = process.env.DIGISTORE_AUTH_KEY;
     if (!this.AUTH_KEY) {
       console.warn(`${this.logPrefix} Variável DIGISTORE_AUTH_KEY não configurada. Webhooks S2S falharão.`);
     }
-
-    // ParamMap CSV
-    this.PARAM_MAP_URL = process.env.PZ_PARAMETER_MAP_URL || 'https://pzadvisors.com/wp-content/uploads/pz_parameter_map.csv';
-    this.paramLoader = _resolveParamLoaderModule();
   }
 
-  // ================== BUILD CHECKOUT ==================
+  // ========================= BUILD CHECKOUT (DATA-DRIVEN) ====================
+  /**
+   * Constrói a URL de checkout Digistore24 a partir de checkout_url ou product_id.
+   * Suporta: CSV ParamMap (singleton.mapTrackingToPlatform) → schema .load() → heurística
+   */
   async buildCheckoutUrl(offerData = {}, trackingParams = {}) {
-    // 1) Base URL
+    // 1) Base URL a partir de checkout_url ou product_id
     let baseUrl = offerData.checkout_url;
     const productId = offerData.product_id;
     if (!baseUrl && productId) {
@@ -116,70 +83,57 @@ class Digistore24Adapter extends PlatformAdapterBase {
 
     const isValidBase =
       typeof baseUrl === 'string' &&
-      (baseUrl.startsWith('https://www.digistore24.com/product/') || baseUrl.startsWith('https://www.digistore24.com/redir/'));
+      (baseUrl.startsWith('https://www.digistore24.com/product/') ||
+        baseUrl.startsWith('https://www.digistore24.com/redir/'));
 
     if (!isValidBase) {
       console.warn(`${this.logPrefix} checkout_url/product_id inválido ou ausente:`, baseUrl);
       return null;
     }
 
+    console.log(`${this.logPrefix} Construindo URL de checkout para base: ${String(baseUrl).split('?')[0]}...`);
+
     try {
       const urlObj = new URL(baseUrl);
 
-      // 2) aff do offer (pode ser sobrescrito depois por QS)
-      const affiliateId = offerData.affiliate_id;
-      if (affiliateId) {
-        urlObj.searchParams.set('aff', String(affiliateId).trim());
-      } else {
-        console.warn(`${this.logPrefix} affiliate_id não encontrado em offerData (param 'aff' não será setado).`);
-      }
-
-      // 3) Construção do QS base (CSV → mapper ou loader → schema) ou fallback
+      // 2) Tentar primeiro CSV ParamMap (singleton API)
       let qs = {};
-      if (this.paramLoader && this.paramLoader.type === 'mapper') {
-        // API antiga usada nos testes: getInstance().mapTrackingToPlatform
-        qs = this.paramLoader.map(trackingParams, 'digistore24') || {};
-        const qsKeys = Object.keys(qs);
-        console.log(`${this.logPrefix} ParamMap (mapper) ativo; QS CSV keys: ${qsKeys.join(',') || '(vazio)'}`);
-      } else if (this.paramLoader && this.paramLoader.type === 'loader') {
+      const PM = _getParamMapSingleton();
+      if (PM && typeof PM.mapTrackingToPlatform === 'function') {
         try {
-          const map = await this.paramLoader.load(this.PARAM_MAP_URL);
-          const { allowlist, aliasMap } = this._schemaToRules(map, 'digistore24');
+          qs = PM.mapTrackingToPlatform(trackingParams, 'digistore24') || {};
+        } catch (_) { qs = {}; }
+      }
+
+      // 3) Se CSV singleton não trouxe nada, tentar schema com .load() + rules
+      if (!qs || Object.keys(qs).length === 0) {
+        const schema = await _tryLoadCsvSchema();
+        if (schema && schema.parameters && typeof schema.parameters === 'object') {
+          const { allowlist, aliasMap } = this._rulesFromCsvSchema(schema, offerData);
           qs = this._buildQueryParamsDataDriven(trackingParams, { allowlist, aliasMap });
-          console.log(`${this.logPrefix} ParamMap (loader) ativo; QS CSV keys: ${Object.keys(qs).join(',') || '(vazio)'}`);
-        } catch (e) {
-          console.warn(`${this.logPrefix} Falha ao ler CSV; aplicando fallback.`, e?.message || e);
-          qs = fallbackHardcodedMap(trackingParams);
         }
-      } else {
-        console.warn(`${this.logPrefix} ParamMap CSV ausente; aplicando fallback hardcoded.`);
-        qs = fallbackHardcodedMap(trackingParams);
       }
 
-      // 4) Offer override estrito (parameterAllowlist + parameterMap)
-      const offerAllow = Array.isArray(offerData.parameterAllowlist) ? offerData.parameterAllowlist : [];
-      const offerMap = offerData.parameterMap && typeof offerData.parameterMap === 'object' ? offerData.parameterMap : null;
-      if (offerAllow.length > 0) {
-        const strictQs = {};
-        for (const key of offerAllow) {
-          if (Object.prototype.hasOwnProperty.call(trackingParams, key)) {
-            const v = trackingParams[key];
-            const sv = v == null ? '' : String(v).trim();
-            if (sv !== '') {
-              const target = offerMap && offerMap[key] ? offerMap[key] : key;
-              strictQs[target] = sv;
-            }
-          }
-        }
-        qs = strictQs; // substitui CSV/fallback
+      // 4) Se ainda vazio → heurística (corrigida p/ Digistore)
+      if (!qs || Object.keys(qs).length === 0) {
+        console.warn(`${this.logPrefix} ParamMap CSV ausente/vazio. Aplicando heurística Digistore.`);
+        const allowlist = this._heuristicAllowlist();
+        const aliasMap = this._heuristicAliasMap();
+        const { allowlist: finalAllow, aliasMap: finalAlias } = this._applyOfferOverrides(offerData, allowlist, aliasMap);
+        qs = this._buildQueryParamsDataDriven(trackingParams, { allowlist: finalAllow, aliasMap: finalAlias });
       }
 
-      // 5) Aplicar QS sanitizado (mantém campos preexistentes e permite override de aff via QS, se vier do CSV/override)
+      // 5) Precedência do afiliado: tracking (qs.aff) sobrescreve affiliate_id de offer
+      const trackingAff = qs.aff;
+      if (!trackingAff) {
+        const offerAff = offerData.affiliate_id;
+        if (offerAff) urlObj.searchParams.set('aff', String(offerAff).trim());
+      }
+
+      // 6) Sanitização final e set na URL
       for (const [k, v] of Object.entries(qs)) {
         const safeValue = String(v).trim().substring(0, 100).replace(/[^a-zA-Z0-9._\-]/g, '_');
-        if (safeValue !== '') {
-          urlObj.searchParams.set(k, safeValue);
-        }
+        if (safeValue !== '') urlObj.searchParams.set(k, safeValue);
       }
 
       const finalUrl = urlObj.toString();
@@ -191,33 +145,96 @@ class Digistore24Adapter extends PlatformAdapterBase {
     }
   }
 
-  // Converte schema `{ parameters: { key: { include_in_checkout, alias }}}` em regras
-  _schemaToRules(schema, platform) {
-    const allowlist = new Set();
-    const aliasMap = {};
-    if (schema && schema.parameters && typeof schema.parameters === 'object') {
-      for (const [key, rec] of Object.entries(schema.parameters)) {
-        const include = this._toBool(rec.include_in_checkout) || this._toBool(rec.include_in_checkout_default);
-        if (include) {
-          allowlist.add(key);
-          const alias = (rec.alias || '').trim();
-          if (alias) aliasMap[key] = alias;
-        }
+  // ------------------------ CSV → Regras (allowlist/alias) -------------------
+  _rulesFromCsvSchema(schema, offerData) {
+    const params = schema.parameters || {};
+    const baseAllow = new Set();
+    const baseAlias = {};
+
+    for (const [srcKey, rec] of Object.entries(params)) {
+      const include = this._toBool(rec.include_in_checkout) || this._toBool(rec.include_in_checkout_default);
+      if (include) {
+        baseAllow.add(srcKey);
+        const alias = (rec.alias || '').trim();
+        if (alias) baseAlias[srcKey] = alias;
       }
     }
+
+    return this._applyOfferOverrides(offerData, baseAllow, baseAlias);
+  }
+
+  _applyOfferOverrides(offerData, baseAllow, baseAlias) {
+    const offerAllow = Array.isArray(offerData?.parameterAllowlist) ? offerData.parameterAllowlist : [];
+    const offerMap = offerData?.parameterMap && typeof offerData.parameterMap === 'object' ? offerData.parameterMap : null;
+
+    // allowlist: se offerAllow existir, ele SUBSTITUI a base
+    const allowlist = offerAllow.length ? new Set(offerAllow) : new Set(baseAllow);
+
+    // alias: mescla com prioridade do offerMap
+    const aliasMap = { ...(baseAlias || {}), ...(offerMap || {}) };
+
+    // sinônimos de afiliado sempre presentes (fonte → 'aff')
+    ['affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid', 'aff'].forEach((k) => (aliasMap[k] = 'aff'));
+
     return { allowlist, aliasMap };
+  }
+
+  // ------------------------ Heurísticas (fallback corrigido) ------------------
+  _heuristicAllowlist() {
+    return new Set([
+      // IDs/SIDs (fontes de entrada)
+      'user_id', 'gclid', 'fbclid', 'anon_id',
+      // Afiliado (fontes)
+      'affiliate', 'affiliate_id', 'ref', 'refid', 'tag', 'aid',
+      // Campaign keys
+      'cid', 'campaignkey',
+      // UTMs (1:1)
+      'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+      // utilitários
+      'timestamp'
+    ]);
+  }
+
+  _heuristicAliasMap() {
+    return {
+      // SIDs padrão Digistore
+      user_id: 'sid1',
+      gclid: 'sid2',
+      fbclid: 'sid3',
+      anon_id: 'sid4',
+
+      // Campaign keys
+      cid: 'cid',
+      campaignkey: 'campaignkey',
+
+      // Afiliado → aff
+      affiliate: 'aff',
+      affiliate_id: 'aff',
+      ref: 'aff',
+      refid: 'aff',
+      tag: 'aff',
+      aid: 'aff',
+
+      // UTMs 1:1
+      utm_source: 'utm_source',
+      utm_medium: 'utm_medium',
+      utm_campaign: 'utm_campaign',
+      utm_term: 'utm_term',
+      utm_content: 'utm_content',
+    };
   }
 
   _buildQueryParamsDataDriven(trackingParams = {}, rules = { allowlist: new Set(), aliasMap: {} }) {
     const { allowlist, aliasMap } = rules;
     const out = {};
-    for (const [k, v] of Object.entries(trackingParams)) {
-      if (!allowlist.has(k)) continue;
-      const sv = v == null ? '' : String(v).trim();
-      if (sv === '') continue;
-      const target = aliasMap[k] || k;
-      out[target] = sv;
+
+    for (const [srcKey, rawVal] of Object.entries(trackingParams || {})) {
+      if (!allowlist.has(srcKey)) continue;
+      if (this._isNullishValue(rawVal)) continue;
+      const destKey = aliasMap[srcKey] || srcKey;
+      out[destKey] = String(rawVal);
     }
+
     return out;
   }
 
@@ -228,7 +245,13 @@ class Digistore24Adapter extends PlatformAdapterBase {
     return false;
   }
 
-  // ================== WEBHOOK (S2S) ==================
+  _isNullishValue(val) {
+    if (val == null) return true;
+    const s = String(val).trim().toLowerCase();
+    return s === '' || s === 'null' || s === 'undefined' || s === 'none' || s === 'na' || s === 'n/a';
+  }
+
+  // ============================= WEBHOOK (S2S) ===============================
   async verifyWebhook(queryPayload, headers, traceId = 'N/A') {
     if (!this.AUTH_KEY) {
       console.error(`${this.logPrefix} Webhook falhou: DIGISTORE_AUTH_KEY não configurada. [Trace: ${traceId}]`);
@@ -289,7 +312,7 @@ class Digistore24Adapter extends PlatformAdapterBase {
       platform: 'digistore24',
       transactionId: payload.order_id,
       orderId: payload.order_id,
-      trackingId: payload.sid1 || null, // nosso user_id
+      trackingId: payload.sid1 || null,
       sid2: payload.sid2 || null,
       sid3: payload.sid3 || null,
       sid4: payload.sid4 || null,
