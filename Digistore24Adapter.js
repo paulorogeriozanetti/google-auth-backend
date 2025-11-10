@@ -1,14 +1,17 @@
 /**
  * PZ Advisors - Digistore24 Adapter
- * Nome/Versão: Digistore24Adapter v1.4.0-DS7
+ * Nome/Versão: Digistore24Adapter v1.4.2-DS7b
  * Data: 2025-11-10
  *
- * Alterações vs v1.3.x
- * - Unificação DR6e: remove API legada (mapTrackingToPlatform) e adota somente CSV schema via .load().
- * - Offer allowlist estrita: se a oferta define parameterAllowlist, ela substitui a base; não injeta sinônimos de affiliate.
- * - Fallback heurístico resiliente (data-driven): inclui UTMs e mapeamentos Digistore (sid1..sid4, aff, cid, campaignkey).
- * - Precedência de affiliate clara: tracking só pode sobrescrever aff se a allowlist permitir "affiliate"; caso contrário usa affiliate_id do offer.
- * - Sanitização consistente de valores ao escrever no URL (trim, length cap, caracteres seguros).
+ * Alterações vs v1.4.1-DS7a
+ * - Precedência de affiliate (e demais parâmetros do QS): o QS calculado
+ *   (data-driven via allowlist/alias do CSV ou fallback) AGORA SOBRESCREVE os
+ *   defaults definidos pela oferta (ex.: affiliate_id). Isso garante que,
+ *   quando o CSV permitir "affiliate" (mapeado para "aff"), o valor vindo do
+ *   tracking tenha prioridade, conforme a diretriz data-driven.
+ * - Mantidos: unificação DR6e somente com CSV schema via .load(); offer
+ *   allowlist estrita; fallback heurístico resiliente com UTMs + sid1..sid4;
+ *   sanitização consistente; webhook S2S com auth_key e normalização.
  */
 
 const crypto = require('crypto');
@@ -50,7 +53,7 @@ function _resolveParamLoaderModule() {
 class Digistore24Adapter extends PlatformAdapterBase {
   constructor(opts = {}) {
     super();
-    this.version = '1.4.0-DS7';
+    this.version = '1.4.2-DS7b';
     this.logPrefix = `[Digistore24Adapter v${this.version}]`;
 
     this.PARAM_MAP_URL = process.env.PZ_PARAMETER_MAP_URL || 'https://pzadvisors.com/wp-content/uploads/pz_parameter_map.csv';
@@ -99,17 +102,16 @@ class Digistore24Adapter extends PlatformAdapterBase {
     try {
       const urlObj = new URL(baseUrl);
 
-      // aff: tracking só entra se permitido e mapeado. Caso contrário, usa affiliate_id do offer.
-      if (!urlObj.searchParams.has('aff')) {
-        if (offerData.affiliate_id) {
-          urlObj.searchParams.set('aff', this._sanitize(String(offerData.affiliate_id)));
-        }
+      // aff default da oferta (será sobrescrito pelo QS se permitido pelo CSV/allowlist)
+      if (offerData.affiliate_id && !urlObj.searchParams.has('aff')) {
+        urlObj.searchParams.set('aff', this._sanitize(String(offerData.affiliate_id)));
       }
 
-      // aplica QS calculado
+      // aplica QS calculado — QS tem precedência sobre defaults da oferta
       for (const [k, v] of Object.entries(qs)) {
         const safe = this._sanitize(String(v));
-        if (safe !== '' && !urlObj.searchParams.has(k)) urlObj.searchParams.set(k, safe);
+        if (safe === '') continue;
+        urlObj.searchParams.set(k, safe); // sobrescreve, inclusive aff
       }
 
       const finalUrl = urlObj.toString();
