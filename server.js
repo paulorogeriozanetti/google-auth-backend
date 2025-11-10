@@ -1,557 +1,429 @@
 /**
- * PZ Advisors – Auth+API Backend (Express)
- * Nome/Versão: server.js v5.0.9 (Rollback Firestore Write Logic)
- * Data: 2025-11-10
- *
- * Objetivo desta versão:
- * 1) Restaurar a lógica de gravação no Firestore exatamente no espírito das versões estáveis
- *    v5.0.5 / v5.0.7: NUNCA silenciar gravações; se Firestore não estiver inicializado,
- *    lançar erro (DB_NOT_INITIALIZED) e retornar 503 nas rotas que gravam/lêem.
- * 2) NÃO perder nenhuma funcionalidade existente.
- * 3) Manter logs de diagnóstico introduzidos nas versões mais recentes.
- *
- * Principais mudanças vs 5.0.8:
- * - Reintroduz padrão getDB(): tenta inicializar Admin SDK sob demanda e lança erro
- *   'DB_NOT_INITIALIZED' quando indisponível (como v5.0.5/5.0.7).
- * - Remove qualquer "skip" silencioso de gravações; as rotas passam a tratar o erro e
- *   respondem 503 quando Firestore não está pronto.
- * - Mantém todas as rotas e integrações (OAuth, Checkout, Webhooks, ConvertKit etc.).
+ * PZ Auth+API Backend (v5.0.8 - Diag Checkout)
+ * Versão: 5.0.8
+ * Data: 2025-10-28
+ * Desc: Mantém logs de diagnóstico na rota '/api/checkout'
+ * introduzidos na v5.0.8 para rastrear 'offerData'.
+ * - Nenhuma alteração funcional desde v5.0.7.
  */
 
-'use strict';
-
-// ─────────────────────────────────────────────────────────────
-// 0) Imports básicos
-// ─────────────────────────────────────────────────────────────
+// 1) Imports
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 const { OAuth2Client } = require('google-auth-library');
-const admin = require('firebase-admin');
 
-// Adapters
-const PlatformAdapterBase = require('./adapters/PlatformAdapterBase');
-const marketingAutomator = require('./marketing/convertkitAutomator');
+// Carrega os módulos
+const marketingAutomator = require('./marketingAutomator');
+const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// ─────────────────────────────────────────────────────────────
-// 0.1) Metadados de build
-// ─────────────────────────────────────────────────────────────
-const SERVER_VERSION = process.env.PZ_SERVER_VERSION || '5.0.9';
-const SERVER_DEPLOY_DATE = process.env.PZ_SERVER_DEPLOY_DATE || '2025-11-10';
-const PORT = Number(process.env.PORT || 8080);
+// 2) Constantes e Configuração do Servidor
+const SERVER_VERSION = '5.0.8'; // Atualizado
+const SERVER_DEPLOY_DATE = '2025-10-28';
+const PORT = process.env.PORT || 8080;
+const TRACE_ID_HEADER = 'x-request-trace-id';
+const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
 
-// ─────────────────────────────────────────────────────────────
-// 1) App e CORS
-// ─────────────────────────────────────────────────────────────
-const app = express();
-const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  try {
-    const { hostname, protocol } = new URL(origin.trim());
-    if (protocol === 'http:' && (hostname === 'localhost' || hostname === '127.0.0.1')) return true;
-    if (protocol === 'https:' && (hostname === 'pzadvisors.com' || hostname === 'www.pzadvisors.com' || hostname.endsWith('.pzadvisors.com'))) return true;
-    return allowedOrigins.includes(origin.trim());
-  } catch {
-    return false;
-  }
+// 3) Configuração de CORS
+const allowedOrigins = [
+  'https://pzadvisors.com',
+  'https://www.pzadvisors.com',
+  'https://auth.pzadvisors.com',
+  'https://api.pzadvisors.com',
+];
+if (process.env.NODE_ENV !== 'production') {
+  allowedOrigins.push('http://localhost:8080');
+  allowedOrigins.push('http://127.0.0.1:8080');
+  allowedOrigins.push('http://localhost:3000');
 }
-
-app.use(cors({
-  origin(origin, cb) {
-    const ok = isAllowedOrigin(origin);
-    if (!ok && origin) try { console.warn(JSON.stringify({ tag: 'cors_denied', origin })); } catch {}
-    cb(null, ok);
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: Origem não permitida: ${origin}`));
+    }
   },
-  methods: ['GET','POST','OPTIONS','HEAD'],
-  allowedHeaders: [
-    'Content-Type','Authorization','X-PZ-Version','x-pz-version','X-Trace-Id','x-trace-id',
-    'X-Api-Token','x-api-token','X-Debug-Token','x-debug-token','X-Debug-Verbose','x-debug-verbose'
-  ],
-  optionsSuccessStatus: 204
-}));
+  credentials: true,
+};
 
-// Trace + headers padrão
-app.use((req, res, next) => {
-  const rid = req.headers['x-trace-id'] || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-  req.traceId = rid;
-  res.setHeader('X-Trace-Id', rid);
-  res.setHeader('X-PZ-Version', `PZ Auth+API Backend v${SERVER_VERSION} (${SERVER_DEPLOY_DATE})`);
-  res.setHeader('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
-  next();
-});
+// 4) Configuração de Clientes Google Auth
+const GOOGLE_CLIENT_IDS = [
+  process.env.GOOGLE_CLIENT_ID_PZADVISORS,
+  process.env.GOOGLE_CLIENT_ID_LANDER_B,
+].filter(Boolean);
 
-// Access log resumido (evita webhook body pesado)
-app.use((req, res, next) => {
-  const t0 = Date.now();
-  res.on('finish', () => {
-    try {
-      if (req.path.startsWith('/webhook/')) return;
-      console.log(JSON.stringify({ rid: req.traceId, method: req.method, path: req.path, status: res.statusCode, ms: Date.now() - t0, origin: req.headers.origin || null }));
-    } catch {}
-  });
-  next();
-});
-
-// ─────────────────────────────────────────────────────────────
-// 2) Firebase Admin SDK – rollback de lógica (v5.0.5/5.0.7)
-// ─────────────────────────────────────────────────────────────
-let SA_SOURCE = 'nenhuma';
-let SA_JSON = null;
-const SA_RAW_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (SA_RAW_JSON) {
-  try { SA_JSON = JSON.parse(SA_RAW_JSON); SA_SOURCE = 'env_json'; console.log('[BOOT] SA carregado de JSON.'); }
-  catch (e) { console.error('[BOOT][ERRO] SA JSON inválido:', e?.message || e); }
+if (!GOOGLE_CLIENT_IDS.length) {
+  console.warn('[AUTH] Aviso: Nenhum GOOGLE_CLIENT_ID_* configurado.');
 }
-let GCP_PROJECT_ID = '', GCP_SA_EMAIL = '', GCP_SA_PRIVATE_KEY = '';
-if (!SA_JSON) {
-  GCP_PROJECT_ID = process.env.GCP_PROJECT_ID || '';
-  GCP_SA_EMAIL = process.env.GCP_SA_EMAIL || '';
-  GCP_SA_PRIVATE_KEY = process.env.GCP_SA_PRIVATE_KEY || '';
-  if (GCP_PROJECT_ID && GCP_SA_EMAIL && GCP_SA_PRIVATE_KEY) {
-    SA_SOURCE = 'env_split';
-    if (GCP_SA_PRIVATE_KEY) GCP_SA_PRIVATE_KEY = String(GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n');
-    console.log('[BOOT] SA carregado de split env.');
-  } else {
-    console.warn('[BOOT][AVISO] Nenhuma SA encontrada.');
-  }
-} else {
-  GCP_PROJECT_ID = SA_JSON.project_id || '';
-  GCP_SA_EMAIL = SA_JSON.client_email || '';
-  GCP_SA_PRIVATE_KEY = SA_JSON.private_key || '';
-}
+const googleAuthClients = GOOGLE_CLIENT_IDS.map(id => new OAuth2Client(id));
+
+// 5) Configuração de Tracking
+const TRACK_TOKEN_ENABLED = !!process.env.TRACK_TOKEN;
+const TRACK_TOKEN_DEBUG_ENABLED = !!process.env.TRACK_TOKEN_DEBUG;
+const TRACK_OPEN = process.env.TRACK_OPEN === 'true';
+
+// 6) Configuração do Firebase Admin SDK
+let admin;
+let db;
+let FIRESTORE_SOURCE_LOG = 'N/A';
+let FIRESTORE_PROJECT_ID = 'N/A';
+let FIRESTORE_INIT = false;
 
 function ensureSA() {
-  const hasKey = !!GCP_SA_PRIVATE_KEY && GCP_SA_PRIVATE_KEY.includes('BEGIN PRIVATE KEY');
-  const miss = { project: !!GCP_PROJECT_ID, email: !!GCP_SA_EMAIL, key: hasKey };
-  if (!miss.project || !miss.email || !miss.key) {
-    const msg = `[FS][ERRO] SA incompleta: ${JSON.stringify(miss)} (Fonte: ${SA_SOURCE})`;
-    console.error(msg);
-    const err = new Error('sa_not_configured');
-    err.code = 'sa_not_configured';
-    err.meta = { miss, source: SA_SOURCE };
-    throw err;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      FIRESTORE_SOURCE_LOG = 'env_json';
+      FIRESTORE_PROJECT_ID = sa.project_id;
+      return sa;
+    } catch (e) { console.error('[FS][ERRO] Falha ao parsear FIREBASE_SERVICE_ACCOUNT_JSON:', e?.message); }
   }
-  return { projectId: GCP_PROJECT_ID, clientEmail: GCP_SA_EMAIL, privateKey: GCP_SA_PRIVATE_KEY };
+  if (process.env.GCP_PROJECT_ID && process.env.GCP_SA_EMAIL && process.env.GCP_SA_PRIVATE_KEY) {
+     try {
+       const sa = {
+         project_id: process.env.GCP_PROJECT_ID,
+         client_email: process.env.GCP_SA_EMAIL,
+         private_key: process.env.GCP_SA_PRIVATE_KEY.replace(/\\n/g, '\n'),
+       };
+       FIRESTORE_SOURCE_LOG = 'env_split';
+       FIRESTORE_PROJECT_ID = sa.project_id;
+       return sa;
+     } catch (e) { console.error('[FS][ERRO] Falha ao montar SA das Vercel vars:', e?.message); }
+  }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+     FIRESTORE_SOURCE_LOG = 'gcp_auto';
+     FIRESTORE_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || 'gcp_auto_project';
+     return null;
+  }
+  console.error('[FS][FATAL] Nenhuma credencial (FIREBASE_SERVICE_ACCOUNT_JSON ou GCP_*) foi encontrada.');
+  throw new Error('sa_not_configured');
 }
 
-let _adminInited = false;
-let _db = null;
 function initAdmin() {
-  if (_adminInited) return;
   try {
-    const credentials = ensureSA();
-    admin.initializeApp({ credential: admin.credential.cert(credentials), projectId: credentials.projectId });
-    _adminInited = true;
-    _db = admin.firestore();
-    console.log('[ADMIN] Firebase SDK OK (Proj:', credentials.projectId, ')');
-  } catch (error) {
-    // Comportamento de v5.0.5/5.0.7: NÃO mascara indisponibilidade; deixa _adminInited=false
-    console.error('[ADMIN][ERRO] Init Firebase:', error?.message || error);
-  }
-}
-
-function getDB() {
-  if (!_adminInited) {
-    initAdmin();
-    if (!_adminInited) {
-      const err = new Error('DB não inicializado.');
-      err.code = 'DB_NOT_INITIALIZED';
-      throw err;
-    }
-  }
-  return _db;
-}
-
-const FieldValue = admin.firestore.FieldValue;
-
-// ─────────────────────────────────────────────────────────────
-// 2.1) Webhooks (ANTES dos parsers globais pesados)
-// ─────────────────────────────────────────────────────────────
-app.get('/webhook/digistore24', async (req, res) => {
-  const logPrefix = `[WEBHOOK /dg24](rid:${req.traceId})`;
-  try {
-    console.log(`${logPrefix} Recebido.`);
-    const adapter = PlatformAdapterBase.getInstance('digistore24');
-    const normalizedData = await adapter.verifyWebhook(req.query, req.headers, req.traceId);
-    if (!normalizedData) {
-      console.warn(`${logPrefix} Verificação falhou.`);
-      return res.status(400).send('Webhook verification failed.');
-    }
-    // Persistência – NUNCA silenciar: usa getDB()/503 em caso de indisponibilidade
-    try {
-      const db = getDB();
-      const docId = `ds24_${normalizedData.transactionId || normalizedData.orderId}`;
-      await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
-        .doc(docId).set(normalizedData, { merge: true });
-    } catch (e) {
-      if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).send('Firestore unavailable.');
-      throw e;
-    }
-    console.log(`${logPrefix} OK. TxID:${normalizedData.transactionId}`);
-    return res.status(200).send('OK');
-  } catch (error) {
-    console.error(`${logPrefix} Erro:`, error.message || error);
-    return res.status(500).send('Internal Server Error.');
-  }
-});
-
-app.post('/webhook/clickbank', express.raw({ type: '*/*' }), async (req, res) => {
-  const logPrefix = `[WEBHOOK /cb](rid:${req.traceId})`;
-  try {
-    console.log(`${logPrefix} Recebido...`);
-    if (!req.body || !(req.body instanceof Buffer) || req.body.length === 0) {
-      console.warn(`${logPrefix} Erro: req.body Buffer inválido.`);
-      return res.status(400).send('Invalid request body.');
-    }
-    const adapter = PlatformAdapterBase.getInstance('clickbank');
-    const normalizedData = await adapter.verifyWebhook(req.body, req.headers, req.traceId);
-    if (!normalizedData) {
-      console.warn(`${logPrefix} Verificação falhou.`);
-      return res.status(400).send('Webhook verification failed.');
-    }
-    try {
-      const db = getDB();
-      const docId = `cb_${normalizedData.transactionId || normalizedData.orderId}`;
-      await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
-        .doc(docId).set(normalizedData, { merge: true });
-    } catch (e) {
-      if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).send('Firestore unavailable.');
-      throw e;
-    }
-    console.log(`${logPrefix} OK. TxID:${normalizedData.transactionId}`);
-    return res.status(200).send('OK');
-  } catch (error) {
-    console.error(`${logPrefix} Erro:`, error.message || error);
-    return res.status(500).send('Internal Server Error.');
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// 2.2) Parsers globais (após webhooks)
-// ─────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '2mb', type: ['application/json','application/*+json'] }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-app.use((req, res, next) => {
-  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS' || (req.body && typeof req.body === 'object')) return next();
-  let data = '';
-  req.on('data', c => { data += c; if (data.length > 2 * 1024 * 1024) req.destroy(); });
-  req.on('end', () => {
-    if (!req.body || typeof req.body !== 'object') {
-      if (data && /^[\s{\[]/.test(data)) try { req.body = JSON.parse(data); } catch {}
-    }
-    next();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// 3) Utils de Daily Facts (v5.0.5)
-// ─────────────────────────────────────────────────────────────
-function zeroPad(n, w = 2) { return String(n).padStart(w, '0'); }
-function deriveDayParts(tsISO, tzOffsetMin) { let d=tsISO?new Date(tsISO):new Date(); const tz=Number.isFinite(+tzOffsetMin)?+tzOffsetMin:0; if(tz!==0) d=new Date(d.getTime()+tz*60*1000); return { y:d.getUTCFullYear(), m:zeroPad(d.getUTCMonth()+1), d:zeroPad(d.getUTCDate()) }; }
-function deriveDayLabel(tsISO, tzOffsetMin) { const p=deriveDayParts(tsISO,tzOffsetMin); return `${p.y}-${p.m}-${p.d}`; }
-function parseClientTimestamp(val) { try{ if(!val) return null; const d=new Date(val); if(isNaN(d.getTime())) return null; return admin.firestore.Timestamp.fromDate(d); } catch { return null; } }
-function toPlainJSON(obj) { try { return JSON.parse(JSON.stringify(obj || null)); } catch { return null; } }
-
-async function upsertDailyFact({ db = null, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
-  if (!db) try { db = getDB(); } catch (dbError) { console.error(`[upsertDailyFact][ERRO] DB:`, dbError.message || dbError); throw dbError; }
-  const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
-  const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
-  const day = deriveDayLabel(tsISO, tz);
-  const docId = `${safeAnon}_${day}`;
-  const docRef = db.collection('daily_facts').doc(docId);
-  const event_id = `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
-  const newEvent = toPlainJSON({ event, event_id, ts_server: FieldValue.serverTimestamp(), ts_client: parseClientTimestamp(tsISO), tz_offset: Number.isFinite(tz) ? tz : null, page, session_id, payload });
-  const updatePayload = {
-    updated_at: FieldValue.serverTimestamp(),
-    events: FieldValue.arrayUnion(newEvent),
-    [`counters.${event}`]: FieldValue.increment(1),
-    ...(user_id ? { user_id, person_id: user_id } : {})
-  };
-  try {
-    await docRef.update(updatePayload);
-  } catch (error) {
-    const notFound = error?.code === 5 || error?.code === 'not-found' || /NOT_FOUND/i.test(error?.message || '');
-    if (notFound) {
-      const seedPayload = {
-        kind: 'user', date: day, entity_id: safeAnon, anon_id: safeAnon,
-        person_id: (user_id && typeof user_id === 'string') ? user_id : safeAnon,
-        ...(user_id ? { user_id } : {}),
-        ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
-        events: [newEvent], counters: { [event]: 1 },
-        created_at: FieldValue.serverTimestamp(), updated_at: FieldValue.serverTimestamp()
-      };
-      await docRef.set(seedPayload);
-    } else {
-      console.error(JSON.stringify({ tag: 'upsert_daily_fact_failed', docId, error: error.message || String(error), code: error.code }));
-      throw error;
-    }
-  }
-  return { ok: true, id: docId };
-}
-
-async function logAffiliateTransaction(normalizedData) {
-  if (!normalizedData?.platform || !normalizedData?.transactionId) {
-    console.warn('[logAffiliateTransaction] Skip: Dados inválidos.');
-    return;
-  }
-  let db;
-  try { db = getDB(); } catch (dbError) { console.error(`[logAffiliateTransaction][ERRO] DB:`, dbError.message || dbError); return; }
-  try {
-    const platform = normalizedData.platform;
-    const txId = normalizedData.transactionId;
-    const safeTxId = String(txId).replace(/[^a-zA-Z0-9_-]/g, '_');
-    const docId = `${platform}_${safeTxId}`;
-    const docRef = db.collection('affiliate_transactions').doc(docId);
-    const docSnap = await docRef.get();
-    const updateData = { ...normalizedData, _log_last_updated_at: FieldValue.serverTimestamp(), _log_doc_id: docId };
-    if (!docSnap.exists) {
-      await docRef.set({ ...updateData, _log_first_seen_at: FieldValue.serverTimestamp() });
-      console.log(`[logAffiliateTransaction] Logado (Novo): ${docId}`);
-    } else {
-      await docRef.update(updateData);
-      console.log(`[logAffiliateTransaction] Logado (Update): ${docId}`);
-    }
-  } catch (error) {
-    console.error(JSON.stringify({ tag: 'log_affiliate_transaction_failed', error: error.message || String(error), platform: normalizedData.platform, txId: normalizedData.transactionId }));
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// 4) Rotas básicas / health / versão
-// ─────────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.status(200).send('🚀 PZ Auth+API Backend ativo.'));
-app.get('/healthz', (_req, res) => res.status(200).json({ ok: true, uptime: process.uptime(), ts: new Date().toISOString() }));
-app.head('/healthz', (_req, res) => res.sendStatus(200));
-app.get('/api/healthz', (_req, res) => res.status(200).json({ ok: true, uptime: process.uptime(), ts: new Date().toISOString() }));
-app.head('/api/healthz', (_req, res) => res.sendStatus(200));
-
-app.get('/api/version', (_req, res) => {
-  res.status(200).json({
-    service: 'PZ Auth+API Backend',
-    version: SERVER_VERSION,
-    build_date: SERVER_DEPLOY_DATE,
-    adapters_loaded: typeof PlatformAdapterBase?.getInstance === 'function',
-    origins: allowedOrigins,
-    fs_auth: 'AdminSDK',
-    fs_init: _adminInited,
-    fs_project: GCP_PROJECT_ID || '(N/A)',
-    fs_sa_source: SA_SOURCE,
-    facts_coll: 'daily_facts',
-    tx_coll: 'affiliate_transactions'
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// 5) OAuth Google One Tap (mantendo comportamento)
-// ─────────────────────────────────────────────────────────────
-const GOOGLE_CLIENT_IDS = (process.env.GOOGLE_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const oauthClient = new OAuth2Client(GOOGLE_CLIENT_IDS[0] || 'YOUR_DEFAULT_CLIENT_ID');
-
-app.options('/auth/google', (_req, res) => res.sendStatus(204));
-app.options('/api/auth/google', (_req, res) => res.sendStatus(204));
-
-async function handleAuthGoogle(req, res) {
-  try {
-    const ct = (req.headers['content-type'] || '').toLowerCase();
-    const body = req.body || {};
-    const credential = (typeof body.credential === 'string' && body.credential) || (typeof body.id_token === 'string' && body.id_token) || null;
-    const context = body.context || {};
-
-    console.log(JSON.stringify({ route: '/auth/google', rid: req.traceId, ct, has_cred: !!credential }));
-    if (!credential) return res.status(400).json({ error: 'missing_credential' });
-
-    const csrfCookie = req.cookies?.g_csrf_token, csrfBody = body?.g_csrf_token;
-    if (csrfCookie && csrfBody && csrfCookie !== csrfBody) {
-      console.warn(`[AUTH] CSRF Mismatch: Cookie:"${csrfCookie}" vs Body:"${csrfBody}"`);
-      return res.status(400).json({ error: 'csrf_mismatch' });
-    }
-
-    res.set({ 'Cache-Control': 'no-store,no-cache,must-revalidate,private', Pragma: 'no-cache', Expires: '0' });
-
-    const ticket = await oauthClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_IDS });
-    const payload = ticket.getPayload();
-    if (!payload) return res.status(401).json({ error: 'invalid_token' });
-
-    const { sub, email, name, picture, email_verified } = payload;
-    const user_id = String(sub);
-
-    // Persistência de usuário + evento (padrão v5.0.5/5.0.7)
-    try {
-      const db = getDB();
-      const docRef = db.collection('users').doc(user_id);
-      await docRef.set({ user_id, sub, email: email || null, name: name || null, picture: picture || null, email_verified: !!email_verified }, { merge: true });
-      await docRef.set({ last_seen: FieldValue.serverTimestamp(), updated_at: FieldValue.serverTimestamp() }, { merge: true });
-    } catch (e) {
-      console.error(JSON.stringify({ route: '/auth/google', rid: req.traceId, warn: 'users_upsert_fail', error: e.message || String(e) }));
-      if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).json({ error: e.code });
-    }
-
-    try {
-      const db = getDB();
-      const anon_id = context.anon_id || body.anon_id || 'anon_unknown';
-      await upsertDailyFact({ db, anon_id, user_id, tz_offset: context.tz_offset, event: 'auth_google_success', page: context.page || '/onetap', session_id: context.session_id, payload: { email: email || null, name: name || null, pic: picture || null, verified: !!email_verified }, tsISO: new Date().toISOString() });
-    } catch (e) {
-      console.error(JSON.stringify({ route: '/auth/google', rid: req.traceId, warn: 'daily_facts_log_fail', error: e.message || String(e) }));
-      if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).json({ error: e.code });
-    }
-
-    return res.status(200).json({ user_id, email: email || null, name: name || null, picture: picture || null });
-  } catch (err) {
-    const msg = err?.message || String(err || '');
-    let code = 'auth_failed';
-    if (/audience/.test(msg)) code = 'audience_mismatch';
-    if (/expired/i.test(msg)) code = 'token_expired';
-    if (/invalid/i.test(msg)) code = 'invalid_token';
-    console.error(JSON.stringify({ route: '/auth/google', rid: req.traceId, error: msg, code }));
-    return res.status(401).json({ error: code });
-  }
-}
-
-app.post('/auth/google', handleAuthGoogle);
-app.post('/api/auth/google', handleAuthGoogle);
-
-// ─────────────────────────────────────────────────────────────
-// 6) Auxiliares
-// ─────────────────────────────────────────────────────────────
-app.post('/api/echo', (req, res) => {
-  res.set({ 'Cache-Control': 'no-store,no-cache,must-revalidate,private', Pragma: 'no-cache', Expires: '0' });
-  return res.status(200).json({ ok: true, rid: req.traceId, echo: req.body || null, ts: new Date().toISOString() });
-});
-
-app.post('/api/track', async (req, res) => {
-  try {
-    const TRACK_OPEN = String(process.env.TRACK_OPEN || '1') === '1';
-    const TRACK_TOKEN = process.env.TRACK_TOKEN || '';
-    if (!TRACK_OPEN) {
-      const tok = req.headers['x-api-token'] || req.headers['X-Api-Token'];
-      if (!TRACK_TOKEN || tok !== TRACK_TOKEN) return res.status(403).json({ ok: false, error: 'forbidden' });
-    }
-
-    const { event, payload } = req.body || {};
-    if (!event || typeof event !== 'string') return res.status(400).json({ ok: false, error: 'missing_event' });
-
-    const anon_id = payload?.anon_id || req.body?.anon_id || 'anon_unknown';
-    const user_id = payload?.user_id || null;
-    const tz_offset = payload?.tz_offset;
-    const tsISO = payload?.ts || null;
-    const page = payload?.page || payload?.context?.page;
-    const sessionId = payload?.session_id;
-
-    const db = getDB();
-    await upsertDailyFact({
-      db,
-      anon_id,
-      user_id,
-      tz_offset,
-      event,
-      page,
-      session_id: sessionId,
-      payload: (() => { const p = { ...payload }; delete p.ts; delete p.tz_offset; delete p.page; delete p.session_id; delete p.user_id; delete p.anon_id; delete p.context; return toPlainJSON(p); })(),
-      tsISO: tsISO || new Date().toISOString()
-    });
-
-    return res.status(200).json({ ok: true, rid: req.traceId });
+    const serviceAccount = ensureSA();
+    initializeApp(serviceAccount ? { credential: cert(serviceAccount) } : {});
+    admin = true;
+    db = getFirestore();
+    db.settings({ ignoreUndefinedProperties: true });
+    FIRESTORE_INIT = true;
+    console.log(`[ADMIN] Firebase SDK OK (Proj: ${FIRESTORE_PROJECT_ID} )`);
   } catch (e) {
-    console.error(JSON.stringify({ route: '/api/track', rid: req.traceId, error: e.message || String(e) }));
-    if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).json({ ok: false, error: e.code });
-    return res.status(500).json({ ok: false, error: 'track_failed' });
+    admin = false;
+    FIRESTORE_INIT = false;
+    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message);
+    if (e.message === 'sa_not_configured') {
+       if(process.env.SA_OPTIONAL !== 'true') { throw e; }
+       console.warn('[ADMIN] SA_OPTIONAL=true. Servidor iniciando sem Firestore.');
+    } else { throw e; }
+  }
+}
+
+// 7) Inicialização dos Adapters
+let ADAPTERS_LOADED = false;
+try {
+  if (PlatformAdapterBase) {
+      ADAPTERS_LOADED = true;
+      console.log('[BOOT] Módulo PlatformAdapterBase (Factory) carregado.');
+  }
+} catch (e) {
+  console.error('[BOOT][FATAL] Falha ao carregar PlatformAdapterBase:', e.message);
+  throw e;
+}
+try {
+  if (marketingAutomator) console.log('[BOOT] Módulo marketingAutomator carregado com sucesso.');
+} catch (e) {}
+
+// 8) Middlewares
+const app = express();
+app.set('trust proxy', 1);
+app.use(cors(corsOptions));
+app.use(cookieParser());
+
+// Middleware de Logging e Trace ID
+app.use((req, res, next) => {
+  const traceId = req.headers[TRACE_ID_HEADER] || crypto.randomUUID();
+  req.traceId = traceId;
+  res.setHeader(TRACE_ID_HEADER, traceId);
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const end = process.hrtime.bigint();
+    const duration = (end - start) / 1_000_000n;
+    let logMsg = `[${req.method}] ${req.path} (${res.statusCode}) - ${duration}ms - [Trace: ${traceId}]`;
+    if (res.locals.errorLog) { logMsg += ` - [ERROR: ${res.locals.errorLog}]`; }
+    console.log(logMsg);
+  });
+  next();
+});
+
+// Middleware de Verificação de Token de API
+const verifyApiToken = (req, res, next) => {
+  if (TRACK_OPEN) return next();
+  const token = req.headers['x-api-token'] || req.query.token;
+  if (TRACK_TOKEN_ENABLED && token === process.env.TRACK_TOKEN) { return next(); }
+  if (TRACK_TOKEN_DEBUG_ENABLED && token === process.env.TRACK_TOKEN_DEBUG) { return next(); }
+  res.locals.errorLog = 'invalid_api_token';
+  return res.status(401).json({ ok: false, error: 'unauthorized', rid: req.traceId });
+};
+
+// 9) Rotas da API
+
+// --- Rotas Públicas (Health & Version) ---
+const HEALTHZ_TS = new Date().toISOString();
+let HEALTHZ_UPTIME_START = process.hrtime.bigint();
+app.get('/healthz', (req, res) => {
+    const uptimeNano = process.hrtime.bigint() - HEALTHZ_UPTIME_START;
+    const uptimeSec = Number(uptimeNano) / 1_000_000_000;
+    res.status(200).json({ ok: true, uptime: uptimeSec, ts: new Date().toISOString() });
+});
+app.get('/api/healthz', (req, res) => {
+    const uptimeNano = process.hrtime.bigint() - HEALTHZ_UPTIME_START;
+    const uptimeSec = Number(uptimeNano) / 1_000_000_000;
+    res.status(200).json({ ok: true, uptime: uptimeSec, ts: new Date().toISOString() });
+});
+app.get('/api/version', (req, res) => {
+  res.status(200).json({
+    service: 'PZ Auth+API Backend', version: SERVER_VERSION, build_date: SERVER_DEPLOY_DATE,
+    adapters_loaded: ADAPTERS_LOADED, client_ids: GOOGLE_CLIENT_IDS, origins: allowedOrigins,
+    track_open: TRACK_OPEN, track_token: TRACK_TOKEN_ENABLED, debug_token: TRACK_TOKEN_DEBUG_ENABLED,
+    fs_auth: admin ? 'AdminSDK' : 'None', fs_init: FIRESTORE_INIT, fs_project: FIRESTORE_PROJECT_ID,
+    fs_sa_source: FIRESTORE_SOURCE_LOG, facts_coll: process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts',
+    tx_coll: process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions',
+    facts_doc_pattern: process.env.FACTS_DOC_PATTERN || '${anon_id}_${YYYY-MM-DD}',
+  });
+});
+
+// --- Rota Pública (Google Auth) ---
+app.post('/auth/google', express.json(), async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) {
+    res.locals.errorLog = 'credential_missing';
+    return res.status(400).json({ ok: false, error: 'credential_missing', rid: req.traceId });
+  }
+  let ticket; let verified = false;
+  for (const client of googleAuthClients) {
+    try {
+      ticket = await client.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_IDS });
+      if (ticket) { verified = true; break; }
+    } catch (e) { console.warn(`[AUTH] Falha na verificação GSI (Cliente: ${client.clientId_?.slice(0,10)}...): ${e.message}`); }
+  }
+  if (!verified || !ticket) {
+    res.locals.errorLog = 'google_token_invalid';
+    return res.status(401).json({ ok: false, error: 'google_token_invalid', rid: req.traceId });
+  }
+  const payload = ticket.getPayload();
+  const { sub, email, name, given_name, family_name, picture } = payload;
+  if (!sub || !email) {
+    res.locals.errorLog = 'google_payload_incomplete';
+    return res.status(400).json({ ok: false, error: 'google_payload_incomplete', rid: req.traceId });
+  }
+  try {
+    const userRef = db.collection('users').doc(sub);
+    const userData = {
+      user_id: sub, email: email, name: name || '', first_name: given_name || '', last_name: family_name || '',
+      picture: picture || '', auth_provider: 'google', last_seen_at: new Date(), created_at: new Date(),
+    };
+    const doc = await userRef.get();
+    if (doc.exists) { await userRef.update({ last_seen_at: new Date() }); }
+    else { await userRef.set(userData); }
+    res.status(200).json({ ok: true, user_id: sub, email: email });
+  } catch (fsError) {
+    res.locals.errorLog = 'firestore_error_auth';
+    console.error(`[AUTH][500] Erro ao salvar user no Firestore (User: ${sub}):`, fsError);
+    res.status(500).json({ ok: false, error: 'firestore_error', rid: req.traceId });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// 7) API de Marketing / Send Guide (mantendo comportamento)
-// ─────────────────────────────────────────────────────────────
+// --- Rota Pública (API de Marketing / Send Guide) ---
 app.post('/api/send-guide', express.json(), async (req, res) => {
-  const { user_id } = req.body || {};
-  if (!user_id) return res.status(400).json({ ok: false, error: 'user_id_missing', rid: req.traceId });
+  const { user_id } = req.body;
+  if (!user_id) {
+    res.locals.errorLog = 'user_id_missing';
+    return res.status(400).json({ ok: false, error: 'user_id_missing', rid: req.traceId });
+  }
   try {
-    const db = getDB();
     const userRef = db.collection('users').doc(user_id);
     const userDoc = await userRef.get();
-    if (!userDoc.exists) return res.status(404).json({ ok: false, error: 'user_not_found', rid: req.traceId });
+    if (!userDoc.exists) {
+      res.locals.errorLog = 'user_not_found_guide';
+      return res.status(404).json({ ok: false, error: 'user_not_found', rid: req.traceId });
+    }
     const userData = userDoc.data();
     const { email, first_name } = userData;
-    if (!email) return res.status(400).json({ ok: false, error: 'user_email_missing', rid: req.traceId });
-
+    if (!email) {
+       res.locals.errorLog = 'user_email_missing_guide';
+      return res.status(400).json({ ok: false, error: 'user_email_missing', rid: req.traceId });
+    }
     const subscriberInfo = {
-      email: email,
-      first_name: first_name || '',
+      email: email, first_name: first_name || '',
       fields: {
-        user_id_google: user_id,
-        anon_id: req.body.anon_id || null,
+        user_id_google: user_id, anon_id: req.body.anon_id || null,
         attribution_history_json: JSON.stringify(req.body.attribution_history || []),
         product_choice: req.body.product_choice || null,
       }
     };
-
     const ckResponse = await marketingAutomator.addSubscriberToFunnel(subscriberInfo);
-    res.status(200).json({ ok: true, message: 'subscriber_added_to_funnel', subscriber: ckResponse });
-  } catch (e) {
-    if (e.code === 'DB_NOT_INITIALIZED') return res.status(503).json({ ok: false, error: e.code });
-    console.error(`[GUIDE][500]`, e?.message || e);
-    if (e.response) return res.status(e.response.status || 502).json({ ok: false, error: 'marketing_api_error', details: e.response.data, rid: req.traceId });
+    res.status(200).json({ ok: true, message: 'Guide request processed.', subscriber: ckResponse });
+  } catch (error) {
+    res.locals.errorLog = `marketing_api_error:${error.message}`;
+    console.error(`[GUIDE][500] Falha ao processar guia (User: ${user_id}):`, error?.message || error);
+    if (error.response) {
+       return res.status(error.response.status || 502).json({
+         ok: false, error: 'marketing_api_error', details: error.response.data, rid: req.traceId
+       });
+    }
     res.status(500).json({ ok: false, error: 'internal_server_error', rid: req.traceId });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// 8) Adapters – Checkout
-// ─────────────────────────────────────────────────────────────
+// --- Rota Protegida (API de Checkout / Adapter Factory) ---
 app.post('/api/checkout', express.json(), async (req, res) => {
-  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body));
-  const { offerData, trackingParams } = req.body || {};
-  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData));
+  // Logs de Diagnóstico v5.0.8 mantidos
+  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body)); // Log 1
+  
+  const { offerData, trackingParams } = req.body;
+  
+  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 2
+
   if (!offerData || !offerData.affiliate_platform) {
-    return res.status(400).json({ ok: false, error: 'missing_offerData' });
+    res.locals.errorLog = 'platform_missing_checkout';
+    return res.status(400).json({ ok: false, error: 'offerData.affiliate_platform_missing', rid: req.traceId });
   }
-  if (!trackingParams) return res.status(400).json({ ok: false, error: 'missing_trackingParams' });
-  let platform = 'unknown';
+  
+  const platform = offerData.affiliate_platform;
+
   try {
-    platform = offerData.affiliate_platform;
     const adapter = PlatformAdapterBase.getInstance(platform);
+    
+    console.log(`[SERVER CHECKOUT] Passando offerData para o adapter ${platform} (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 3
+    
     const finalCheckoutUrl = await adapter.buildCheckoutUrl(offerData, trackingParams);
-    if (!finalCheckoutUrl || typeof finalCheckoutUrl !== 'string') {
-      console.error(`[API /checkout] Adapter.buildCheckoutUrl() inválido:`, finalCheckoutUrl);
-      throw new Error(`Adapter ${platform} falhou.`);
+
+    if (finalCheckoutUrl) {
+      res.status(200).json({ ok: true, finalCheckoutUrl: finalCheckoutUrl });
+    } else {
+       res.locals.errorLog = `adapter_returned_null:${platform}`;
+       console.warn(`[CHECKOUT][400] Adapter ${platform} retornou URL nula. [Trace: ${req.traceId}]`);
+       res.status(400).json({ ok: false, error: 'checkout_url_generation_failed', platform: platform, rid: req.traceId });
     }
-    return res.status(200).json({ ok: true, finalCheckoutUrl });
   } catch (error) {
-    console.error(`[API /checkout] Falha ${platform}:`, error.message || error);
-    return res.status(500).json({ ok: false, error: 'checkout_url_generation_failed', platform });
+    res.locals.errorLog = `adapter_factory_error:${platform}:${error.message}`;
+    console.error(`[CHECKOUT][500] Falha na Factory ou Adapter (${platform}):`, error?.message || error);
+    res.status(500).json({
+      ok: false, error: 'adapter_error', platform: platform, details: error.message, rid: req.traceId
+    });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// 9) Erros globais
-// ─────────────────────────────────────────────────────────────
-process.on('unhandledRejection', reason => { console.error('[UNHANDLED_REJECTION] Reason:', reason); });
-process.on('uncaughtException', (err, origin) => { console.error('[UNCAUGHT_EXCEPTION] Error:', err, 'Origin:', origin); });
+// --- Rota Protegida (API de Tracking / Eventos) ---
+app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
+  const { event, payload } = req.body;
+  if (!event || !payload) {
+    res.locals.errorLog = 'event_payload_missing';
+    return res.status(400).json({ ok: false, error: 'event_or_payload_missing', rid: req.traceId });
+  }
+  const collectionName = process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts';
+  try {
+    const docData = {
+      ...payload, event_name: event, server_timestamp: new Date(), trace_id: req.traceId,
+      ip: req.ip || null, ua: req.headers['user-agent'] || null,
+    };
+    const docIdPattern = process.env.FACTS_DOC_PATTERN || '';
+    let docRef;
+    if (docIdPattern && payload.anon_id) {
+        const date = new Date(); const yyyy = date.getUTCFullYear();
+        const mm = String(date.getUTCMonth() + 1).padStart(2, '0'); const dd = String(date.getUTCDate()).padStart(2, '0');
+        const docId = docIdPattern.replace('${anon_id}', payload.anon_id).replace('${YYYY-MM-DD}', `${yyyy}-${mm}-${dd}`);
+        docRef = db.collection(collectionName).doc(docId);
+        await docRef.set(docData, { merge: true });
+        res.status(200).json({ ok: true, rid: req.traceId, doc_id: docId, op: 'merged' });
+    } else {
+        docRef = await db.collection(collectionName).add(docData);
+        res.status(201).json({ ok: true, rid: req.traceId, doc_id: docRef.id, op: 'created' });
+    }
+  } catch (fsError) {
+    res.locals.errorLog = 'firestore_error_track';
+    console.error(`[TRACK][500] Erro ao salvar evento '${event}' no Firestore:`, fsError);
+    res.status(500).json({ ok: false, error: 'firestore_error', rid: req.traceId });
+  }
+});
 
-// ─────────────────────────────────────────────────────────────
-// 10) Start – tenta inicializar no boot. Em testes, exporta app.
-// ─────────────────────────────────────────────────────────────
-initAdmin();
+// --- Rotas Públicas (Webhooks S2S das Plataformas) ---
+app.get('/webhook/digistore24', async (req, res) => {
+  const query = req.query; const headers = req.headers;
+  try {
+    const adapter = PlatformAdapterBase.getInstance('digistore24');
+    const normalizedData = await adapter.verifyWebhook(query, headers, req.traceId);
+    if (normalizedData) {
+      const docId = `ds24_${normalizedData.transactionId || normalizedData.orderId || crypto.randomUUID()}`;
+      await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
+        .doc(docId).set(normalizedData, { merge: true });
+      console.log(`[WEBHOOK][DS24] Webhook S2S ${docId} processado. [Trace: ${req.traceId}]`);
+      res.status(200).send('OK');
+    } else {
+      res.locals.errorLog = 'webhook_ds24_unauthorized';
+      console.warn(`[WEBHOOK][DS24] Webhook S2S falhou na verificação do Adapter. [Trace: ${req.traceId}]`);
+      res.status(401).send('Unauthorized');
+    }
+  } catch (error) {
+    res.locals.errorLog = `webhook_ds24_error:${error.message}`;
+    console.error(`[WEBHOOK][DS24] Erro crítico no Adapter Digistore24:`, error?.message || error);
+    res.status(500).send('Internal Server Error');
+  }
+});
+app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBodyBuffer = req.body; const headers = req.headers;
+  if (!rawBodyBuffer || rawBodyBuffer.length === 0) {
+      res.locals.errorLog = 'webhook_cb_empty_body';
+      console.warn(`[WEBHOOK][CB] Recebido body vazio. [Trace: ${req.traceId}]`);
+      return res.status(400).send('Bad Request: Empty payload');
+  }
+  try {
+    const adapter = PlatformAdapterBase.getInstance('clickbank');
+    const normalizedData = await adapter.verifyWebhook(rawBodyBuffer, headers, req.traceId);
+    if (normalizedData) {
+      const docId = `cb_${normalizedData.transactionId || normalizedData.orderId}`;
+      await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
+        .doc(docId).set(normalizedData, { merge: true });
+      console.log(`[WEBHOOK][CB] Webhook INS ${docId} processado. [Trace: ${req.traceId}]`);
+      res.status(200).send('OK');
+    } else {
+      res.locals.errorLog = 'webhook_cb_unauthorized';
+      console.warn(`[WEBHOOK][CB] Webhook INS falhou na verificação (HMAC/Decrypt). [Trace: ${req.traceId}]`);
+      res.status(401).send('Unauthorized');
+    }
+  } catch (error) {
+    res.locals.errorLog = `webhook_cb_error:${error.message}`;
+    console.error(`[WEBHOOK][CB] Erro crítico no Adapter Clickbank:`, error?.message || error);
+    res.status(500).send('Internal Server Error');
+  }
+});
 
-if (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) {
-  console.log('[BOOT] Ambiente teste. Exportando "app".');
-  module.exports = app;
-} else {
+// 10) Start
+try {
+  initAdmin();
   app.listen(PORT, () => {
-    console.log('──────────────────────────────────────────────────────────────');
+    HEALTHZ_UPTIME_START = process.hrtime.bigint();
+    console.log('\n' + '─'.repeat(60));
     console.log(`✅ Server UP on port ${PORT}`);
-    console.log(`📦 Version: v${SERVER_VERSION} (${SERVER_DEPLOY_DATE})`);
+    console.log(`📦 Version: ${SERVER_VERSION} (${SERVER_DEPLOY_DATE})`);
     console.log('🔧 Config:');
-    console.log(`   - CORS Origens : ${allowedOrigins.slice(0,3).join(', ')}...`);
+    console.log(`   - CORS Origens : ${allowedOrigins.slice(0, 3).join(', ')}...`);
     console.log(`   - Google Auth  : ${GOOGLE_CLIENT_IDS.length} Client ID(s)`);
-    console.log(`   - Firestore    : Admin SDK (Fonte: ${SA_SOURCE}) ${_adminInited ? '✅' : '❌'}`);
-    console.log(`   - Adapters     : ${typeof PlatformAdapterBase?.getInstance === 'function' ? '✅' : '❌'}`);
-    console.log(`   - NODE_ENV     : ${process.env.NODE_ENV || '(N/A)'}`);
-    console.log('──────────────────────────────────────────────────────────────');
+    console.log(`   - Track Aberto : ${TRACK_OPEN}`);
+    console.log(`   - Track Token  : ${TRACK_TOKEN_ENABLED ? 'Sim' : 'Não'}`);
+    console.log(`   - Debug Token  : ${TRACK_TOKEN_DEBUG_ENABLED ? 'Sim' : 'Não'}`);
+    console.log(`   - Firestore    : ${FIRESTORE_INIT ? `Admin SDK (Fonte: ${FIRESTORE_SOURCE_LOG}) ✅` : 'Desconectado ❌'}`);
+    console.log(`   - Adapters     : ${ADAPTERS_LOADED ? '✅' : '❌'}`);
+    console.log(`   - Guia URL Base: ${process.env.GUIDE_REDIRECT_BASE_URL || 'N/A'}`);
+    console.log(`   - NODE_ENV     : ${process.env.NODE_ENV || 'undefined'}`);
+    console.log('─'.repeat(60));
   });
+} catch (e) {
+  console.error('[FATAL] Erro ao iniciar servidor:', e?.message || e);
+  process.exit(1);
 }
