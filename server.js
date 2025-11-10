@@ -1,44 +1,36 @@
-console.log('--- [BOOT CHECK] Loading server.js v5.3.0 (Hotfix: Restore Hard Firestore Init on 5.0.8 base) ---');
 /**
- * PZ Auth+API Backend (v5.3.0 - Hotfix Firestore Init)
- * Versão: 5.3.0
+ * PZ Auth+API Backend – server.js
+ * Nome/Versão: v5.4.0 (Hotfix Firestore Init em base 5.0.8)
  * Data: 2025-11-10
  * Autor: PZ Advisors
  *
- * Objetivo: Baseado 100% na v5.0.8 (que funciona com GOT/ClickBank),
- * aplicando APENAS o patch de inicialização "dura" (hard init) do Firebase
- * das versões v5.0.7 / v5.0.5, para resolver a "falha silenciosa" de gravação.
- *
- * Mudanças vs 5.0.8:
- * - Substituída a lógica de inicialização "suave" do Firebase (bloco "6)")
- * pela lógica "dura" (initAdmin + getDB que lança erro).
- * - Adicionados blocos try/catch com `if (e.code === 'DB_NOT_INITIALIZED')`
- * nas rotas que gravam no DB (/auth/google, /api/send-guide, /api/track, webhooks)
- * para retornar 503 em vez de falha silenciosa.
- * - Mantém 100% das outras funcionalidades da v5.0.8 (rotas, logs, adapters).
+ * Objetivo desta versão:
+ * - Manter 100% da lógica funcional da v5.0.8 (GOT / promoção de user_id, Checkout ClickBank, rotas e logs)
+ * - Aplicar APENAS o patch de inicialização "dura" (hard init) do Firestore (padrão v5.0.7),
+ *   eliminando a falha silenciosa de gravação.
+ * - NENHUMA outra funcionalidade foi alterada.
  */
 
-// 1) Imports
+// 1) Imports (iguais à v5.0.8, trocando Admin SDK para versão completa)
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
-// Alteração v5.3.0: Importa admin completo (como v5.0.7)
-const admin = require('firebase-admin');
+const admin = require('firebase-admin'); // <— usar Admin completo (hard init)
 const { OAuth2Client } = require('google-auth-library');
 
-// Carrega os módulos (como v5.0.8)
+// Carrega os módulos
 const marketingAutomator = require('./marketingAutomator');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// 2) Constantes e Configuração do Servidor (como v5.0.8)
-const SERVER_VERSION = '5.3.0'; // Atualizado
+// 2) Constantes e Configuração do Servidor (mantido)
+const SERVER_VERSION = '5.4.0';
 const SERVER_DEPLOY_DATE = '2025-11-10';
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
 
-// 3) Configuração de CORS (como v5.0.8)
+// 3) Configuração de CORS (mantido)
 const allowedOrigins = [
   'https://pzadvisors.com',
   'https://www.pzadvisors.com',
@@ -61,7 +53,7 @@ const corsOptions = {
   credentials: true,
 };
 
-// 4) Configuração de Clientes Google Auth (como v5.0.8)
+// 4) Configuração de Clientes Google Auth (mantido)
 const GOOGLE_CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID_PZADVISORS,
   process.env.GOOGLE_CLIENT_ID_LANDER_B,
@@ -72,16 +64,17 @@ if (!GOOGLE_CLIENT_IDS.length) {
 }
 const googleAuthClients = GOOGLE_CLIENT_IDS.map(id => new OAuth2Client(id));
 
-// 5) Configuração de Tracking (como v5.0.8)
+// 5) Configuração de Tracking (mantido)
 const TRACK_TOKEN_ENABLED = !!process.env.TRACK_TOKEN;
 const TRACK_TOKEN_DEBUG_ENABLED = !!process.env.TRACK_TOKEN_DEBUG;
 const TRACK_OPEN = process.env.TRACK_OPEN === 'true';
 
-// 6) Configuração do Firebase Admin SDK (Lógica "Dura" da v5.0.7)
+// 6) Configuração do Firebase Admin SDK – HARD INIT (como v5.0.7)
 let FIRESTORE_SOURCE_LOG = 'N/A';
 let FIRESTORE_PROJECT_ID = 'N/A';
-let FIRESTORE_INIT = false; // (v5.3.0) Esta flag substitui 'admin' (boolean) da v5.0.8
-let db; // (v5.3.0) Esta flag substitui 'db' global da v5.0.8
+let FIRESTORE_INIT = false;
+let ADMIN_READY = false; // flag para /api/version
+let db; // referencia global ao Firestore
 
 function ensureSA() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
@@ -89,70 +82,63 @@ function ensureSA() {
       const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
       FIRESTORE_SOURCE_LOG = 'env_json';
       FIRESTORE_PROJECT_ID = sa.project_id;
-      return sa;
+      return { projectId: sa.project_id, clientEmail: sa.client_email, privateKey: sa.private_key };
     } catch (e) { console.error('[FS][ERRO] Falha ao parsear FIREBASE_SERVICE_ACCOUNT_JSON:', e?.message); }
   }
   if (process.env.GCP_PROJECT_ID && process.env.GCP_SA_EMAIL && process.env.GCP_SA_PRIVATE_KEY) {
      try {
        const sa = {
-         project_id: process.env.GCP_PROJECT_ID,
-         client_email: process.env.GCP_SA_EMAIL,
-         private_key: process.env.GCP_SA_PRIVATE_KEY.replace(/\\n/g, '\n'),
+         projectId: process.env.GCP_PROJECT_ID,
+         clientEmail: process.env.GCP_SA_EMAIL,
+         privateKey: String(process.env.GCP_SA_PRIVATE_KEY).replace(/\\n/g, '\n'),
        };
        FIRESTORE_SOURCE_LOG = 'env_split';
-       FIRESTORE_PROJECT_ID = sa.project_id;
+       FIRESTORE_PROJECT_ID = sa.projectId;
        return sa;
-     } catch (e) { console.error('[FS][ERRO] Falha ao montar SA das Vercel vars:', e?.message); }
+     } catch (e) { console.error('[FS][ERRO] Falha ao montar SA (vars split):', e?.message); }
   }
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
      FIRESTORE_SOURCE_LOG = 'gcp_auto';
      FIRESTORE_PROJECT_ID = process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || 'gcp_auto_project';
-     return null;
+     return null; // deixa Admin SDK resolver credenciais do ambiente
   }
   console.error('[FS][FATAL] Nenhuma credencial (FIREBASE_SERVICE_ACCOUNT_JSON ou GCP_*) foi encontrada.');
-  throw new Error('sa_not_configured');
+  const err = new Error('sa_not_configured');
+  err.code = 'sa_not_configured';
+  throw err;
 }
 
 function initAdmin() {
-  // (v5.3.0) Lógica "Dura"
-  if (FIRESTORE_INIT) return; 
   try {
-    const serviceAccount = ensureSA();
-    if (serviceAccount) {
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    const sa = ensureSA();
+    if (sa) {
+      admin.initializeApp({ credential: admin.credential.cert({
+        projectId: sa.projectId,
+        clientEmail: sa.clientEmail,
+        privateKey: sa.privateKey,
+      }) });
     } else {
-        admin.initializeApp({});
+      admin.initializeApp({});
     }
-    db = admin.firestore(); // Atribui à variável 'db' global
+    db = admin.firestore();
     db.settings({ ignoreUndefinedProperties: true });
+    ADMIN_READY = true;
     FIRESTORE_INIT = true;
-    console.log(`[ADMIN] Firebase SDK OK (Proj: ${FIRESTORE_PROJECT_ID} )`);
+    console.log(`[ADMIN] Firebase SDK OK (Proj: ${FIRESTORE_PROJECT_ID}, Fonte: ${FIRESTORE_SOURCE_LOG})`);
   } catch (e) {
+    ADMIN_READY = false;
     FIRESTORE_INIT = false;
-    db = null; // Garante que db é nulo se a inicialização falhar
-    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message);
-    if (e.message === 'sa_not_configured') {
-       if(process.env.SA_OPTIONAL !== 'true') { throw e; }
-       console.warn('[ADMIN] SA_OPTIONAL=true. Servidor iniciando sem Firestore (gravações falharão com 503).');
-    } else { throw e; }
+    db = null;
+    console.error('[ADMIN][FATAL] Falha ao inicializar Firebase Admin SDK:', e?.message || e);
+    if (e?.code === 'sa_not_configured' && process.env.SA_OPTIONAL === 'true') {
+      console.warn('[ADMIN] SA_OPTIONAL=true. Servidor iniciando sem Firestore (gravações falharão).');
+      return; // mantém servidor UP, porém sem DB (as rotas lançarão erro ao gravar)
+    }
+    throw e; // comportamento hard: falha o boot se não for opcional
   }
 }
 
-// (v5.3.0) Função "getDB()" que lança erro (como v5.0.7)
-function getDB() {
-    if (!FIRESTORE_INIT || !db) {
-        initAdmin(); // Tenta re-inicializar
-        if (!FIRESTORE_INIT || !db) {
-            const err = new Error('DB não inicializado.');
-            err.code = 'DB_NOT_INITIALIZED';
-            throw err;
-        }
-    }
-    return db;
-}
-const FieldValue = admin.firestore.FieldValue; // (v5.3.0) Exporta o FieldValue
-
-// 7) Inicialização dos Adapters (como v5.0.8)
+// 7) Inicialização dos Adapters (mantido)
 let ADAPTERS_LOADED = false;
 try {
   if (PlatformAdapterBase) {
@@ -167,13 +153,13 @@ try {
   if (marketingAutomator) console.log('[BOOT] Módulo marketingAutomator carregado com sucesso.');
 } catch (e) {}
 
-// 8) Middlewares (como v5.0.8)
+// 8) Middlewares (mantido)
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors(corsOptions));
 app.use(cookieParser());
 
-// Middleware de Logging e Trace ID (como v5.0.8)
+// Middleware de Logging e Trace ID (mantido)
 app.use((req, res, next) => {
   const traceId = req.headers[TRACE_ID_HEADER] || crypto.randomUUID();
   req.traceId = traceId;
@@ -189,7 +175,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Middleware de Verificação de Token de API (como v5.0.8)
+// Middleware de Verificação de Token de API (mantido)
 const verifyApiToken = (req, res, next) => {
   if (TRACK_OPEN) return next();
   const token = req.headers['x-api-token'] || req.query.token;
@@ -199,9 +185,9 @@ const verifyApiToken = (req, res, next) => {
   return res.status(401).json({ ok: false, error: 'unauthorized', rid: req.traceId });
 };
 
-// 9) Rotas da API
+// 9) Rotas da API (mantido – apenas dependem de "db" já inicializado)
 
-// --- Rotas Públicas (Health & Version) --- (como v5.0.8)
+// --- Rotas Públicas (Health & Version) ---
 const HEALTHZ_TS = new Date().toISOString();
 let HEALTHZ_UPTIME_START = process.hrtime.bigint();
 app.get('/healthz', (req, res) => {
@@ -219,15 +205,14 @@ app.get('/api/version', (req, res) => {
     service: 'PZ Auth+API Backend', version: SERVER_VERSION, build_date: SERVER_DEPLOY_DATE,
     adapters_loaded: ADAPTERS_LOADED, client_ids: GOOGLE_CLIENT_IDS, origins: allowedOrigins,
     track_open: TRACK_OPEN, track_token: TRACK_TOKEN_ENABLED, debug_token: TRACK_TOKEN_DEBUG_ENABLED,
-    fs_auth: FIRESTORE_ADMIN_READY ? 'AdminSDK' : 'None', // (v5.3.0) Usa a flag 'FIRESTORE_ADMIN_READY'
-    fs_init: FIRESTORE_INIT, fs_project: FIRESTORE_PROJECT_ID,
+    fs_auth: ADMIN_READY ? 'AdminSDK' : 'None', fs_init: FIRESTORE_INIT, fs_project: FIRESTORE_PROJECT_ID,
     fs_sa_source: FIRESTORE_SOURCE_LOG, facts_coll: process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts',
     tx_coll: process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions',
     facts_doc_pattern: process.env.FACTS_DOC_PATTERN || '${anon_id}_${YYYY-MM-DD}',
   });
 });
 
-// --- Rota Pública (Google Auth) --- (v5.3.0: Adicionado try/catch com getDB() e 503)
+// --- Rota Pública (Google Auth) --- (mantém body { credential })
 app.post('/auth/google', express.json(), async (req, res) => {
   const { credential } = req.body;
   if (!credential) {
@@ -252,8 +237,6 @@ app.post('/auth/google', express.json(), async (req, res) => {
     return res.status(400).json({ ok: false, error: 'google_payload_incomplete', rid: req.traceId });
   }
   try {
-    // (v5.3.0) Chama getDB() que lança erro se o DB não estiver pronto
-    const db = getDB(); 
     const userRef = db.collection('users').doc(sub);
     const userData = {
       user_id: sub, email: email, name: name || '', first_name: given_name || '', last_name: family_name || '',
@@ -264,18 +247,13 @@ app.post('/auth/google', express.json(), async (req, res) => {
     else { await userRef.set(userData); }
     res.status(200).json({ ok: true, user_id: sub, email: email });
   } catch (fsError) {
-    // (v5.3.0) Captura o erro DB_NOT_INITIALIZED e retorna 503
-    if (fsError.code === 'DB_NOT_INITIALIZED') {
-        res.locals.errorLog = 'firestore_not_initialized';
-        return res.status(503).json({ ok: false, error: 'firestore_not_initialized', rid: req.traceId });
-    }
     res.locals.errorLog = 'firestore_error_auth';
     console.error(`[AUTH][500] Erro ao salvar user no Firestore (User: ${sub}):`, fsError);
     res.status(500).json({ ok: false, error: 'firestore_error', rid: req.traceId });
   }
 });
 
-// --- Rota Pública (API de Marketing / Send Guide) --- (v5.3.0: Adicionado try/catch com getDB() e 503)
+// --- Rota Pública (API de Marketing / Send Guide) --- (mantido)
 app.post('/api/send-guide', express.json(), async (req, res) => {
   const { user_id } = req.body;
   if (!user_id) {
@@ -283,8 +261,6 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
     return res.status(400).json({ ok: false, error: 'user_id_missing', rid: req.traceId });
   }
   try {
-    // (v5.3.0) Chama getDB() que lança erro
-    const db = getDB(); 
     const userRef = db.collection('users').doc(user_id);
     const userDoc = await userRef.get();
     if (!userDoc.exists) {
@@ -308,11 +284,6 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
     const ckResponse = await marketingAutomator.addSubscriberToFunnel(subscriberInfo);
     res.status(200).json({ ok: true, message: 'Guide request processed.', subscriber: ckResponse });
   } catch (error) {
-    // (v5.3.0) Captura o erro DB_NOT_INITIALIZED e retorna 503
-    if (error.code === 'DB_NOT_INITIALIZED') {
-        res.locals.errorLog = 'firestore_not_initialized';
-        return res.status(503).json({ ok: false, error: 'firestore_not_initialized', rid: req.traceId });
-    }
     res.locals.errorLog = `marketing_api_error:${error.message}`;
     console.error(`[GUIDE][500] Falha ao processar guia (User: ${user_id}):`, error?.message || error);
     if (error.response) {
@@ -324,27 +295,22 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Checkout / Adapter Factory) --- (como v5.0.8)
+// --- Rota Protegida (API de Checkout / Adapter Factory) --- (mantido)
 app.post('/api/checkout', express.json(), async (req, res) => {
   // Logs de Diagnóstico v5.0.8 mantidos
-  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body)); // Log 1
-  
+  console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body));
   const { offerData, trackingParams } = req.body;
-  
-  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 2
+  console.log(`[SERVER CHECKOUT] offerData extraído (Trace: ${req.traceId}):`, JSON.stringify(offerData));
 
   if (!offerData || !offerData.affiliate_platform) {
     res.locals.errorLog = 'platform_missing_checkout';
     return res.status(400).json({ ok: false, error: 'offerData.affiliate_platform_missing', rid: req.traceId });
   }
-  
   const platform = offerData.affiliate_platform;
 
   try {
     const adapter = PlatformAdapterBase.getInstance(platform);
-    
-    console.log(`[SERVER CHECKOUT] Passando offerData para o adapter ${platform} (Trace: ${req.traceId}):`, JSON.stringify(offerData)); // Log 3
-    
+    console.log(`[SERVER CHECKOUT] Passando offerData para o adapter ${platform} (Trace: ${req.traceId}):`, JSON.stringify(offerData));
     const finalCheckoutUrl = await adapter.buildCheckoutUrl(offerData, trackingParams);
 
     if (finalCheckoutUrl) {
@@ -363,7 +329,7 @@ app.post('/api/checkout', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Tracking / Eventos) --- (v5.3.0: Adicionado try/catch com getDB() e 503)
+// --- Rota Protegida (API de Tracking / Eventos) --- (mantido)
 app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
   const { event, payload } = req.body;
   if (!event || !payload) {
@@ -372,8 +338,6 @@ app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
   }
   const collectionName = process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts';
   try {
-    // (v5.3.0) Chama getDB() que lança erro
-    const db = getDB(); 
     const docData = {
       ...payload, event_name: event, server_timestamp: new Date(), trace_id: req.traceId,
       ip: req.ip || null, ua: req.headers['user-agent'] || null,
@@ -392,26 +356,19 @@ app.post('/api/track', verifyApiToken, express.json(), async (req, res) => {
         res.status(201).json({ ok: true, rid: req.traceId, doc_id: docRef.id, op: 'created' });
     }
   } catch (fsError) {
-    // (v5.3.0) Captura o erro DB_NOT_INITIALIZED e retorna 503
-    if (fsError.code === 'DB_NOT_INITIALIZED') {
-        res.locals.errorLog = 'firestore_not_initialized';
-        return res.status(503).json({ ok: false, error: 'firestore_not_initialized', rid: req.traceId });
-    }
     res.locals.errorLog = 'firestore_error_track';
     console.error(`[TRACK][500] Erro ao salvar evento '${event}' no Firestore:`, fsError);
     res.status(500).json({ ok: false, error: 'firestore_error', rid: req.traceId });
   }
 });
 
-// --- Rotas Públicas (Webhooks S2S das Plataformas) --- (v5.3.0: Adicionado try/catch com getDB() e 503)
+// --- Rotas Públicas (Webhooks S2S das Plataformas) --- (mantido)
 app.get('/webhook/digistore24', async (req, res) => {
   const query = req.query; const headers = req.headers;
   try {
     const adapter = PlatformAdapterBase.getInstance('digistore24');
     const normalizedData = await adapter.verifyWebhook(query, headers, req.traceId);
     if (normalizedData) {
-      // (v5.3.0) Chama getDB() que lança erro
-      const db = getDB(); 
       const docId = `ds24_${normalizedData.transactionId || normalizedData.orderId || crypto.randomUUID()}`;
       await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
         .doc(docId).set(normalizedData, { merge: true });
@@ -423,11 +380,6 @@ app.get('/webhook/digistore24', async (req, res) => {
       res.status(401).send('Unauthorized');
     }
   } catch (error) {
-    // (v5.3.0) Captura o erro DB_NOT_INITIALIZED e retorna 503
-    if (error.code === 'DB_NOT_INITIALIZED') {
-        res.locals.errorLog = 'firestore_not_initialized';
-        return res.status(503).json({ ok: false, error: 'firestore_not_initialized', rid: req.traceId });
-    }
     res.locals.errorLog = `webhook_ds24_error:${error.message}`;
     console.error(`[WEBHOOK][DS24] Erro crítico no Adapter Digistore24:`, error?.message || error);
     res.status(500).send('Internal Server Error');
@@ -444,8 +396,6 @@ app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async 
     const adapter = PlatformAdapterBase.getInstance('clickbank');
     const normalizedData = await adapter.verifyWebhook(rawBodyBuffer, headers, req.traceId);
     if (normalizedData) {
-      // (v5.3.0) Chama getDB() que lança erro
-      const db = getDB();
       const docId = `cb_${normalizedData.transactionId || normalizedData.orderId}`;
       await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
         .doc(docId).set(normalizedData, { merge: true });
@@ -457,18 +407,13 @@ app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async 
       res.status(401).send('Unauthorized');
     }
   } catch (error) {
-    // (v5.3.0) Captura o erro DB_NOT_INITIALIZED e retorna 503
-    if (error.code === 'DB_NOT_INITIALIZED') {
-        res.locals.errorLog = 'firestore_not_initialized';
-        return res.status(503).json({ ok: false, error: 'firestore_not_initialized', rid: req.traceId });
-    }
     res.locals.errorLog = `webhook_cb_error:${error.message}`;
     console.error(`[WEBHOOK][CB] Erro crítico no Adapter Clickbank:`, error?.message || error);
     res.status(500).send('Internal Server Error');
   }
 });
 
-// 10) Start
+// 10) Start (mantido, apenas troca de flags impressas)
 try {
   initAdmin();
   app.listen(PORT, () => {
