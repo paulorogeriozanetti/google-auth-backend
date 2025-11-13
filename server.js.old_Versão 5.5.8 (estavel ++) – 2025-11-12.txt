@@ -1,16 +1,13 @@
-console.log('--- [BOOT CHECK] Loading server.js v5.6.0 (S2S Router Migration) ---');
+console.log('--- [BOOT CHECK] Loading server.js v5.5.8 (Webhook Hotfix) ---');
 /**
- * PZ Auth+API Backend (v5.6.0 - S2S Router Migration)
- * Versão: 5.6.0
- * Data: 2025-11-13
+ * PZ Auth+API Backend (v5.5.8 - Webhook Hotfix)
+ * Versão: 5.5.8
+ * Data: 2025-11-12
  * Autor: PZ Advisors
  *
- * Objetivo: Migra o processamento de S2S (webhook) para a nova arquitetura
- * PostbackRouter, substituindo as rotas /webhook/*.
- * - [P1] Importa o PostbackRouter.
- * - [P1] Substitui app.get('/webhook/digistore24') e app.post('/webhook/clickbank')
- * por uma rota única: app.all('/postback/:platform').
- * - Mantém todas as funcionalidades v5.5.8.
+ * Objetivo: Baseado na v5.5.7.
+ * - [CRITICAL] Corrige um bloco de código corrompido (artefato de colagem) na rota /webhook/digistore24 que impedia a inicialização (Req 1).
+ * - Mantém todas as funcionalidades v5.5.7 (Trace ID no topo, hotfix 404, CORS allowlist, token .env-only, EventName fix, Higiene "null").
  */
 
 // 1) Imports
@@ -25,14 +22,10 @@ const { OAuth2Client } = require('google-auth-library');
 // Carrega os módulos
 const marketingAutomator = require('./marketingAutomator');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
-// --- INÍCIO DA ALTERAÇÃO v5.6.0 ---
-// Importa o novo roteador S2S
-const PostbackRouter = require('./PostbackRouter');
-// --- FIM DA ALTERAÇÃO v5.6.0 ---
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '5.6.0'; // ATUALIZADO
-const SERVER_DEPLOY_DATE = '2025-11-13'; // ATUALIZADO
+const SERVER_VERSION = '5.5.8'; // ATUALIZADO
+const SERVER_DEPLOY_DATE = '2025-11-12'; // ATUALIZADO
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
@@ -577,14 +570,73 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     }
 });
 
-// --- INÍCIO DA ALTERAÇÃO v5.6.0: (Migração S2S Router) ---
-// As rotas /webhook/digistore24 e /webhook/clickbank foram removidas
-// e substituídas pela rota única /postback/:platform, gerenciada
-// pelo PostbackRouter.
+// --- INÍCIO DA ALTERAÇÃO v5.5.8: (Hotfix) Correção do Bloco Corrompido ---
+// (Este bloco substitui o código corrompido da v5.5.7)
 
 // --- Rotas Públicas (Webhooks S2S das Plataformas) ---
-app.all('/postback/:platform', PostbackRouter.handle);
-// --- FIM DA ALTERAÇÃO v5.6.0 ---
+app.get('/webhook/digistore24', async (req, res) => {
+  const query = req.query; 
+  const headers = req.headers;
+  try {
+    const adapter = PlatformAdapterBase.getInstance('digistore24');
+    const normalizedData = await adapter.verifyWebhook(query, headers, req.traceId);
+    if (normalizedData) {
+      if (db) {
+        const docId = `ds24_${normalizedData.transactionId || normalizedData.orderId || crypto.randomUUID()}`;
+        await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
+          .doc(docId).set(normalizedData, { merge: true });
+        console.log(`[WEBHOOK][DS24] Webhook S2S ${docId} processado. [Trace: ${req.traceId}]`);
+      } else {
+        console.warn(`[WEBHOOK][DS24] Firestore (db) não disponível. Gravação pulada. [Trace: ${req.traceId}]`);
+      }
+      return res.status(200).send('OK');
+    } else {
+      res.locals.errorLog = 'webhook_ds24_unauthorized';
+      console.warn(`[WEBHOOK][DS24] Webhook S2S falhou na verificação do Adapter. [Trace: ${req.traceId}]`);
+      return res.status(401).send('Unauthorized');
+    }
+  } catch (error) {
+    res.locals.errorLog = `webhook_ds24_error:${error.message}`;
+    console.error(`[WEBHOOK][DS24] Erro crítico no Adapter Digistore24:`, error?.message || error);
+    return res.status(500).send('Internal Server Error');
+  }
+});
+
+app.post('/webhook/clickbank', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBodyBuffer = req.body; 
+  const headers = req.headers;
+
+  if (!rawBodyBuffer || rawBodyBuffer.length === 0) {
+    res.locals.errorLog = 'webhook_cb_empty_body';
+    console.warn(`[WEBHOOK][CB] Recebido body vazio. [Trace: ${req.traceId}]`);
+    return res.status(400).send('Bad Request: Empty payload');
+  }
+
+  try {
+    const adapter = PlatformAdapterBase.getInstance('clickbank');
+    const normalizedData = await adapter.verifyWebhook(rawBodyBuffer, headers, req.traceId);
+    if (normalizedData) {
+      if (db) {
+        const docId = `cb_${normalizedData.transactionId || normalizedData.orderId}`;
+        await db.collection(process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions')
+          .doc(docId).set(normalizedData, { merge: true });
+        console.log(`[WEBHOOK][CB] Webhook INS ${docId} processado. [Trace: ${req.traceId}]`);
+      } else {
+        console.warn(`[WEBHOOK][CB] Firestore (db) não disponível. Gravação pulada. [Trace: ${req.traceId}]`);
+      }
+      return res.status(200).send('OK');
+    } else {
+      res.locals.errorLog = 'webhook_cb_unauthorized';
+      console.warn(`[WEBHOOK][CB] Webhook INS falhou na verificação (HMAC/Decrypt). [Trace: ${req.traceId}]`);
+      return res.status(401).send('Unauthorized');
+    }
+  } catch (error) {
+    res.locals.errorLog = `webhook_cb_error:${error.message}`;
+    console.error(`[WEBHOOK][CB] Erro crítico no Adapter Clickbank:`, error?.message || error);
+    return res.status(500).send('Internal Server Error');
+  }
+});
+// --- FIM DA ALTERAÇÃO v5.5.8 ---
 
 
 // 10) Start
