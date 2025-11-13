@@ -1,15 +1,16 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.0.0 (S2S + DailyFacts Service) ---');
+console.log('--- [BOOT CHECK] Loading server.js v5.6.0 (S2S Router Migration) ---');
 /**
- * PZ Auth+API Backend (v6.0.0 - S2S + DailyFacts Service)
- * Versão: 6.0.0
+ * PZ Auth+API Backend (v5.6.0 - S2S Router Migration)
+ * Versão: 5.6.0
  * Data: 2025-11-13
  * Autor: PZ Advisors
  *
- * Objetivo: Refatoração e Centralização S2S.
- * - [P1] Refatora 'upsertDailyFact' e utilitários para um serviço externo (DailyFactsService.js).
- * - [P1] Importa e utiliza 'DailyFactsService' na rota /api/track.
- * - [P1] Mantém PostbackRouter e todas as funcionalidades v5.6.0.
- * - [Refactor] Código mais limpo e reutilizável para gravação dupla (Web/S2S).
+ * Objetivo: Migra o processamento de S2S (webhook) para a nova arquitetura
+ * PostbackRouter, substituindo as rotas /webhook/*.
+ * - [P1] Importa o PostbackRouter.
+ * - [P1] Substitui app.get('/webhook/digistore24') e app.post('/webhook/clickbank')
+ * por uma rota única: app.all('/postback/:platform').
+ * - Mantém todas as funcionalidades v5.5.8.
  */
 
 // 1) Imports
@@ -24,11 +25,13 @@ const { OAuth2Client } = require('google-auth-library');
 // Carrega os módulos
 const marketingAutomator = require('./marketingAutomator');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
-// Importa o roteador S2S (mantido da v5.6.0)
+// --- INÍCIO DA ALTERAÇÃO v5.6.0 ---
+// Importa o novo roteador S2S
 const PostbackRouter = require('./PostbackRouter');
+// --- FIM DA ALTERAÇÃO v5.6.0 ---
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.0.0'; // ATUALIZADO
+const SERVER_VERSION = '5.6.0'; // ATUALIZADO
 const SERVER_DEPLOY_DATE = '2025-11-13'; // ATUALIZADO
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
@@ -211,12 +214,118 @@ function isValidToken(tok) {
 
 
 // =================================================================
-// 9) Utils de Daily Facts (Refatorado v6.0.0)
+// 9) Utils de Daily Facts (Base v5.5.3)
 // =================================================================
-// --- INÍCIO DA ALTERAÇÃO v6.0.0 ---
-// Funções utilitárias movidas para DailyFactsService.js para reutilização
-const { upsertDailyFact, toPlainJSON } = require('./DailyFactsService');
-// --- FIM DA ALTERAÇÃO v6.0.0 ---
+function zeroPad(n, w = 2) { return String(n).padStart(w, '0'); }
+function deriveDayParts(tsISO, tzOffsetMin) { let d=tsISO?new Date(tsISO):new Date(); const tz=Number.isFinite(+tzOffsetMin)?+tzOffsetMin:0; if(tz!==0) d=new Date(d.getTime()+tz*60*1000); return { y:d.getUTCFullYear(), m:zeroPad(d.getUTCMonth()+1), d:zeroPad(d.getUTCDate()) }; }
+function deriveDayLabel(tsISO, tzOffsetMin) { const p=deriveDayParts(tsISO,tzOffsetMin); return `${p.y}-${p.m}-${p.d}`; }
+
+function parseClientTimestamp(val) { 
+  try{ 
+    if(!val) return null; 
+    const d=new Date(val); 
+    if(isNaN(d.getTime())) return null; 
+    return Timestamp.fromDate(d);
+  } catch { return null; } 
+}
+function toPlainJSON(obj) { try { return JSON.parse(JSON.stringify(obj || null)); } catch { return null; } }
+
+// (v5.5.3) Higiene de Dados
+function clean(v) {
+  if (v === undefined || v === null) return ""; 
+  const s = String(v).trim();
+  if (s === 'null' || s === '"null"' || s === "'null'") return ""; 
+  return s;
+}
+
+/**
+ * Lógica de gravação (Base v5.5.3)
+ */
+async function upsertDailyFact({ db = null, anon_id, user_id, tz_offset, event, page, session_id, payload, tsISO }) {
+  if (!FIRESTORE_INIT || !db) {
+    console.warn(`[upsertDailyFact] DB não disponível (SA_OPTIONAL=true). Pulando gravação.`);
+    return { ok: false, id: null, error: 'DB_NOT_INITIALIZED' };
+  }
+
+  // (P0 v5.5.3) Aplica Higiene
+  if (payload && payload.got && typeof payload.got === 'object') {
+      Object.keys(payload.got).forEach(k => {
+          const cleanedValue = clean(payload.got[k]); 
+          if (cleanedValue === "") {
+             delete payload.got[k]; // Remove chaves vazias
+          } else {
+             payload.got[k] = cleanedValue;
+          }
+      });
+  }
+
+  const safeAnon = (anon_id && typeof anon_id === 'string') ? anon_id : 'anon_unknown';
+  const tz = Number.isFinite(+tz_offset) ? +tz_offset : 0;
+  const day = deriveDayLabel(tsISO, tz);
+  
+  const docIdPattern = process.env.FACTS_DOC_PATTERN || '${anon_id}_${YYYY-MM-DD}';
+  const docId = docIdPattern
+    .replace('${anon_id}', safeAnon)
+    .replace('${YYYY-MM-DD}', day)
+    .replace('${y}', deriveDayParts(tsISO, tz).y) 
+    .replace('${m}', deriveDayParts(tsISO, tz).m)
+    .replace('${d}', deriveDayParts(tsISO, tz).d);
+
+  const docRef = db.collection(process.env.FIRESTORE_FACTS_COLLECTION || 'daily_facts').doc(docId);
+  
+  const event_id = payload?.event_id || `${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
+  
+  if (payload.event_id) delete payload.event_id;
+  
+  const newEvent = toPlainJSON({ 
+    event, 
+    event_id, 
+    ts_server: FieldValue.serverTimestamp(), 
+    ts_client: parseClientTimestamp(tsISO), 
+    tz_offset: Number.isFinite(tz) ? tz : null, 
+    page, 
+    session_id, 
+    payload 
+  });
+  
+  const final_user_id = (user_id && typeof user_id === 'string') ? user_id : null;
+  const final_person_id = final_user_id || safeAnon;
+
+  const updatePayload = {
+    updated_at: FieldValue.serverTimestamp(),
+    events: FieldValue.arrayUnion(newEvent),
+    [`counters.${event}`]: FieldValue.increment(1),
+    person_id: final_person_id, 
+    ...(final_user_id ? { user_id: final_user_id } : {})
+  };
+  
+  try {
+    await docRef.update(updatePayload);
+  } catch (error) {
+    const notFound = error?.code === 5 || error?.code === 'not-found' || /NOT_FOUND/i.test(error?.message || '');
+    if (notFound) {
+      const seedPayload = {
+        kind: 'user', date: day, entity_id: safeAnon, anon_id: safeAnon,
+        person_id: final_person_id, 
+        ...(final_user_id ? { user_id: final_user_id } : {}),
+        ...(Number.isFinite(tz) ? { tz_offset: tz } : {}),
+        events: [newEvent], 
+        counters: { [event]: 1 },
+        created_at: FieldValue.serverTimestamp(), 
+        updated_at: FieldValue.serverTimestamp()
+      };
+      await docRef.set(seedPayload);
+    } else {
+      if (error.code === 6 || /ALREADY_EXISTS/i.test(error.message)) {
+         console.warn(`[TRACK] Ignorando evento duplicado (idempotência): ${docId} / ${event_id}`);
+         return { ok: true, id: docId, op: 'ignored_duplicate' };
+      }
+      console.error(JSON.stringify({ tag: 'upsert_daily_fact_failed', docId, error: error.message || String(error), code: error.code }));
+      throw error;
+    }
+  }
+  return { ok: true, id: docId };
+}
 
 
 // 10) Rotas da API
@@ -429,14 +538,12 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     }
 
     try {
-        // --- INÍCIO DA ALTERAÇÃO v6.0.0 ---
-        // Utiliza a função importada de DailyFactsService.js
         const result = await upsertDailyFact({
             db: db, 
             anon_id: payload?.anon_id || null, 
             user_id: payload?.user_id || null, 
             tz_offset: payload?.tz_offset,
-            event: eventName, 
+            event: eventName, // <-- (P0) USA O EVENTNAME CORRETO
             page: payload?.page || payload?.context?.page,
             session_id: payload?.session_id,
             payload: (() => { 
@@ -445,11 +552,14 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
                 delete p.user_id; delete p.anon_id; delete p.context;
                 delete p.auth; 
                 delete p.event_id; 
+                // --- INÍCIO DA ALTERAÇÃO v5.5.6: (Nit) Remove deleção redundante ---
+                // 'p.event' é mantido para logs no FB, e não é um campo de 1º nível em 'newEvent'
+                // delete p.event; // (Removido na v5.5.6)
+                // --- FIM DA ALTERAÇÃO v5.5.6 ---
                 return toPlainJSON(p); 
             })(),
             tsISO: payload?.ts || new Date().toISOString()
         });
-        // --- FIM DA ALTERAÇÃO v6.0.0 ---
 
         if (result.ok) {
             res.status(200).json({ ok: true, rid: req.traceId, doc_id: result.id, op: result.op || 'merged/set' });
@@ -467,9 +577,14 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     }
 });
 
+// --- INÍCIO DA ALTERAÇÃO v5.6.0: (Migração S2S Router) ---
+// As rotas /webhook/digistore24 e /webhook/clickbank foram removidas
+// e substituídas pela rota única /postback/:platform, gerenciada
+// pelo PostbackRouter.
+
 // --- Rotas Públicas (Webhooks S2S das Plataformas) ---
-// Migrado para o PostbackRouter na v5.6.0 (Mantido)
 app.all('/postback/:platform', PostbackRouter.handle);
+// --- FIM DA ALTERAÇÃO v5.6.0 ---
 
 
 // 10) Start
