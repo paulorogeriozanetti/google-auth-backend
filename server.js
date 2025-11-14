@@ -1,14 +1,14 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.0.3 (S2S Parser Fix) ---');
+console.log('--- [BOOT CHECK] Loading server.js v6.0.4 (S2S Parser Fix) ---');
 /**
- * PZ Auth+API Backend (v6.0.3 - S2S Parser Fix)
- * Versão: 6.0.3
+ * PZ Auth+API Backend (v6.0.4 - S2S Parser Fix)
+ * Versão: 6.0.4
  * Data: 2025-11-13
  * Autor: PZ Advisors
  *
- * Objetivo: Corrige o roteamento de S2S para usar parsers específicos por rota.
- * - [CRÍTICO] Substitui app.all('/postback/:platform') por rotas GET e POST separadas.
- * - [CRÍTICO] Adiciona express.urlencoded() APENAS à rota POST /postback/clickbank.
- * - [CRÍTICO] Rota GET (Digistore) permanece sem parser de body.
+ * Objetivo: Corrige o parser de body do ClickBank S2S para v6.0.0.
+ * - [CRÍTICO] Substitui app.all() por rotas GET e POST S2S separadas.
+ * - [CRÍTICO] Rota POST /postback/clickbank agora aceita express.json() (principal)
+ * e express.urlencoded() (fallback) para ler 'notification' e 'iv' [cite: Abaixo o feedback sobre os códigos gerados. Agora gerar nova versão v1.0.4 do PostbackRouter.js...].
  * - Mantém todas as funcionalidades v6.0.0 (DailyFactsService, /api/track, etc.).
  */
 
@@ -28,7 +28,7 @@ const PlatformAdapterBase = require('./PlatformAdapterBase');
 const PostbackRouter = require('./PostbackRouter');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.0.3'; // ATUALIZADO
+const SERVER_VERSION = '6.0.4'; // ATUALIZADO
 const SERVER_DEPLOY_DATE = '2025-11-13'; // ATUALIZADO
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
@@ -470,19 +470,17 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
 });
 
 // --- INÍCIO DA ALTERAÇÃO v6.0.3: (S2S Parsers Específicos) ---
-// A rota app.all() foi removida.
-// Aplicamos os parsers corretos por rota, conforme o feedback.
-
-// --- Rotas Públicas (Webhooks S2S das Plataformas) ---
-
 // Rota S2S (GET) - Usada pelo Digistore24 (sem body parser)
 app.get('/postback/:platform', PostbackRouter.handle);
 
 // Rota S2S (POST) - ClickBank com rota dedicada
-// Aplica o parser 'urlencoded' para ler 'notification' e 'iv' do body.
+// Aplica o parser 'json' (principal) e 'urlencoded' (fallback) para ler 'notification' e 'iv' do body [cite: Analisar abaixo o feedback. Gerar nova versão v6.0.3...].
 // e injeta platform='clickbank' para o PostbackRouter.
 app.post(
   '/postback/clickbank',
+  // 1) Tenta parsear JSON: { "notification": "...", "iv": "..." }
+  express.json({ limit: '1mb' }),
+  // 2) Se vier como form-encoded, este parser cuida
   express.urlencoded({ extended: false }),
   (req, res) => {
     // Injeta o parâmetro 'platform' manualmente para o Router
