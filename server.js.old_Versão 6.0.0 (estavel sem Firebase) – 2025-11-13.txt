@@ -1,15 +1,15 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.0.3 (S2S Parser Fix) ---');
+console.log('--- [BOOT CHECK] Loading server.js v6.0.0 (S2S + DailyFacts Service) ---');
 /**
- * PZ Auth+API Backend (v6.0.3 - S2S Parser Fix)
- * Versão: 6.0.3
+ * PZ Auth+API Backend (v6.0.0 - S2S + DailyFacts Service)
+ * Versão: 6.0.0
  * Data: 2025-11-13
  * Autor: PZ Advisors
  *
- * Objetivo: Corrige o roteamento de S2S para usar parsers específicos por rota.
- * - [CRÍTICO] Substitui app.all('/postback/:platform') por rotas GET e POST separadas.
- * - [CRÍTICO] Adiciona express.urlencoded() APENAS à rota POST /postback/clickbank.
- * - [CRÍTICO] Rota GET (Digistore) permanece sem parser de body.
- * - Mantém todas as funcionalidades v6.0.0 (DailyFactsService, /api/track, etc.).
+ * Objetivo: Refatoração e Centralização S2S.
+ * - [P1] Refatora 'upsertDailyFact' e utilitários para um serviço externo (DailyFactsService.js).
+ * - [P1] Importa e utiliza 'DailyFactsService' na rota /api/track.
+ * - [P1] Mantém PostbackRouter e todas as funcionalidades v5.6.0.
+ * - [Refactor] Código mais limpo e reutilizável para gravação dupla (Web/S2S).
  */
 
 // 1) Imports
@@ -28,7 +28,7 @@ const PlatformAdapterBase = require('./PlatformAdapterBase');
 const PostbackRouter = require('./PostbackRouter');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.0.3'; // ATUALIZADO
+const SERVER_VERSION = '6.0.0'; // ATUALIZADO
 const SERVER_DEPLOY_DATE = '2025-11-13'; // ATUALIZADO
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
@@ -253,8 +253,7 @@ app.get('/api/version', (req, res) => {
   });
 });
 
-// --- Rota Pública (Google Auth) ---
-// (JSON Parser aplicado localmente)
+// --- Rota Pública (Google Auth) --- (como v5.0.8)
 app.post('/auth/google', express.json(), async (req, res) => {
   // (Lógica v5.5.2 mantida)
   const { credential } = req.body;
@@ -300,10 +299,8 @@ app.post('/auth/google', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Pública (API de Marketing / Send Guide) ---
-// (JSON Parser aplicado localmente)
+// --- Rota Pública (API de Marketing / Send Guide) --- (v5.5.5: Hotfix 404)
 app.post('/api/send-guide', express.json(), async (req, res) => {
-  // (Lógica v5.5.5 mantida)
   const { user_id } = req.body;
   if (!user_id) {
     res.locals.errorLog = 'user_id_missing';
@@ -318,6 +315,7 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
         const userDoc = await userRef.get();
         if (!userDoc.exists) {
           res.locals.errorLog = 'user_not_found_guide';
+          // (v5.5.5 Hotfix)
           return res.status(404).json({ ok: false, error: 'user_not_found', rid: req.traceId });
         }
         const userData = userDoc.data();
@@ -355,8 +353,7 @@ app.post('/api/send-guide', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Checkout / Adapter Factory) ---
-// (JSON Parser aplicado localmente)
+// --- Rota Protegida (API de Checkout / Adapter Factory) --- (como v5.0.8)
 app.post('/api/checkout', express.json(), async (req, res) => {
   // (Lógica v5.5.2 mantida)
   console.log(`[SERVER CHECKOUT] req.body recebido (Trace: ${req.traceId}):`, JSON.stringify(req.body)); 
@@ -395,8 +392,7 @@ app.post('/api/checkout', express.json(), async (req, res) => {
   }
 });
 
-// --- Rota Protegida (API de Tracking / Eventos) ---
-// (JSON Parser aplicado localmente, com limite)
+// --- Rota Protegida (API de Tracking / Eventos) --- (v5.5.6: Polimento Nit)
 app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     
     // (v5.5.3) Pixel Fallback
@@ -433,7 +429,8 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     }
 
     try {
-        // Utiliza a função importada de DailyFactsService.js (v6.0.0)
+        // --- INÍCIO DA ALTERAÇÃO v6.0.0 ---
+        // Utiliza a função importada de DailyFactsService.js
         const result = await upsertDailyFact({
             db: db, 
             anon_id: payload?.anon_id || null, 
@@ -452,6 +449,7 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
             })(),
             tsISO: payload?.ts || new Date().toISOString()
         });
+        // --- FIM DA ALTERAÇÃO v6.0.0 ---
 
         if (result.ok) {
             res.status(200).json({ ok: true, rid: req.traceId, doc_id: result.id, op: result.op || 'merged/set' });
@@ -469,28 +467,9 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
     }
 });
 
-// --- INÍCIO DA ALTERAÇÃO v6.0.3: (S2S Parsers Específicos) ---
-// A rota app.all() foi removida.
-// Aplicamos os parsers corretos por rota, conforme o feedback.
-
 // --- Rotas Públicas (Webhooks S2S das Plataformas) ---
-
-// Rota S2S (GET) - Usada pelo Digistore24 (sem body parser)
-app.get('/postback/:platform', PostbackRouter.handle);
-
-// Rota S2S (POST) - ClickBank com rota dedicada
-// Aplica o parser 'urlencoded' para ler 'notification' e 'iv' do body.
-// e injeta platform='clickbank' para o PostbackRouter.
-app.post(
-  '/postback/clickbank',
-  express.urlencoded({ extended: false }),
-  (req, res) => {
-    // Injeta o parâmetro 'platform' manualmente para o Router
-    req.params.platform = 'clickbank';
-    PostbackRouter.handle(req, res);
-  }
-);
-// --- FIM DA ALTERAÇÃO v6.0.3 ---
+// Migrado para o PostbackRouter na v5.6.0 (Mantido)
+app.all('/postback/:platform', PostbackRouter.handle);
 
 
 // 10) Start

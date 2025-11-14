@@ -1,18 +1,20 @@
 /**
  * PostbackRouter.js
- * Versão: v1.0.4
+ * Versão: v1.0.2
  * Data: 2025-11-13
  * Desc: Ponto de entrada único (roteador) para todos os webhooks S2S.
+ * Identifica a plataforma e delega para o handler específico.
  *
- * Alterações v1.0.4:
- * - Limpeza de comentários [cite: ...] para produção.
- * - Confirma a lógica v1.0.2 (stubs e airbag) [cite: Analisar abaixo o feedback. Gerar nova versão v1.0.2 para colar...].
- * - Confirma que ClickbankPostback (v1.0.2+) [cite: Analisar feedback abaixo. Se necessário gerar v1.0.2 para colar com as alterações necessárias e no mesmo formato. Nenhuma funcionalidade deve ser perdida. Inserir no cabeçalho como comentário o nome, número e data para a versão para diferenciar das anteriores.] é importado.
+ * Alterações v1.0.2 (baseado no feedback):
+ * - Adiciona "airbag" (fallback 200 OK) se um handler for executado
+ * sem erros, mas esquecer de enviar uma resposta.
+ * - Mantém log de debug da v1.0.1.
  */
 
 // Importa os handlers específicos da plataforma
+//
 const DigistorePostback = require('./DigistorePostback');
-const ClickbankPostback = require('./ClickbankPostback');
+// const ClickbankPostback = require('./ClickbankPostback'); // Descomente quando estiver pronto
 // const BuygoodsPostback = require('./BuygoodsPostback');   // Futuro
 
 /**
@@ -21,9 +23,13 @@ const ClickbankPostback = require('./ClickbankPostback');
  */
 const handlers = {
   'digistore24': DigistorePostback.handle,
-  'clickbank': ClickbankPostback.handle,
   
   // Stubs para plataformas futuras (retornam 200 OK para evitar retries)
+  //
+  'clickbank': async (req, res) => {
+    console.warn(`[PostbackRouter] Plataforma 'clickbank' recebida, mas o handler ainda é um stub.`);
+    res.status(200).send('OK (stub)'); 
+  },
   'buygoods': async (req, res) => {
     console.warn(`[PostbackRouter] Plataforma 'buygoods' recebida, mas o handler ainda é um stub.`);
     res.status(200).send('OK (stub)');
@@ -39,6 +45,7 @@ async function handle(req, res) {
   const platform = String(req.params.platform || 'unknown').toLowerCase();
   const handler = handlers[platform];
 
+  // Log de debug (v1.0.1)
   if (process.env.NODE_ENV !== 'production') {
     console.log(`[PostbackRouter] Webhook recebido para plataforma: ${platform}`);
   }
@@ -52,17 +59,23 @@ async function handle(req, res) {
     // Delega o trabalho para o handler específico (ex: DigistorePostback.handle)
     await handler(req, res);
     
-    // "Airbag" de segurança (v1.0.2)
+    // --- Alteração v1.0.2: "Airbag" de segurança ---
+    // Se o handler foi executado com sucesso (não deu erro), mas
+    // esqueceu de enviar uma resposta, enviamos um 200 OK para
+    // impedir que a plataforma (ex: Digistore) fique tentando de novo.
     if (!res.headersSent) {
       console.warn(`[PostbackRouter] Handler para '${platform}' não enviou resposta. Enviando 200 OK por segurança (fallback).`);
       res.status(200).send('OK (router fallback)');
     }
+    // --- Fim da Alteração v1.0.2 ---
 
   } catch (error) {
     // Pega erros catastróficos que o handler possa ter deixado vazar
     console.error(`[PostbackRouter] Erro CRÍTICO no handler da plataforma '${platform}':`, error.message);
     
+    // Garante que o webhook receba uma resposta para evitar retries
     if (!res.headersSent) {
+      // 500 porque o erro é no nosso servidor
       res.status(500).send('Internal Server Error');
     }
   }
