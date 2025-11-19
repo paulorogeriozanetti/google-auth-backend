@@ -1,15 +1,20 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.1 (Smart Parsing + Canonical Offer ID + Legacy Return Mode) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.2 (Smart Parsing + Canonical Offer ID + Legacy/Rich Return Override) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.4.1
+ * Nome/Versão: ClickbankAdapter v1.4.2
  * Data: 2025-11-19
  *
- * Alterações vs v1.4.0:
+ * Alterações vs v1.4.1:
  * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
- * - Introduz CB_RETURN_MODE (legacy|rich). Por omissão = legacy (compatível com v1.3.4):
- *     • legacy → retorna string ou string[] como antes.
+ * - Mantém CB_RETURN_MODE (legacy|rich) como default global.
+ * - Adiciona override por chamada:
+ *     • offerData.return_mode ou offerData.returnMode podem forçar "legacy" ou "rich" por request.
+ *
+ * Alterações vs v1.4.0:
+ * - Mantém modo de retorno dual:
+ *     • legacy → retorna string ou string[] (compatível com v1.3.4).
  *     • rich   → retorna objeto { offers, primaryOffer, raw_count }.
- * - Não descarta mais ofertas sem vendor/cbitems: _normalizeClickbankOffer nunca é filtro.
+ * - Não descarta ofertas sem vendor/cbitems: _normalizeClickbankOffer nunca é filtro.
  *
  * Alterações vs v1.3.4-DR6f:
  * - Mantém: scrape robusto (Cheerio), injeção data-driven de params, HMAC webhook, AES, etc.
@@ -63,12 +68,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.4.1';
+    this.version = '1.4.2';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
     this.SCRAPER_MODE = String(process.env.CB_SCRAPER_MODE || 'off').toLowerCase();
-    // NEW: modo de retorno (legacy|string[] ou rich|obj)
+    // Modo de retorno default (pode ser sobreposto por chamada)
     this.RETURN_MODE = String(process.env.CB_RETURN_MODE || 'legacy').toLowerCase();
 
     this.PARAM_MAP_URL =
@@ -83,7 +88,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
         : resolved;
 
     console.log(
-      `${this.logPrefix} Scraper Mode: ${this.SCRAPER_MODE} | Return Mode: ${this.RETURN_MODE}`
+      `${this.logPrefix} Scraper Mode: ${this.SCRAPER_MODE} | Default Return Mode: ${this.RETURN_MODE}`
     );
   }
 
@@ -94,8 +99,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
   /**
    * Retorna:
    *  - SCRAPER_MODE != 'on'  → string (hoplink data-driven, legado).
-   *  - SCRAPER_MODE == 'on' e CB_RETURN_MODE=legacy → string[] (same v1.3.4).
-   *  - SCRAPER_MODE == 'on' e CB_RETURN_MODE=rich   → { offers, primaryOffer, raw_count }.
+   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'legacy' → string[] (same v1.3.4).
+   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'rich'   → { offers, primaryOffer, raw_count }.
+   *
+   * O return_mode efetivo é decidido por:
+   *   offerData.return_mode / offerData.returnMode  (se válido)
+   *   senão, this.RETURN_MODE (CB_RETURN_MODE)      (default global)
    *
    * @returns {Promise<string | string[] | {offers: Object[], primaryOffer?: Object, raw_count: number} | null>}
    */
@@ -104,6 +113,18 @@ class ClickbankAdapter extends PlatformAdapterBase {
     if (!baseUrl) {
       console.warn(`${this.logPrefix} 'hoplink' ausente no offerData.`);
       return null;
+    }
+
+    // Decide o modo de retorno efetivo (por chamada)
+    let callReturnMode =
+      offerData.return_mode ||
+      offerData.returnMode ||
+      this.RETURN_MODE ||
+      'legacy';
+
+    callReturnMode = String(callReturnMode).toLowerCase();
+    if (callReturnMode !== 'rich' && callReturnMode !== 'legacy') {
+      callReturnMode = 'legacy';
     }
 
     // 1) Regras CSV (fonte única) com fallback heurístico
@@ -134,7 +155,10 @@ class ClickbankAdapter extends PlatformAdapterBase {
         import('cheerio'),
       ]);
 
-      console.log(`${this.logPrefix} Scraping: ${trackedHoplink}`);
+      console.log(
+        `${this.logPrefix} Scraping: ${trackedHoplink} | Return Mode (effective): ${callReturnMode}`
+      );
+
       const resp = await axios.get(trackedHoplink, {
         headers: {
           'User-Agent':
@@ -195,11 +219,11 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
       // --- INÍCIO DA LÓGICA v1.4.x (Smart Parsing + Canonical ID) ---
 
-      // 1) Injeta params em todas as URLs ClickBank encontradas
+      // 1) Injeta params em todas as URLs ClickBank encontradas e normaliza
       const normalizedOffers = Array.from(foundUrls)
         .map((u) => this._appendParamsToUrl(u, paramsData))
         .filter(Boolean)
-        .map((u) => this._normalizeClickbankOffer(u)); // NÃO filtra por vendor/cbitems aqui
+        .map((u) => this._normalizeClickbankOffer(u)); // nunca filtra aqui
 
       if (normalizedOffers.length > 0) {
         console.log(
@@ -207,7 +231,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
         );
 
         // Modo "rich": objeto estruturado
-        if (this.RETURN_MODE === 'rich') {
+        if (callReturnMode === 'rich') {
           const primaryOffer =
             normalizedOffers.find((o) => o && o.offer_id) || normalizedOffers[0];
 
@@ -224,14 +248,16 @@ class ClickbankAdapter extends PlatformAdapterBase {
           .filter((u) => typeof u === 'string' && u.length > 0);
 
         if (urls.length > 0) {
-          // Opcional: se quiser imitar exatamente a v1.3.4, poderia limitar a 3: urls.slice(0,3)
+          // Se quiser, pode limitar a 3 aqui para mimetizar v1.3.4: return urls.slice(0, 3);
           return urls;
         }
       }
 
       // --- FIM DA LÓGICA v1.4.x ---
 
-      console.warn(`${this.logPrefix} SCRAPE não encontrou links válidos. Fallback hoplink (string).`);
+      console.warn(
+        `${this.logPrefix} SCRAPE não encontrou links válidos. Fallback hoplink (string).`
+      );
       return trackedHoplink;
     } catch (e) {
       console.error(`${this.logPrefix} Erro no SCRAPER:`, e?.message || e);
@@ -242,7 +268,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
   /**
    * Analisa uma URL final do ClickBank e extrai metadados.
    * Padrão ID canónico: clickbank:<vendor>:<cbitems>
-   * (Introduzido em v1.4.0, mantido e usado em v1.4.1)
    */
   _normalizeClickbankOffer(urlStr) {
     try {
