@@ -1,19 +1,23 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.2 (Smart Parsing + Canonical Offer ID + Legacy/Rich Return Override) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.3 (Smart Parsing + Canonical Offer ID + Rich Fallback) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.4.2
- * Data: 2025-11-19
+ * Nome/Versão: ClickbankAdapter v1.4.3
+ * Data: 2025-11-20
  *
- * Alterações vs v1.4.1:
+ * Alterações vs v1.4.2:
  * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
- * - Mantém CB_RETURN_MODE (legacy|rich) como default global.
- * - Adiciona override por chamada:
- *     • offerData.return_mode ou offerData.returnMode podem forçar "legacy" ou "rich" por request.
+ * - Mantém CB_RETURN_MODE (legacy|rich) + override por chamada (offerData.return_mode / returnMode).
+ * - Ajusta fallback do SCRAPER:
+ *     • Quando SCRAPER_MODE='on' e return_mode efetivo='rich', NUNCA retorna string.
+ *       - Se não encontrar links pay.clickbank/clkbank → retorna objeto rico com o hoplink normalizado
+ *         { offers:[...], primaryOffer, raw_count, fallback_reason:'scrape_empty' }.
+ *       - Se ocorrer erro no scrape → idem com fallback_reason:'scrape_error' + error_message.
+ * - Torna regex de captura mais permissiva para URLs //pay.clickbank.net sem protocolo.
  *
- * Alterações vs v1.4.0:
+ * Alterações vs v1.4.0/1.4.1:
  * - Mantém modo de retorno dual:
- *     • legacy → retorna string ou string[] (compatível com v1.3.4).
- *     • rich   → retorna objeto { offers, primaryOffer, raw_count }.
+ *     • legacy → retorna string ou string[] (compatível com v1.3.4-DR6f).
+ *     • rich   → retorna objeto { offers, primaryOffer, raw_count, ... }.
  * - Não descarta ofertas sem vendor/cbitems: _normalizeClickbankOffer nunca é filtro.
  *
  * Alterações vs v1.3.4-DR6f:
@@ -68,7 +72,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.4.2';
+    this.version = '1.4.3';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -100,7 +104,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    * Retorna:
    *  - SCRAPER_MODE != 'on'  → string (hoplink data-driven, legado).
    *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'legacy' → string[] (same v1.3.4).
-   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'rich'   → { offers, primaryOffer, raw_count }.
+   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'rich'   → { offers, primaryOffer, raw_count, ... }.
    *
    * O return_mode efetivo é decidido por:
    *   offerData.return_mode / offerData.returnMode  (se válido)
@@ -209,11 +213,14 @@ class ClickbankAdapter extends PlatformAdapterBase {
         .get()
         .join('\n');
       const bodyText = `${html}\n${scripts}`;
+
+      // Regex mais permissiva: aceita http(s):// e também //pay.clickbank.net...
       const urlRegex =
-        /\bhttps?:\/\/[^\s"'<>]+?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*/gi;
+        /((?:https?:)?\/\/[^\s"'<>]*?(?:pay\.clickbank\.net|clkbank\.com)[^\s"'<>]*)/gi;
+
       let m;
       while ((m = urlRegex.exec(bodyText)) !== null) {
-        const abs = toAbs(m[0]);
+        const abs = toAbs(m[1] || m[0]);
         if (abs && isCb(abs)) foundUrls.add(abs);
       }
 
@@ -255,12 +262,38 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
       // --- FIM DA LÓGICA v1.4.x ---
 
-      console.warn(
-        `${this.logPrefix} SCRAPE não encontrou links válidos. Fallback hoplink (string).`
-      );
+      console.warn(`${this.logPrefix} SCRAPE não encontrou links válidos.`);
+
+      // Fallback específico para modo "rich": devolve estrutura rica mesmo sem pay.clickbank
+      if (callReturnMode === 'rich') {
+        const normalized = this._normalizeClickbankOffer(trackedHoplink);
+        return {
+          offers: [normalized],
+          primaryOffer: normalized,
+          raw_count: 1,
+          fallback_reason: 'scrape_empty',
+        };
+      }
+
+      // Modo legacy mantém comportamento antigo (string)
+      console.warn(`${this.logPrefix} Fallback hoplink (string) em modo legacy.`);
       return trackedHoplink;
     } catch (e) {
       console.error(`${this.logPrefix} Erro no SCRAPER:`, e?.message || e);
+
+      // Em modo rich, nunca retornamos string: devolve estrutura rica com fallback
+      if (callReturnMode === 'rich') {
+        const normalized = this._normalizeClickbankOffer(trackedHoplink);
+        return {
+          offers: [normalized],
+          primaryOffer: normalized,
+          raw_count: 1,
+          fallback_reason: 'scrape_error',
+          error_message: e?.message || String(e),
+        };
+      }
+
+      // Legacy: mantém compat, retorna hoplink string
       return trackedHoplink;
     }
   }
