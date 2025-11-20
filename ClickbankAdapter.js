@@ -1,20 +1,22 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.3 (Smart Parsing + Canonical Offer ID + Rich Fallback) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.4 (Smart Parsing + Canonical Offer ID + Vendor-Aware Multi-Offer Scrape) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.4.3
+ * Nome/Versão: ClickbankAdapter v1.4.4
  * Data: 2025-11-20
  *
- * Alterações vs v1.4.2:
+ * Alterações vs v1.4.3:
  * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
  * - Mantém CB_RETURN_MODE (legacy|rich) + override por chamada (offerData.return_mode / returnMode).
- * - Ajusta fallback do SCRAPER:
- *     • Quando SCRAPER_MODE='on' e return_mode efetivo='rich', NUNCA retorna string.
- *       - Se não encontrar links pay.clickbank/clkbank → retorna objeto rico com o hoplink normalizado
- *         { offers:[...], primaryOffer, raw_count, fallback_reason:'scrape_empty' }.
- *       - Se ocorrer erro no scrape → idem com fallback_reason:'scrape_error' + error_message.
- * - Torna regex de captura mais permissiva para URLs //pay.clickbank.net sem protocolo.
+ * - Torna o scraper "vendor-aware":
+ *     • Extrai o vendor do HTML (window.clickbank.vendor ou cbtb.clickbank.net/?vendor=...).
+ *     • Usa o vendor para montar host <vendor>.pay.clickbank.net e procurar links com cbitems=,
+ *       mesmo quando aparecem como URLs relativas ("/?cbitems=1&...") ou sem protocolo.
+ *     • Complementa a varredura base (DOM + regex pay.clickbank/clkbank) com uma varredura
+ *       específica de href/src contendo "cbitems=".
+ * - Mantém fallback rico em modo 'rich' quando não houver links pay.clickbank/clkbank:
+ *     • { offers:[...], primaryOffer, raw_count, fallback_reason:'scrape_empty'|'scrape_error', ... }.
  *
- * Alterações vs v1.4.0/1.4.1:
+ * Alterações vs v1.4.0/1.4.2:
  * - Mantém modo de retorno dual:
  *     • legacy → retorna string ou string[] (compatível com v1.3.4-DR6f).
  *     • rich   → retorna objeto { offers, primaryOffer, raw_count, ... }.
@@ -72,7 +74,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.4.3';
+    this.version = '1.4.4';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -178,8 +180,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
       const $ = cheerio.load(html);
       const base = resp.request?.res?.responseUrl || trackedHoplink;
 
+      // Tenta extrair vendor do HTML (window.clickbank.vendor / cbtb.clickbank.net/?vendor=...)
+      const vendorFromHtml = this._extractVendorFromHtml(html);
+      const vendorHost = vendorFromHtml ? `${vendorFromHtml}.pay.clickbank.net` : null;
+
+      const CB_HOSTS_BASE = ['pay.clickbank.net', 'clkbank.com'];
+      const CB_HOSTS = vendorHost ? [...CB_HOSTS_BASE, vendorHost] : CB_HOSTS_BASE;
       const CANDIDATES = ['a[href]', 'form[action]', 'iframe[src]', 'area[href]'];
-      const CB_HOSTS = ['pay.clickbank.net', 'clkbank.com'];
       const foundUrls = new Set();
 
       const toAbs = (u) => {
@@ -191,14 +198,17 @@ class ClickbankAdapter extends PlatformAdapterBase {
       };
       const isCb = (url) => {
         try {
-          const h = new URL(url).hostname;
-          return CB_HOSTS.some((p) => h.includes(p));
+          const h = new URL(url).hostname.toLowerCase();
+          return CB_HOSTS.some((p) => {
+            const hp = p.toLowerCase();
+            return h === hp || h.endsWith(`.${hp}`);
+          });
         } catch {
           return false;
         }
       };
 
-      // Varredura DOM
+      // Varredura DOM (anchors, forms, iframes, areas)
       for (const sel of CANDIDATES) {
         $(sel).each((_, el) => {
           const raw = $(el).attr('href') || $(el).attr('action') || $(el).attr('src');
@@ -207,7 +217,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
         });
       }
 
-      // Varredura Regex (fallback para scripts, etc.)
+      // Varredura Regex (fallback para scripts, etc.) em todo o HTML + scripts
       const scripts = $('script')
         .map((_, s) => $(s).html() || '')
         .get()
@@ -222,6 +232,35 @@ class ClickbankAdapter extends PlatformAdapterBase {
       while ((m = urlRegex.exec(bodyText)) !== null) {
         const abs = toAbs(m[1] || m[0]);
         if (abs && isCb(abs)) foundUrls.add(abs);
+      }
+
+      // Varredura específica vendor-aware para cbitems= (URLs absolutas ou relativas)
+      if (vendorHost) {
+        try {
+          const relRegex = /(href|src)\s*=\s*["']([^"']*cbitems=[^"']*)["']/gi;
+          let m2;
+          while ((m2 = relRegex.exec(html)) !== null) {
+            const raw = m2[2] || '';
+            let abs = null;
+
+            if (/^https?:\/\//i.test(raw) || raw.startsWith('//')) {
+              abs = toAbs(raw);
+            } else {
+              // Trata como relativo para <vendor>.pay.clickbank.net
+              const path = raw.startsWith('/') ? raw : `/${raw}`;
+              abs = `https://${vendorHost}${path}`;
+            }
+
+            if (abs && isCb(abs)) {
+              foundUrls.add(abs);
+            }
+          }
+        } catch (err) {
+          console.warn(
+            `${this.logPrefix} Erro na coleta vendor/cbitems (vendor-aware scraping):`,
+            err?.message || err
+          );
+        }
       }
 
       // --- INÍCIO DA LÓGICA v1.4.x (Smart Parsing + Canonical ID) ---
@@ -340,6 +379,37 @@ class ClickbankAdapter extends PlatformAdapterBase {
     } catch (e) {
       return { url: urlStr, offer_id: null, error: e.message };
     }
+  }
+
+  /**
+   * Extrai vendor do HTML:
+   * - window.clickbank = { vendor: "puraboost", ... }
+   * - <script src="//cbtb.clickbank.net/?vendor=puraboost">
+   */
+  _extractVendorFromHtml(html = '') {
+    if (!html || typeof html !== 'string') return null;
+
+    try {
+      // Primeiro tenta via window.clickbank.vendor
+      const windowMatch = html.match(
+        /window\.clickbank\s*=\s*{[^}]*vendor\s*:\s*["']([^"']+)["']/i
+      );
+      if (windowMatch && windowMatch[1]) {
+        return windowMatch[1].toLowerCase();
+      }
+    } catch (_) {}
+
+    try {
+      // Depois tenta via cbtb.clickbank.net/?vendor=...
+      const cbtbMatch = html.match(
+        /cbtb\.clickbank\.net\/\?[^"'<>]*\bvendor=([a-zA-Z0-9_-]+)/i
+      );
+      if (cbtbMatch && cbtbMatch[1]) {
+        return cbtbMatch[1].toLowerCase();
+      }
+    } catch (_) {}
+
+    return null;
   }
 
   /**
