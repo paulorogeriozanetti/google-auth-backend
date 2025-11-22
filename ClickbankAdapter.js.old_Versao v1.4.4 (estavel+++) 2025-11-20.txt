@@ -1,25 +1,13 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.5.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.4.4 (Smart Parsing + Canonical Offer ID + Vendor-Aware Multi-Offer Scrape) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.5.0
- * Data: 2025-11-22
+ * Nome/Versão: ClickbankAdapter v1.4.4
+ * Data: 2025-11-20
  *
- * Alterações vs v1.4.4:
+ * Alterações vs v1.4.3:
  * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
- * - Continua suportando CB_RETURN_MODE (legacy|rich) + override por chamada.
- * - Amplia o scraper para ser "productID-aware":
- *     • Além de pay.clickbank/clkbank e cbitems (vendor-aware), agora detecta URLs
- *       com productID=... em landers de vendor (ex.: endopumpsecret.com/...productID=500001).
- *     • Quando encontrar productID e souber o vendor (offerData.vendor ou HTML),
- *       monta uma URL canónica https://<vendor>.pay.clickbank.net/?cbitems=<productID>.
- * - _normalizeClickbankOffer passa a expor opcionalmente template_params
- *   (cbfid, cbskin, template, exitoffer) extraídos da querystring.
- *   Isso permite que camadas superiores apliquem defaults (pz_offer_map.csv)
- *   apenas quando template_params for null.
- *
- * Alterações herdadas de v1.4.x:
  * - Mantém CB_RETURN_MODE (legacy|rich) + override por chamada (offerData.return_mode / returnMode).
- * - Mantém o scraper "vendor-aware":
+ * - Torna o scraper "vendor-aware":
  *     • Extrai o vendor do HTML (window.clickbank.vendor ou cbtb.clickbank.net/?vendor=...).
  *     • Usa o vendor para montar host <vendor>.pay.clickbank.net e procurar links com cbitems=,
  *       mesmo quando aparecem como URLs relativas ("/?cbitems=1&...") ou sem protocolo.
@@ -28,7 +16,13 @@ console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.5.0 (Smart Parsing + C
  * - Mantém fallback rico em modo 'rich' quando não houver links pay.clickbank/clkbank:
  *     • { offers:[...], primaryOffer, raw_count, fallback_reason:'scrape_empty'|'scrape_error', ... }.
  *
- * Alterações herdadas vs v1.3.4-DR6f:
+ * Alterações vs v1.4.0/1.4.2:
+ * - Mantém modo de retorno dual:
+ *     • legacy → retorna string ou string[] (compatível com v1.3.4-DR6f).
+ *     • rich   → retorna objeto { offers, primaryOffer, raw_count, ... }.
+ * - Não descarta ofertas sem vendor/cbitems: _normalizeClickbankOffer nunca é filtro.
+ *
+ * Alterações vs v1.3.4-DR6f:
  * - Mantém: scrape robusto (Cheerio), injeção data-driven de params, HMAC webhook, AES, etc.
  * - Adiciona: offer_id canónico clickbank:<vendor>:<cbitems> e metadata por oferta.
  */
@@ -80,7 +74,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.5.0';
+    this.version = '1.4.4';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -186,26 +180,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
       const $ = cheerio.load(html);
       const base = resp.request?.res?.responseUrl || trackedHoplink;
 
-      // Conjunto de productID encontrados (para montar URLs canónicas)
-      const productIds = new Set();
-
       // Tenta extrair vendor do HTML (window.clickbank.vendor / cbtb.clickbank.net/?vendor=...)
       const vendorFromHtml = this._extractVendorFromHtml(html);
-      const vendorFromOfferData =
-        offerData && offerData.vendor ? String(offerData.vendor).trim().toLowerCase() : null;
+      const vendorHost = vendorFromHtml ? `${vendorFromHtml}.pay.clickbank.net` : null;
 
-      const vendorHostHtml = vendorFromHtml ? `${vendorFromHtml}.pay.clickbank.net` : null;
-      const vendorHostOffer = vendorFromOfferData
-        ? `${vendorFromOfferData}.pay.clickbank.net`
-        : null;
-
-      const cbHostsSet = new Set(['pay.clickbank.net', 'clkbank.com']);
-      if (vendorHostHtml) cbHostsSet.add(vendorHostHtml);
-      if (vendorHostOffer) cbHostsSet.add(vendorHostOffer);
-      const CB_HOSTS = Array.from(cbHostsSet);
-
-      const vendorHost = vendorHostHtml || vendorHostOffer;
-
+      const CB_HOSTS_BASE = ['pay.clickbank.net', 'clkbank.com'];
+      const CB_HOSTS = vendorHost ? [...CB_HOSTS_BASE, vendorHost] : CB_HOSTS_BASE;
       const CANDIDATES = ['a[href]', 'form[action]', 'iframe[src]', 'area[href]'];
       const foundUrls = new Set();
 
@@ -228,35 +208,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
         }
       };
 
-      const collectProductIdFromRaw = (raw) => {
-        if (!raw || !/productid=/i.test(raw)) return;
-        try {
-          const abs = toAbs(raw);
-          if (!abs) return;
-          const u = new URL(abs);
-          const pId =
-            u.searchParams.get('productID') ||
-            u.searchParams.get('productId') ||
-            u.searchParams.get('productid');
-          if (pId) {
-            productIds.add(pId);
-          }
-        } catch (_) {
-          // ignora URLs mal-formadas
-        }
-      };
-
       // Varredura DOM (anchors, forms, iframes, areas)
       for (const sel of CANDIDATES) {
         $(sel).each((_, el) => {
           const raw = $(el).attr('href') || $(el).attr('action') || $(el).attr('src');
           const abs = toAbs(raw);
           if (abs && isCb(abs)) foundUrls.add(abs);
-
-          // NEW v1.5.0: captura productID=... em links/forms/iframes/áreas
-          if (raw && /productid=/i.test(raw)) {
-            collectProductIdFromRaw(raw);
-          }
         });
       }
 
@@ -275,21 +232,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
       while ((m = urlRegex.exec(bodyText)) !== null) {
         const abs = toAbs(m[1] || m[0]);
         if (abs && isCb(abs)) foundUrls.add(abs);
-      }
-
-      // Extra: captura productID=... em textos/scripts (URLs completas)
-      try {
-        const productRegex = /((?:https?:)?\/\/[^\s"'<>]*?productid=\d+[^\s"'<>]*)/gi;
-        let pm;
-        while ((pm = productRegex.exec(bodyText)) !== null) {
-          const raw = pm[1] || pm[0];
-          collectProductIdFromRaw(raw);
-        }
-      } catch (err) {
-        console.warn(
-          `${this.logPrefix} Erro na coleta de URLs com productID via regex:`,
-          err?.message || err
-        );
       }
 
       // Varredura específica vendor-aware para cbitems= (URLs absolutas ou relativas)
@@ -317,32 +259,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
           console.warn(
             `${this.logPrefix} Erro na coleta vendor/cbitems (vendor-aware scraping):`,
             err?.message || err
-          );
-        }
-      }
-
-      // NEW v1.5.0: constrói URLs canónicas a partir de productID=..., quando soubermos o vendor
-      if (productIds.size > 0) {
-        const vendorForProductId = vendorFromOfferData || vendorFromHtml || null;
-        if (vendorForProductId) {
-          for (const pid of productIds) {
-            try {
-              const cbUrl = new URL(`https://${vendorForProductId}.pay.clickbank.net/`);
-              cbUrl.searchParams.set('cbitems', pid);
-              const abs = cbUrl.toString();
-              if (abs && isCb(abs)) {
-                foundUrls.add(abs);
-              }
-            } catch (err) {
-              console.warn(
-                `${this.logPrefix} Erro ao montar URL canónica para productID=${pid}:`,
-                err?.message || err
-              );
-            }
-          }
-        } else {
-          console.warn(
-            `${this.logPrefix} Foram encontrados productID=..., mas não foi possível determinar o vendor (nem via offerData.vendor nem via HTML).`
           );
         }
       }
@@ -424,9 +340,6 @@ class ClickbankAdapter extends PlatformAdapterBase {
   /**
    * Analisa uma URL final do ClickBank e extrai metadados.
    * Padrão ID canónico: clickbank:<vendor>:<cbitems>
-   *
-   * NEW v1.5.0:
-   * - Passa a expor template_params com { cbfid, cbskin, template, exitoffer } quando existirem.
    */
   _normalizeClickbankOffer(urlStr) {
     try {
@@ -455,27 +368,12 @@ class ClickbankAdapter extends PlatformAdapterBase {
         offer_id = `clickbank:${vendor}:${cbitems}`;
       }
 
-      // 3. Extrair parâmetros de template relevantes (cbfid, cbskin, template, exitoffer)
-      const templateParams = {};
-      const cbfid = url.searchParams.get('cbfid');
-      const cbskin = url.searchParams.get('cbskin');
-      const template = url.searchParams.get('template');
-      const exitoffer = url.searchParams.get('exitoffer');
-
-      if (cbfid) templateParams.cbfid = cbfid;
-      if (cbskin) templateParams.cbskin = cbskin;
-      if (template) templateParams.template = template;
-      if (exitoffer) templateParams.exitoffer = exitoffer;
-
-      const hasTemplateParams = Object.keys(templateParams).length > 0;
-
       return {
         url: urlStr,
         affiliate_platform: 'clickbank',
         vendor: vendor || null,
         sku: cbitems || null,
         offer_id: offer_id, // pode ser null se não identificável
-        template_params: hasTemplateParams ? templateParams : null,
         // params: Object.fromEntries(url.searchParams) // manter comentado para não inchar payload
       };
     } catch (e) {

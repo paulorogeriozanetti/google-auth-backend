@@ -1,15 +1,12 @@
 /**
  * PZ Advisors - ParamMapLoaderCsv
- * Versão: v1.3.0 (Dynamic platform columns + HTTP fetch cache)
- * Data: 2025-11-22
+ * Versão: v1.2.0 (HTTP fetch + ETag/Last-Modified cache + Refresh)
+ * Data: 2025-11-05
  * Descrição:
- * - Mantém leitura de pz_parameter_map.csv a partir de UMA fonte oficial (WordPress) via HTTP(S),
+ * - Lê pz_parameter_map.csv a partir de UMA fonte oficial (WordPress) via HTTP(S),
  *   quando PZ_PARAM_MAP_PATH (ou PZ_PARAM_MAP_URL) começar com http/https.
  * - Mantém suporte a caminho local (fs) como fallback técnico (ex.: ambientes de dev offline).
  * - Cache em memória com ETag/Last-Modified e janela de refresh configurável.
- * - NOVO: detecção dinâmica de colunas "*_id_parameter" com base no cabeçalho do CSV.
- *   - Se a coluna "<platform>_id_parameter" existir no CSV, ela é usada mesmo que não esteja na lista fixa.
- *   - A lista `_platformColumns` permanece como fallback para compatibilidade.
  * - Mantém a mesma API pública das versões anteriores.
  */
 
@@ -21,7 +18,7 @@ const { URL: URLCtor } = require('url');
 
 class ParamMapLoaderCsv {
   constructor(csvPath) {
-    this.version = '1.3.0';
+    this.version = '1.2.0';
     this.logPrefix = `[ParamMapLoaderCsv v${this.version}]`;
 
     const envUrl = process.env.PZ_PARAM_MAP_URL || process.env.PZ_PARAM_MAP_PATH;
@@ -32,10 +29,6 @@ class ParamMapLoaderCsv {
     this._mtimeMs = null; // apenas para caminho local
     this._headers = null;
     this._byPzId = {};
-
-    // Colunas "conhecidas" por legado.
-    // A partir desta versão, a presença no cabeçalho do CSV passa a ser o critério principal:
-    // se existir "<platform>_id_parameter" no header, será usada mesmo que não conste aqui.
     this._platformColumns = [
       'digistore24_id_parameter',
       'clickbank_id_parameter',
@@ -67,22 +60,10 @@ class ParamMapLoaderCsv {
 
   // ---------------- API Pública ----------------
 
-  /**
-   * Retorna o nome da coluna "<platform>_id_parameter" se:
-   * - Ela existir no cabeçalho do CSV (prioridade), ou
-   * - Estiver na lista de colunas conhecidas (_platformColumns) como fallback.
-   */
   getPlatformColumn(platform) {
     if (!platform) return null;
     const p = String(platform).toLowerCase();
     const col = `${p}_id_parameter`;
-
-    // 1) Preferência: cabeçalho real do CSV
-    if (Array.isArray(this._headers) && this._headers.includes(col)) {
-      return col;
-    }
-
-    // 2) Fallback legado (lista fixa)
     return this._platformColumns.includes(col) ? col : null;
   }
 
@@ -110,7 +91,7 @@ class ParamMapLoaderCsv {
   mapTrackingToPlatform(trackingParams = {}, platform) {
     const col = this.getPlatformColumn(platform);
     if (!col) {
-      console.warn(`${this.logPrefix} Plataforma não suportada ou coluna não encontrada: ${platform}`);
+      console.warn(`${this.logPrefix} Plataforma não suportada: ${platform}`);
       return {};
     }
     const query = {};
@@ -255,12 +236,12 @@ class ParamMapLoaderCsv {
 
   _applyRawCsv(raw) {
     const { headers, rows } = this._parseCsvSemicolon(raw);
-    this._headers = headers || [];
-    this._cache = rows || [];
+    this._headers = headers;
+    this._cache = rows;
 
     // index por pz_id_parameter
     this._byPzId = {};
-    for (const r of this._cache) {
+    for (const r of rows) {
       const pzId = r['pz_id_parameter'];
       if (!pzId) continue;
       r.status = String(r.status || '').toLowerCase().trim() === 'active' ? 'active' : 'inactive';
@@ -279,18 +260,11 @@ class ParamMapLoaderCsv {
     if (lines.length === 0) return { headers: [], rows: [] };
 
     const headerLine = lines[0];
-
-    // Auto-detecção simples de delimitador entre ';' e ','
-    // Escolhe o que tiver mais ocorrências na linha de cabeçalho.
-    const semicolons = (headerLine.match(/;/g) || []).length;
-    const commas = (headerLine.match(/,/g) || []).length;
-    const delimiter = semicolons >= commas ? ';' : ',';
-
-    const headers = this._splitSemicolon(headerLine, delimiter).map(h => this._normHeader(h));
+    const headers = this._splitSemicolon(headerLine).map(h => this._normHeader(h));
 
     const rows = [];
     for (let i = 1; i < lines.length; i++) {
-      const cols = this._splitSemicolon(lines[i], delimiter);
+      const cols = this._splitSemicolon(lines[i]);
       const row = {};
       headers.forEach((h, idx) => { row[h] = (cols[idx] ?? '').trim(); });
       rows.push(row);
@@ -298,7 +272,7 @@ class ParamMapLoaderCsv {
     return { headers, rows };
   }
 
-  _splitSemicolon(line, delimiter = ';') {
+  _splitSemicolon(line) {
     const out = [];
     let cur = '';
     let inQuotes = false;
@@ -312,7 +286,7 @@ class ParamMapLoaderCsv {
         else { inQuotes = !inQuotes; }
         continue;
       }
-      if (ch === delimiter && !inQuotes) {
+      if (ch === ';' && !inQuotes) {
         out.push(cur.trim());
         cur = '';
       } else {
