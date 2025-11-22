@@ -1,36 +1,29 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.9.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults + URL Injection) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.9.2 (Smart Parsing + Canonical Offer ID + Async Defaults + Warm-up Hardening) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.9.0
+ * Nome/Versão: ClickbankAdapter v1.9.2
  * Data: 2025-11-22
  *
+ * Alterações vs v1.9.1:
+ * - HARDENING: Melhoria na mitigação de "Race Condition" (Cold Start).
+ * • Adiciona try/catch ao acessar loader.getRow() durante o polling para evitar crash se o loader falhar internamente.
+ * • Adiciona log de diagnóstico (console.log) informando o tempo total de espera (warm-up) apenas quando houver delay real.
+ *
+ * Alterações vs v1.9.0:
+ * - FIX: Resolve "Race Condition" na carga inicial do OfferMapLoaderCsv.
+ * • O método _applyOfferMapTemplateDefaults agora é ASYNC e aguarda (polling)
+ * se o CSV ainda não tiver sido carregado na memória.
+ * • Atualiza chamadas em buildCheckoutUrl para usar 'await'.
+ *
  * Alterações vs v1.8.0:
- * - Corrige uso do OfferMapLoaderCsv (pz_offer_map.csv) para NÃO depender apenas de getClickbankDefaults:
- *     • Se existir loader.getClickbankDefaults(offer_id), usa.
- *     • Caso contrário, usa loader.getRow(offer_id) e extrai cb_default_cbfid/cb_default_cbskin/template/exitoffer.
+ * - Corrige uso do OfferMapLoaderCsv (pz_offer_map.csv) para NÃO depender apenas de getClickbankDefaults.
  * - Garante que os defaults são aplicados SOMENTE quando o offer tiver offer_id.
  * - Faz merge dos defaults com template_params vindos do scraping SEM sobrescrever o que já veio da URL.
- * - NOVO: injeta sempre cbfid/cbskin/template/exitoffer na URL final quando existirem em template_params
- *         (sem duplicar ou sobrescrever valores já presentes na querystring).
- *
- * Alterações vs v1.6.0–v1.7.0:
- * - Mantém integração com OfferMapLoaderCsv (pz_offer_map.csv) para preencher template_params
- *   (cbfid, cbskin, template, exitoffer) quando:
- *     • offer.offer_id existir (ex.: clickbank:endopump:500001) e
- *     • os valores não estiverem presentes no resultado do scraping.
+ * - NOVO: injeta sempre cbfid/cbskin/template/exitoffer na URL final quando existirem em template_params.
  *
  * Alterações herdadas vs v1.5.0:
- * - Scraper "productID-aware":
- *     • Além de pay.clickbank/clkbank e cbitems (vendor-aware), detecta URLs
- *       com productID=... em landers de vendor (ex.: endopumpsecret.com/...productID=500001).
- *     • Quando encontrar productID e souber o vendor (offerData.vendor ou HTML),
- *       monta uma URL canónica https://<vendor>.pay.clickbank.net/?cbitems=<productID>.
- * - _normalizeClickbankOffer expõe template_params
- *   (cbfid, cbskin, template, exitoffer) extraídos da querystring.
- *
- * Alterações herdadas vs v1.3.4-DR6f:
- * - Mantém: scrape robusto (Cheerio), injeção data-driven de params, HMAC webhook, AES, etc.
- * - Adiciona: offer_id canónico clickbank:<vendor>:<cbitems> e metadata por oferta.
+ * - Scraper "productID-aware" e suporte a canonical offer ID.
+ * - Exposição de template_params normalizados.
  */
 
 const crypto = require('crypto');
@@ -80,7 +73,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.9.0';
+    this.version = '1.9.2';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -107,19 +100,26 @@ class ClickbankAdapter extends PlatformAdapterBase {
     );
   }
 
+  /**
+   * Helper simples para pausa assíncrona (sleep)
+   */
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   // =========================================================
   // ===============  BUILD CHECKOUT (DATA-DRIVEN) ===========
   // =========================================================
 
   /**
    * Retorna:
-   *  - SCRAPER_MODE != 'on'  → string (hoplink data-driven, legado).
-   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'legacy' → string[] (same v1.3.4).
-   *  - SCRAPER_MODE == 'on' e return_mode efetivo = 'rich'   → { offers, primaryOffer, raw_count, ... }.
+   * - SCRAPER_MODE != 'on'  → string (hoplink data-driven, legado).
+   * - SCRAPER_MODE == 'on' e return_mode efetivo = 'legacy' → string[] (same v1.3.4).
+   * - SCRAPER_MODE == 'on' e return_mode efetivo = 'rich'   → { offers, primaryOffer, raw_count, ... }.
    *
    * O return_mode efetivo é decidido por:
-   *   offerData.return_mode / offerData.returnMode  (se válido)
-   *   senão, this.RETURN_MODE (CB_RETURN_MODE)      (default global)
+   * offerData.return_mode / offerData.returnMode  (se válido)
+   * senão, this.RETURN_MODE (CB_RETURN_MODE)      (default global)
    *
    * @returns {Promise<string | string[] | {offers: Object[], primaryOffer?: Object, raw_count: number} | null>}
    */
@@ -359,7 +359,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
         .map((u) => this._normalizeClickbankOffer(u)); // nunca filtra aqui
 
       // 2) Aplica defaults de template (pz_offer_map.csv) + injeta na URL final
-      const normalizedOffers = this._applyOfferMapTemplateDefaults(normalizedOffersRaw);
+      // [UPDATED v1.9.x] Adicionado await para suportar polling em cold start
+      const normalizedOffers = await this._applyOfferMapTemplateDefaults(normalizedOffersRaw);
 
       if (normalizedOffers.length > 0) {
         console.log(
@@ -396,7 +397,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Fallback específico para modo "rich": devolve estrutura rica mesmo sem pay.clickbank
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
-        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
+        // [UPDATED v1.9.x] Adicionado await
+        const [normalizedWithDefaults] = await this._applyOfferMapTemplateDefaults([normalized]);
         return {
           offers: [normalizedWithDefaults],
           primaryOffer: normalizedWithDefaults,
@@ -414,7 +416,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Em modo rich, nunca retornamos string: devolve estrutura rica com fallback
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
-        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
+        // [UPDATED v1.9.x] Adicionado await
+        const [normalizedWithDefaults] = await this._applyOfferMapTemplateDefaults([normalized]);
         return {
           offers: [normalizedWithDefaults],
           primaryOffer: normalizedWithDefaults,
@@ -722,9 +725,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
   /**
    * Lazy require do OfferMapLoaderCsv + singleton.
    * Tenta:
-   *  - mod.default.getInstance()
-   *  - mod.getInstance()
-   *  - new mod()
+   * - mod.default.getInstance()
+   * - mod.getInstance()
+   * - new mod()
    */
   _getOfferMapLoaderInstance() {
     if (this._offerMapLoader) return this._offerMapLoader;
@@ -763,8 +766,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
    * a partir do OfferMapLoaderCsv.
    *
    * Preferências:
-   *  - Se existir loader.getClickbankDefaults(offerId), usa diretamente.
-   *  - Caso contrário, usa loader.getRow(offerId) e extrai colunas cb_default_*.
+   * - Se existir loader.getClickbankDefaults(offerId), usa diretamente.
+   * - Caso contrário, usa loader.getRow(offerId) e extrai colunas cb_default_*.
    *
    * @param {string} offerId
    * @param {*} [loaderOverride]
@@ -869,19 +872,78 @@ class ClickbankAdapter extends PlatformAdapterBase {
    * e garante que esses parâmetros também apareçam na URL final.
    *
    * Regras:
-   *   - Só atua se offer.offer_id existir.
-   *   - NUNCA sobrescreve template_params vindos do scraping (prioridade absoluta).
-   *   - Usa OfferMapLoaderCsv para complementar apenas campos ausentes.
+   * - Só atua se offer.offer_id existir.
+   * - NUNCA sobrescreve template_params vindos do scraping (prioridade absoluta).
+   * - Usa OfferMapLoaderCsv para complementar apenas campos ausentes.
+   * - [v1.9.1] Realiza polling/wait se o CSV ainda não foi carregado.
+   * - [PATCH v1.9.2] Protege loader.getRow com try/catch e loga warm-up quando houver espera.
    *
    * @param {Array<Object>} offers
-   * @returns {Array<Object>} mesma referência de array, com objetos possivelmente enriquecidos
+   * @returns {Promise<Array<Object>>} mesma referência de array, com objetos possivelmente enriquecidos
    */
-  _applyOfferMapTemplateDefaults(offers) {
+  async _applyOfferMapTemplateDefaults(offers) {
     if (!Array.isArray(offers) || offers.length === 0) return offers;
 
     const loader = this._getOfferMapLoaderInstance();
     if (!loader) return offers;
 
+    // [FIX v1.9.1] Lógica de Polling para garantir carga do CSV
+    const firstOfferId = offers.find((o) => o && o.offer_id)?.offer_id;
+
+    if (firstOfferId) {
+      let attempts = 0;
+      const maxAttempts = 5; // ~2.5 segundos de tolerância
+      const warmupStart = Date.now();
+
+      while (attempts < maxAttempts) {
+        let hasRow = false;
+
+        // 1) Tenta usar getRow como proxy de "cache quente", mas protegido por try/catch
+        if (typeof loader.getRow === 'function') {
+          try {
+            const row = loader.getRow(firstOfferId);
+            if (row) {
+              hasRow = true;
+            }
+          } catch (err) {
+            console.warn(
+              `${this.logPrefix} Erro em loader.getRow(${firstOfferId}) durante warm-up:`,
+              err?.message || err
+            );
+          }
+        }
+
+        if (hasRow) {
+          break; // Cache quente, segue
+        }
+
+        // 2) Tenta ler defaults via método normal (_getOfferDefaultsFromMap)
+        const check = this._getOfferDefaultsFromMap(firstOfferId, loader);
+        if (check) {
+          break; // Já temos defaults utilizáveis
+        }
+
+        // 3) Se chegamos aqui, possivelmente é cold start: espera antes de tentar de novo
+        if (attempts === 0) {
+          console.log(
+            `${this.logPrefix} Verificando disponibilidade do OfferMap (Cold Start mitigation para ${firstOfferId})...`
+          );
+        }
+
+        await this._sleep(500);
+        attempts++;
+      }
+
+      // Log de diagnóstico: só se houve pelo menos 1 espera
+      if (attempts > 0) {
+        const elapsed = Date.now() - warmupStart;
+        console.log(
+          `${this.logPrefix} Warm-up OfferMap para ${firstOfferId}: ${attempts} tentativa(s), ~${elapsed}ms.`
+        );
+      }
+    }
+
+    // Processamento normal (merge defaults + template_params)
     for (const offer of offers) {
       if (!offer || !offer.offer_id) continue;
 
