@@ -1,32 +1,27 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.5.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.6.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.5.0
+ * Nome/Versão: ClickbankAdapter v1.6.0
  * Data: 2025-11-22
  *
- * Alterações vs v1.4.4:
+ * Alterações vs v1.5.0:
+ * - Integra OfferMapLoaderCsv (pz_offer_map.csv) para preencher template_params
+ *   (cbfid, cbskin, template, exitoffer) quando:
+ *     • offer.offer_id existir (ex.: clickbank:endopump:500001) E
+ *     • template_params vier null do scraping.
+ * - NUNCA sobrescreve template_params que já vieram da raspagem (prioridade absoluta).
+ * - Mantém toda a lógica anterior de scraping, normalização e retorno (legacy|rich).
+ *
+ * Alterações herdadas vs v1.4.4:
  * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
  * - Continua suportando CB_RETURN_MODE (legacy|rich) + override por chamada.
- * - Amplia o scraper para ser "productID-aware":
- *     • Além de pay.clickbank/clkbank e cbitems (vendor-aware), agora detecta URLs
+ * - Scraper "productID-aware":
+ *     • Além de pay.clickbank/clkbank e cbitems (vendor-aware), detecta URLs
  *       com productID=... em landers de vendor (ex.: endopumpsecret.com/...productID=500001).
  *     • Quando encontrar productID e souber o vendor (offerData.vendor ou HTML),
  *       monta uma URL canónica https://<vendor>.pay.clickbank.net/?cbitems=<productID>.
- * - _normalizeClickbankOffer passa a expor opcionalmente template_params
+ * - _normalizeClickbankOffer expõe template_params
  *   (cbfid, cbskin, template, exitoffer) extraídos da querystring.
- *   Isso permite que camadas superiores apliquem defaults (pz_offer_map.csv)
- *   apenas quando template_params for null.
- *
- * Alterações herdadas de v1.4.x:
- * - Mantém CB_RETURN_MODE (legacy|rich) + override por chamada (offerData.return_mode / returnMode).
- * - Mantém o scraper "vendor-aware":
- *     • Extrai o vendor do HTML (window.clickbank.vendor ou cbtb.clickbank.net/?vendor=...).
- *     • Usa o vendor para montar host <vendor>.pay.clickbank.net e procurar links com cbitems=,
- *       mesmo quando aparecem como URLs relativas ("/?cbitems=1&...") ou sem protocolo.
- *     • Complementa a varredura base (DOM + regex pay.clickbank/clkbank) com uma varredura
- *       específica de href/src contendo "cbitems=".
- * - Mantém fallback rico em modo 'rich' quando não houver links pay.clickbank/clkbank:
- *     • { offers:[...], primaryOffer, raw_count, fallback_reason:'scrape_empty'|'scrape_error', ... }.
  *
  * Alterações herdadas vs v1.3.4-DR6f:
  * - Mantém: scrape robusto (Cheerio), injeção data-driven de params, HMAC webhook, AES, etc.
@@ -36,7 +31,7 @@ console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.5.0 (Smart Parsing + C
 const crypto = require('crypto');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 
-// Resolve o loader do CSV, aceitando várias "formas"
+// Resolve o loader do CSV de parâmetros de tracking (pz_parameter_map.csv)
 function _resolveParamLoaderModule() {
   try {
     const mod = require('./ParamMapLoaderCsv');
@@ -80,7 +75,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.5.0';
+    this.version = '1.6.0';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -98,6 +93,9 @@ class ClickbankAdapter extends PlatformAdapterBase {
       opts.paramLoader && typeof opts.paramLoader.load === 'function'
         ? opts.paramLoader
         : resolved;
+
+    // Singleton lazy do OfferMapLoaderCsv (pz_offer_map.csv)
+    this._offerMapLoader = null;
 
     console.log(
       `${this.logPrefix} Scraper Mode: ${this.SCRAPER_MODE} | Default Return Mode: ${this.RETURN_MODE}`
@@ -253,7 +251,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
           const abs = toAbs(raw);
           if (abs && isCb(abs)) foundUrls.add(abs);
 
-          // NEW v1.5.0: captura productID=... em links/forms/iframes/áreas
+          // captura productID=... em links/forms/iframes/áreas
           if (raw && /productid=/i.test(raw)) {
             collectProductIdFromRaw(raw);
           }
@@ -321,7 +319,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
         }
       }
 
-      // NEW v1.5.0: constrói URLs canónicas a partir de productID=..., quando soubermos o vendor
+      // Constrói URLs canónicas a partir de productID=..., quando soubermos o vendor
       if (productIds.size > 0) {
         const vendorForProductId = vendorFromOfferData || vendorFromHtml || null;
         if (vendorForProductId) {
@@ -350,10 +348,13 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // --- INÍCIO DA LÓGICA v1.4.x (Smart Parsing + Canonical ID) ---
 
       // 1) Injeta params em todas as URLs ClickBank encontradas e normaliza
-      const normalizedOffers = Array.from(foundUrls)
+      const normalizedOffersRaw = Array.from(foundUrls)
         .map((u) => this._appendParamsToUrl(u, paramsData))
         .filter(Boolean)
         .map((u) => this._normalizeClickbankOffer(u)); // nunca filtra aqui
+
+      // 2) Aplica defaults de template (pz_offer_map.csv) APENAS quando template_params é null
+      const normalizedOffers = this._applyOfferMapTemplateDefaults(normalizedOffersRaw);
 
       if (normalizedOffers.length > 0) {
         console.log(
@@ -390,9 +391,10 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Fallback específico para modo "rich": devolve estrutura rica mesmo sem pay.clickbank
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
+        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
         return {
-          offers: [normalized],
-          primaryOffer: normalized,
+          offers: [normalizedWithDefaults],
+          primaryOffer: normalizedWithDefaults,
           raw_count: 1,
           fallback_reason: 'scrape_empty',
         };
@@ -407,9 +409,10 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Em modo rich, nunca retornamos string: devolve estrutura rica com fallback
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
+        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
         return {
-          offers: [normalized],
-          primaryOffer: normalized,
+          offers: [normalizedWithDefaults],
+          primaryOffer: normalizedWithDefaults,
           raw_count: 1,
           fallback_reason: 'scrape_error',
           error_message: e?.message || String(e),
@@ -425,8 +428,8 @@ class ClickbankAdapter extends PlatformAdapterBase {
    * Analisa uma URL final do ClickBank e extrai metadados.
    * Padrão ID canónico: clickbank:<vendor>:<cbitems>
    *
-   * NEW v1.5.0:
-   * - Passa a expor template_params com { cbfid, cbskin, template, exitoffer } quando existirem.
+   * v1.5.0+:
+   * - Expõe template_params com { cbfid, cbskin, template, exitoffer } quando existirem na URL.
    */
   _normalizeClickbankOffer(urlStr) {
     try {
@@ -705,6 +708,89 @@ class ClickbankAdapter extends PlatformAdapterBase {
     }
 
     return u.toString();
+  }
+
+  // =========================================================
+  // ===========  OFFER MAP (pz_offer_map.csv) ===============
+  // =========================================================
+
+  /**
+   * Lazy require do OfferMapLoaderCsv + singleton.
+   * Tenta:
+   *  - mod.default.getInstance()
+   *  - mod.getInstance()
+   *  - new mod()
+   */
+  _getOfferMapLoaderInstance() {
+    if (this._offerMapLoader) return this._offerMapLoader;
+
+    try {
+      const mod = require('./OfferMapLoaderCsv');
+      const cand = mod?.default || mod;
+
+      if (cand && typeof cand.getInstance === 'function') {
+        this._offerMapLoader = cand.getInstance();
+        return this._offerMapLoader;
+      }
+
+      if (typeof cand === 'function') {
+        this._offerMapLoader = new cand();
+        return this._offerMapLoader;
+      }
+
+      console.warn(
+        `${this.logPrefix} OfferMapLoaderCsv carregado, mas não expõe getInstance nem é construtor utilizável.`
+      );
+      this._offerMapLoader = null;
+    } catch (err) {
+      console.warn(
+        `${this.logPrefix} OfferMapLoaderCsv não disponível (pz_offer_map.csv não será usado):`,
+        err?.message || err
+      );
+      this._offerMapLoader = null;
+    }
+
+    return this._offerMapLoader;
+  }
+
+  /**
+   * Aplica defaults de template (cbfid, cbskin, template, exitoffer) vindos do pz_offer_map.csv
+   * APENAS quando:
+   *   - offer.offer_id existir, e
+   *   - offer.template_params for null (sem sobrescrever o que veio da raspagem).
+   *
+   * @param {Array<Object>} offers
+   * @returns {Array<Object>} mesma referência de array, com objetos possivelmente enriquecidos
+   */
+  _applyOfferMapTemplateDefaults(offers) {
+    if (!Array.isArray(offers) || offers.length === 0) return offers;
+
+    const loader = this._getOfferMapLoaderInstance();
+    if (!loader || typeof loader.getClickbankDefaults !== 'function') return offers;
+
+    for (const offer of offers) {
+      if (!offer || !offer.offer_id) continue;
+
+      // Se já tem template_params do scraping, respeita 100%
+      if (offer.template_params && Object.keys(offer.template_params).length > 0) {
+        continue;
+      }
+
+      try {
+        const defaults = loader.getClickbankDefaults(offer.offer_id);
+        if (defaults) {
+          // Copia simples; FE pode decidir usar só cbfid/cbskin, etc.
+          offer.template_params = { ...defaults };
+        }
+      } catch (err) {
+        console.warn(
+          `${this.logPrefix} Erro ao aplicar defaults de OfferMap para ${offer.offer_id}:`,
+          err?.message || err
+        );
+      }
+    }
+
+    return offers;
   }
 
   // =========================================================
