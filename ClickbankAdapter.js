@@ -1,10 +1,18 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.6.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.7.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults Fallback) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.6.0
+ * Nome/Versão: ClickbankAdapter v1.7.0
  * Data: 2025-11-22
  *
- * Alterações vs v1.5.0:
+ * Alterações vs v1.6.0:
+ * - Ajusta integração com OfferMapLoaderCsv:
+ *   • Aceita tanto loader.getClickbankDefaults(...) quanto loader.getRow(...).
+ *   • Se getClickbankDefaults não existir, deriva os defaults cbfid/cbskin/template/exitoffer
+ *     a partir das colunas cb_default_* da linha do CSV.
+ *   • Mantém a regra de NUNCA sobrescrever template_params já vindos do scraping.
+ * - Restante lógica idêntica à v1.6.0.
+ *
+ * Alterações herdadas vs v1.5.0:
  * - Integra OfferMapLoaderCsv (pz_offer_map.csv) para preencher template_params
  *   (cbfid, cbskin, template, exitoffer) quando:
  *     • offer.offer_id existir (ex.: clickbank:endopump:500001) E
@@ -75,7 +83,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.6.0';
+    this.version = '1.7.0';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -766,7 +774,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
     if (!Array.isArray(offers) || offers.length === 0) return offers;
 
     const loader = this._getOfferMapLoaderInstance();
-    if (!loader || typeof loader.getClickbankDefaults !== 'function') return offers;
+    if (!loader) return offers;
 
     for (const offer of offers) {
       if (!offer || !offer.offer_id) continue;
@@ -777,9 +785,35 @@ class ClickbankAdapter extends PlatformAdapterBase {
       }
 
       try {
-        const defaults = loader.getClickbankDefaults(offer.offer_id);
-        if (defaults) {
-          // Copia simples; FE pode decidir usar só cbfid/cbskin, etc.
+        let defaults = null;
+
+        if (typeof loader.getClickbankDefaults === 'function') {
+          // Caminho "oficial" se a API existir
+          defaults = loader.getClickbankDefaults(offer.offer_id);
+        } else if (typeof loader.getRow === 'function') {
+          // Fallback derivando diretamente da linha do CSV
+          const row = loader.getRow(offer.offer_id);
+          if (row && String(row.status || '').toLowerCase() === 'active') {
+            const {
+              cb_default_cbfid,
+              cb_default_cbskin,
+              cb_default_template,
+              cb_default_exitoffer,
+            } = row;
+
+            const tmp = {};
+            if (cb_default_cbfid) tmp.cbfid = String(cb_default_cbfid).trim();
+            if (cb_default_cbskin) tmp.cbskin = String(cb_default_cbskin).trim();
+            if (cb_default_template) tmp.template = String(cb_default_template).trim();
+            if (cb_default_exitoffer) tmp.exitoffer = String(cb_default_exitoffer).trim();
+
+            if (Object.keys(tmp).length > 0) {
+              defaults = tmp;
+            }
+          }
+        }
+
+        if (defaults && Object.keys(defaults).length > 0) {
           offer.template_params = { ...defaults };
         }
       } catch (err) {
