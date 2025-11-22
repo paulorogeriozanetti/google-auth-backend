@@ -1,21 +1,25 @@
-console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.8.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults + URL Template Injection) ---');
+console.log('--- [BOOT CHECK] Loading ClickbankAdapter v1.9.0 (Smart Parsing + Canonical Offer ID + Vendor/ProductID-Aware Multi-Offer Scrape + OfferMap Defaults + URL Injection) ---');
 /**
  * PZ Advisors - Clickbank Adapter
- * Nome/Versão: ClickbankAdapter v1.8.0
+ * Nome/Versão: ClickbankAdapter v1.9.0
  * Data: 2025-11-22
  *
- * Alterações vs v1.7.0:
- * - Mantém toda a lógica de normalização inteligente (Smart Parsing) e offer_id canónico.
- * - Mantém CB_RETURN_MODE (legacy|rich) + override por chamada.
+ * Alterações vs v1.8.0:
+ * - Corrige uso do OfferMapLoaderCsv (pz_offer_map.csv) para NÃO depender apenas de getClickbankDefaults:
+ *     • Se existir loader.getClickbankDefaults(offer_id), usa.
+ *     • Caso contrário, usa loader.getRow(offer_id) e extrai cb_default_cbfid/cb_default_cbskin/template/exitoffer.
+ * - Garante que os defaults são aplicados SOMENTE quando o offer tiver offer_id.
+ * - Faz merge dos defaults com template_params vindos do scraping SEM sobrescrever o que já veio da URL.
+ * - NOVO: injeta sempre cbfid/cbskin/template/exitoffer na URL final quando existirem em template_params
+ *         (sem duplicar ou sobrescrever valores já presentes na querystring).
+ *
+ * Alterações vs v1.6.0–v1.7.0:
  * - Mantém integração com OfferMapLoaderCsv (pz_offer_map.csv) para preencher template_params
  *   (cbfid, cbskin, template, exitoffer) quando:
- *     • offer.offer_id existir (ex.: clickbank:endopump:500001) E
- *     • template_params vier null do scraping.
- * - NOVO: aplica automaticamente template_params à URL final:
- *     • Só define cbfid/cbskin/template/exitoffer na querystring se ainda não existirem na URL.
- *     • Nunca sobrescreve valores vindos do HTML da ClickBank.
+ *     • offer.offer_id existir (ex.: clickbank:endopump:500001) e
+ *     • os valores não estiverem presentes no resultado do scraping.
  *
- * Alterações herdadas vs v1.4.4:
+ * Alterações herdadas vs v1.5.0:
  * - Scraper "productID-aware":
  *     • Além de pay.clickbank/clkbank e cbitems (vendor-aware), detecta URLs
  *       com productID=... em landers de vendor (ex.: endopumpsecret.com/...productID=500001).
@@ -76,7 +80,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
    */
   constructor(opts = {}) {
     super();
-    this.version = '1.8.0';
+    this.version = '1.9.0';
     this.logPrefix = `[ClickbankAdapter v${this.version}]`;
 
     this.WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -348,17 +352,14 @@ class ClickbankAdapter extends PlatformAdapterBase {
 
       // --- INÍCIO DA LÓGICA v1.4.x (Smart Parsing + Canonical ID) ---
 
-      // 1) Injeta params de tracking em todas as URLs ClickBank encontradas e normaliza
+      // 1) Injeta params em todas as URLs ClickBank encontradas e normaliza
       const normalizedOffersRaw = Array.from(foundUrls)
         .map((u) => this._appendParamsToUrl(u, paramsData))
         .filter(Boolean)
         .map((u) => this._normalizeClickbankOffer(u)); // nunca filtra aqui
 
-      // 2) Aplica defaults de template (pz_offer_map.csv) APENAS quando template_params é null
-      const normalizedWithDefaults = this._applyOfferMapTemplateDefaults(normalizedOffersRaw);
-
-      // 3) Aplica template_params (se existirem) na URL final (sem sobrescrever params já existentes)
-      const normalizedOffers = this._applyTemplateParamsToUrls(normalizedWithDefaults);
+      // 2) Aplica defaults de template (pz_offer_map.csv) + injeta na URL final
+      const normalizedOffers = this._applyOfferMapTemplateDefaults(normalizedOffersRaw);
 
       if (normalizedOffers.length > 0) {
         console.log(
@@ -395,9 +396,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Fallback específico para modo "rich": devolve estrutura rica mesmo sem pay.clickbank
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
-        const [normalizedWithDefaults] = this._applyTemplateParamsToUrls(
-          this._applyOfferMapTemplateDefaults([normalized])
-        );
+        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
         return {
           offers: [normalizedWithDefaults],
           primaryOffer: normalizedWithDefaults,
@@ -415,9 +414,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
       // Em modo rich, nunca retornamos string: devolve estrutura rica com fallback
       if (callReturnMode === 'rich') {
         const normalized = this._normalizeClickbankOffer(trackedHoplink);
-        const [normalizedWithDefaults] = this._applyTemplateParamsToUrls(
-          this._applyOfferMapTemplateDefaults([normalized])
-        );
+        const [normalizedWithDefaults] = this._applyOfferMapTemplateDefaults([normalized]);
         return {
           offers: [normalizedWithDefaults],
           primaryOffer: normalizedWithDefaults,
@@ -762,10 +759,119 @@ class ClickbankAdapter extends PlatformAdapterBase {
   }
 
   /**
+   * Extrai defaults (cbfid, cbskin, template, exitoffer) para um offer_id
+   * a partir do OfferMapLoaderCsv.
+   *
+   * Preferências:
+   *  - Se existir loader.getClickbankDefaults(offerId), usa diretamente.
+   *  - Caso contrário, usa loader.getRow(offerId) e extrai colunas cb_default_*.
+   *
+   * @param {string} offerId
+   * @param {*} [loaderOverride]
+   * @returns {null | {cbfid?:string, cbskin?:string, template?:string, exitoffer?:string}}
+   */
+  _getOfferDefaultsFromMap(offerId, loaderOverride) {
+    if (!offerId) return null;
+    const loader = loaderOverride || this._getOfferMapLoaderInstance();
+    if (!loader) return null;
+
+    // Preferencial: método dedicado, se existir
+    if (typeof loader.getClickbankDefaults === 'function') {
+      try {
+        const d = loader.getClickbankDefaults(offerId);
+        if (d && typeof d === 'object') return d;
+      } catch (err) {
+        console.warn(
+          `${this.logPrefix} Erro em loader.getClickbankDefaults(${offerId}):`,
+          err?.message || err
+        );
+      }
+    }
+
+    // Fallback genérico: getRow + colunas cb_default_*
+    if (typeof loader.getRow === 'function') {
+      try {
+        const row = loader.getRow(offerId);
+        if (!row) return null;
+
+        const status = String(row.status || '').toLowerCase().trim();
+        if (status && status !== 'active') return null;
+
+        const clean = (v) => {
+          if (v === undefined || v === null) return '';
+          return String(v).trim();
+        };
+
+        const cbfid = clean(row.cb_default_cbfid);
+        const cbskin = clean(row.cb_default_cbskin);
+        const template = clean(row.cb_default_template);
+        const exitoffer = clean(row.cb_default_exitoffer);
+
+        const out = {};
+        if (cbfid) out.cbfid = cbfid;
+        if (cbskin) out.cbskin = cbskin;
+        if (template) out.template = template;
+        if (exitoffer) out.exitoffer = exitoffer;
+
+        return Object.keys(out).length ? out : null;
+      } catch (err) {
+        console.warn(
+          `${this.logPrefix} Erro ao extrair defaults de OfferMap via getRow(${offerId}):`,
+          err?.message || err
+        );
+        return null;
+      }
+    }
+
+    console.warn(
+      `${this.logPrefix} OfferMapLoaderCsv não expõe getClickbankDefaults nem getRow utilizável.`
+    );
+    return null;
+  }
+
+  /**
+   * Garante que cbfid/cbskin/template/exitoffer existindo em template_params
+   * também sejam refletidos na URL (sem sobrescrever ou duplicar).
+   *
+   * @param {string} urlStr
+   * @param {Object} templateParams
+   * @returns {string}
+   */
+  _appendTemplateParamsToUrl(urlStr, templateParams) {
+    if (!urlStr || !templateParams || typeof templateParams !== 'object') return urlStr;
+
+    try {
+      const u = new URL(urlStr);
+      const mapping = {
+        cbfid: 'cbfid',
+        cbskin: 'cbskin',
+        template: 'template',
+        exitoffer: 'exitoffer',
+      };
+
+      for (const [key, value] of Object.entries(templateParams)) {
+        const qsKey = mapping[key];
+        if (!qsKey) continue;
+        if (value === undefined || value === null || String(value).trim() === '') continue;
+        if (!u.searchParams.has(qsKey)) {
+          u.searchParams.set(qsKey, String(value));
+        }
+      }
+
+      return u.toString();
+    } catch (_) {
+      return urlStr;
+    }
+  }
+
+  /**
    * Aplica defaults de template (cbfid, cbskin, template, exitoffer) vindos do pz_offer_map.csv
-   * APENAS quando:
-   *   - offer.offer_id existir, e
-   *   - offer.template_params for null (sem sobrescrever o que veio da raspagem).
+   * e garante que esses parâmetros também apareçam na URL final.
+   *
+   * Regras:
+   *   - Só atua se offer.offer_id existir.
+   *   - NUNCA sobrescreve template_params vindos do scraping (prioridade absoluta).
+   *   - Usa OfferMapLoaderCsv para complementar apenas campos ausentes.
    *
    * @param {Array<Object>} offers
    * @returns {Array<Object>} mesma referência de array, com objetos possivelmente enriquecidos
@@ -774,21 +880,31 @@ class ClickbankAdapter extends PlatformAdapterBase {
     if (!Array.isArray(offers) || offers.length === 0) return offers;
 
     const loader = this._getOfferMapLoaderInstance();
-    if (!loader || typeof loader.getClickbankDefaults !== 'function') return offers;
+    if (!loader) return offers;
 
     for (const offer of offers) {
       if (!offer || !offer.offer_id) continue;
 
-      // Se já tem template_params do scraping, respeita 100%
-      if (offer.template_params && Object.keys(offer.template_params).length > 0) {
-        continue;
-      }
+      // Clona o que veio do scraping (se houver)
+      const scrapedTemplateParams =
+        offer.template_params && typeof offer.template_params === 'object'
+          ? { ...offer.template_params }
+          : {};
+
+      let finalTemplateParams = { ...scrapedTemplateParams };
 
       try {
-        const defaults = loader.getClickbankDefaults(offer.offer_id);
-        if (defaults && Object.keys(defaults).length > 0) {
-          // Copia simples; pode conter cbfid, cbskin, template, exitoffer
-          offer.template_params = { ...defaults };
+        const defaults = this._getOfferDefaultsFromMap(offer.offer_id, loader);
+
+        if (defaults && typeof defaults === 'object') {
+          // Merge: defaults só preenchem campos ausentes
+          for (const [k, v] of Object.entries(defaults)) {
+            if (v === undefined || v === null || String(v).trim() === '') continue;
+            const already = finalTemplateParams[k];
+            if (already === undefined || already === null || String(already).trim() === '') {
+              finalTemplateParams[k] = v;
+            }
+          }
         }
       } catch (err) {
         console.warn(
@@ -796,50 +912,19 @@ class ClickbankAdapter extends PlatformAdapterBase {
           err?.message || err
         );
       }
-    }
 
-    return offers;
-  }
+      // Se após o merge temos algum parâmetro de template, fixa em offer.template_params
+      const hasAnyTemplateParam = Object.keys(finalTemplateParams).length > 0;
 
-  /**
-   * Aplica template_params (cbfid, cbskin, template, exitoffer, etc.) na URL final:
-   * - Só define um parâmetro se ele ainda não existir na querystring.
-   * - Ignora valores null/undefined/vazios.
-   *
-   * @param {Array<Object>} offers
-   * @returns {Array<Object>}
-   */
-  _applyTemplateParamsToUrls(offers) {
-    if (!Array.isArray(offers) || offers.length === 0) return offers;
-
-    for (const offer of offers) {
-      if (!offer || !offer.url || !offer.template_params) continue;
-
-      try {
-        const u = new URL(offer.url);
-        const tparams = offer.template_params || {};
-
-        for (const [key, val] of Object.entries(tparams)) {
-          if (val == null) continue;
-          const strVal = String(val).trim();
-          if (!strVal) continue;
-
-          // Para ClickBank, as chaves de template_params já são os nomes de query (cbfid, cbskin, template, exitoffer)
-          const qsKey = key;
-
-          if (!u.searchParams.has(qsKey)) {
-            u.searchParams.set(qsKey, strVal);
-          }
+      if (hasAnyTemplateParam) {
+        offer.template_params = finalTemplateParams;
+        // Garante que a URL final reflete esses parâmetros
+        if (offer.url) {
+          offer.url = this._appendTemplateParamsToUrl(offer.url, finalTemplateParams);
         }
-
-        offer.url = u.toString();
-      } catch (err) {
-        console.warn(
-          `${this.logPrefix} Erro ao aplicar template_params na URL para offer ${
-            (offer && offer.offer_id) || ''
-          }:`,
-          err?.message || err
-        );
+      } else {
+        // Mantém nulo se nada definido
+        offer.template_params = null;
       }
     }
 
@@ -861,7 +946,7 @@ class ClickbankAdapter extends PlatformAdapterBase {
       console.warn(`${this.logPrefix} Webhook sem body ou headers.`);
       return null;
     }
-    if (Buffer.isBuffer(rawBodyBuffer) && Buffer.byteLength(rawBodyBuffer) === 0) {
+    if (Buffer.isBuffer(rawBodyBuffer) && rawBodyBuffer.length === 0) {
       console.warn(`${this.logPrefix} Webhook com body vazio.`);
       return null;
     }
