@@ -1,6 +1,6 @@
 /**
  * PZ Advisors - ParamMapLoaderCsv
- * Versão: v1.2.1 (HTTP fetch + ETag/Last-Modified cache + Refresh; +mediascalers no allowlist)
+ * Versão: v1.2.0 (HTTP fetch + ETag/Last-Modified cache + Refresh)
  * Data: 2025-11-05
  * Descrição:
  * - Lê pz_parameter_map.csv a partir de UMA fonte oficial (WordPress) via HTTP(S),
@@ -18,7 +18,7 @@ const { URL: URLCtor } = require('url');
 
 class ParamMapLoaderCsv {
   constructor(csvPath) {
-    this.version = '1.2.1';
+    this.version = '1.2.0';
     this.logPrefix = `[ParamMapLoaderCsv v${this.version}]`;
 
     const envUrl = process.env.PZ_PARAM_MAP_URL || process.env.PZ_PARAM_MAP_PATH;
@@ -37,7 +37,6 @@ class ParamMapLoaderCsv {
       'maxweb_id_parameter',
       'nutriprofits_id_parameter',
       'amazon_id_parameter',
-      'mediascalers_id_parameter',
     ];
 
     // HTTP cache
