@@ -1,6 +1,6 @@
 /**
  * ClickbankPostback.js
- * Versão: v1.0.4
+ * Versão: v1.0.3
  * Data: 2026-03-25
  * Nome: ClickBank S2S Postback Handler
  * Desc: Handler S2S (webhook) para a plataforma ClickBank.
@@ -243,7 +243,6 @@ async function handle(req, res) {
     canonical.utm_term = firstNonEmpty(vv.utm_term) || null;
     canonical.utm_content = firstNonEmpty(vv.utm_content) || null;
     canonical.click_timestamp = firstNonEmpty(vv.click_timestamp, tracking.click_timestamp) || null;
-    canonical.cid = firstNonEmpty(vv.cid, tracking.cid) || null; // v1.0.4 (item 9.3): alimenta Ga4Sink.client_id
 
     // Parser de data robusto
     try {
