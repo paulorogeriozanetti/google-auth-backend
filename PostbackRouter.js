@@ -1,8 +1,12 @@
 /**
  * PostbackRouter.js
- * Versão: v1.0.6
- * Data: 2025-11-14
+ * Versão: v1.0.7
+ * Data: 2026-07-17
  * Desc: Ponto de entrada único (roteador) para todos os webhooks S2S.
+ *
+ * Alterações v1.0.7:
+ * - Registra a plataforma 'mediascalers' (Everflow) -> MediaScalersPostback.handleGet.
+ *   Delta aditivo e aprovado pelo ARCHITECT; não altera Digistore24/ClickBank/stubs.
  *
  * Alterações v1.0.6 (baseado no feedback):
  * - Confirma a lógica v1.0.5: Trata GET /postback/clickbank (Test IPN).
@@ -14,6 +18,7 @@
 // Importa os handlers específicos da plataforma
 const DigistorePostback = require('./DigistorePostback');
 const ClickbankPostback = require('./ClickbankPostback');
+const MediaScalersPostback = require('./MediaScalersPostback');
 // const BuygoodsPostback = require('./BuygoodsPostback');   // Futuro
 
 /**
@@ -23,6 +28,7 @@ const ClickbankPostback = require('./ClickbankPostback');
 const handlers = {
   'digistore24': DigistorePostback.handle,
   'clickbank': ClickbankPostback.handle,
+  'mediascalers': MediaScalersPostback.handleGet,
   
   // Stubs para plataformas futuras (retornam 200 OK para evitar retries)
   'buygoods': async (req, res) => {
