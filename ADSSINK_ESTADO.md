@@ -14,7 +14,7 @@ e não representa nada que esteja em produção.
 
 | Ficheiro | Versão | Estado de revisão |
 |---|---|---|
-| `AdsSink.js` | **2.1.0** | ✅ R1 + R2 aprovado |
+| `AdsSink.js` | **2.2.0** | ✅ R1 + R2 aprovado |
 | `ConvMapLoaderCsv.js` | **2.1.0** | ✅ R1 + R2 aprovado |
 | `ConsentResolver.js` | **1.0.0** | ✅ R1 + R2 aprovado |
 | `adssink_csv/pz_conversion_map.csv` | 14 col, sep `;` | desenhado, **não escrito em produção** |
@@ -23,11 +23,20 @@ e não representa nada que esteja em produção.
 Os CSVs vivem aqui só para não se perderem. O CSV de produção é servido a partir do repo
 `pza-frontend` — ver `CSV_GOVERNANCE.md` no knowledge base.
 
-> **Correcção de versão — 2026-07-26.** Esta tabela declarava `2.2.0` para `AdsSink.js` e
-> `ConvMapLoaderCsv.js`, e `—` para `ConsentResolver.js`. Os números reais, lidos dos cabeçalhos
-> dos próprios ficheiros e confirmados em runtime (`[ConvMapLoaderCsv v2.1.0]`), são **2.1.0**,
-> **2.1.0** e **1.0.0**. O `2.2.0` nunca existiu — foi propagado pelos docs (e pelo agente).
-> Decisão do Paulo: **corrigir os docs, não fazer bump do ficheiro.** O código não mudou.
+> **Histórico de versões — ler todo, houve duas correcções.**
+>
+> **1ª correcção (2026-07-26, manhã) — PARCIALMENTE ERRADA.** O agente declarou que o `2.2.0`
+> "nunca existiu" e baixou os três artefactos para 2.1.0/2.1.0/1.0.0. Correcto para o
+> `ConvMapLoaderCsv.js` e o `ConsentResolver.js`. **Errado para o `AdsSink.js`.**
+>
+> **2ª correcção (2026-07-26, tarde) — a boa.** O `AdsSink.js` estava internamente
+> contraditório: cabeçalho `v2.1.0`, mas `const VERSION = '2.2.0'` na linha 124 — e é a
+> constante que aparece nos logs em runtime. Decisão do Paulo: **vence o `2.2.0`.** O cabeçalho
+> foi alinhado com a constante. Os docs que diziam 2.2.0 estavam certos sobre este ficheiro; foi
+> o agente que os "corrigiu" para errado.
+>
+> Lição: a versão de um ficheiro lê-se na constante que o runtime emite, não no comentário de
+> cabeçalho. Quando as duas discordam, isso é o defeito — não um detalhe cosmético.
 
 ## Cobertura do bridge — divergência produção vs PROPOSTA
 
@@ -76,13 +85,17 @@ fontes discordam nos nomes do mesmo ctId (ex.: `7697484646` = `pz_view_offer` no
 
 ## O que falta antes de isto poder ir para `main`
 
-1. **`google-ads-api` não está no `package.json`.** Confirmado por leitura directa de
-   `package.json@main` (sha `fcfa254c…`) em 2026-07-26. Tem de entrar no commit de merge.
-   *Alternativa de emergência:* `axios` + `google-auth-library` já estão instaladas e permitem
-   chamar a REST `customers/{id}:uploadClickConversions` sem a dependência gRPC — mas isso é
-   um delta de código e implica nova revisão.
-2. **`PZ_ADSSINK_ENABLED=false`** deve estar definido no Railway *antes* do merge, para o código
-   entrar passivo.
+1. ~~**`google-ads-api` não está no `package.json`.**~~ **PENDÊNCIA FALSA — retirada 2026-07-26.**
+   O `AdsSink.js` **nunca** usou essa biblioteca. O cabeçalho do próprio ficheiro (linha 91) diz:
+   *"Implementação HTTP: REST + google-auth-library + axios, ambos JÁ dependências do backend.
+   Deliberadamente NÃO se adiciona google-ads-api (~40 MB + gerador gRPC para uma única chamada)."*
+   Confirmado por `grep`: zero ocorrências de `google-ads-api` ou `GoogleAdsApi` no código.
+   **Não há alteração a fazer ao `package.json`.** Esta pendência foi inventada pelo agente e
+   propagada por vários docs sem nunca ter sido validada contra o código.
+2. ~~**`PZ_ADSSINK_ENABLED=false`**~~ **FEITO — 2026-07-26**, no serviço `google-auth-backend` do
+   Railway. Nota: o teste no código é `process.env.PZ_ADSSINK_ENABLED !== 'true'`, ou seja
+   qualquer valor diferente de `true` — incluindo a variável ausente — desliga o envio. A
+   variável não era estritamente necessária; é redundância correcta e fica.
 3. **PEND-03 — filtro de rebill.** O nome real do campo do postback (`pay_sequence_no <= 1`?)
    ainda não foi confirmado contra um postback real. **Inventar o nome do campo é proibido.**
 4. **Duplicidade de conversion actions** — `purchase` vs `pz_purchase`,
@@ -135,3 +148,23 @@ da produção em 2026-07-26, com backups `_bak_2026-07-26` na pasta local.
 quando o ficheiro real tem 14 (`flow_mode` incluída) e omite `/dg/circo2-vsl`, `/norev-method`
 e `/jetterix-us`. Foi precisamente uma referência documental desactualizada que partiu o
 `/bridge` em 2026-05-12.
+
+## Por que o merge para `main` é inerte (verificado 2026-07-26)
+
+Não é "inerte porque a flag está a `false`". É inerte porque **nada carrega o código**:
+
+```
+$ grep -rn "require(.*\(AdsSink\|ConvMapLoaderCsv\|ConsentResolver\)" --include=*.js .
+AdsSink.js:121:const ConvMapLoaderCsv = require('./ConvMapLoaderCsv');
+AdsSink.js:122:const ConsentResolver = require('./ConsentResolver');
+```
+
+As únicas referências são internas ao próprio AdsSink. Nenhum postback, nenhuma rota, nenhum
+`server.js` faz `require('./AdsSink')`. O diff `main..feat/adssink` são 8 ficheiros **todos
+novos**, zero linhas alteradas em ficheiros existentes.
+
+Consequência prática: o deploy de `main` não pode regredir nada. O módulo nem chega a ser
+carregado pelo Node — não há sequer superfície para falhar em runtime.
+
+**A ligação (o `require` + a chamada nos postbacks) é um commit futuro, separado e revisto.**
+É esse que muda o comportamento em produção, não este.

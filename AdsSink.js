@@ -1,6 +1,6 @@
 /**
  * PZ Advisors — AdsSink
- * Versão: v2.1.0
+ * Versão: v2.2.0
  * Data: 2026-07-25
  *
  * MUDANÇA v1.0.0 -> v2.0.0 (plano v8.2, aprovado por ARCHITECT + Gemini):
