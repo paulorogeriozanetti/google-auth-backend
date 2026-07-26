@@ -121,7 +121,7 @@ const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestor
 const ConvMapLoaderCsv = require('./ConvMapLoaderCsv');
 const ConsentResolver = require('./ConsentResolver');
 
-const VERSION = '2.3.0';
+const VERSION = '2.2.0';
 const LOG = `[AdsSink v${VERSION}]`;
 const COLLECTION_NAME = process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions';
 
@@ -798,7 +798,7 @@ async function sendConversion(canonical, opts = {}) {
 
     // --- Claim (predicado v8.2) ---
     const db = getFirestore();
-    docRef = db.collection(opts.collection || COLLECTION_NAME).doc(_docIdFor(canonical));
+    docRef = db.collection(COLLECTION_NAME).doc(_docIdFor(canonical));
     const claim = await _claim(docRef);
     if (!claim.ok) {
       if (claim.reason === 'max_attempts_excedido') {

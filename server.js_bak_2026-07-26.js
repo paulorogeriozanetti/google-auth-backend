@@ -1,4 +1,4 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.1.0 (Ligacao Micro AdsSink) ---'); // [v6.1.0] era v6.0.4
+console.log('--- [BOOT CHECK] Loading server.js v6.0.4 (S2S Parser Fix) ---');
 /**
  * PZ Auth+API Backend (v6.0.4 - S2S Parser Fix)
  * Versão: 6.0.4
@@ -26,12 +26,10 @@ const marketingAutomator = require('./marketingAutomator');
 const PlatformAdapterBase = require('./PlatformAdapterBase');
 // Importa o roteador S2S (mantido da v5.6.0)
 const PostbackRouter = require('./PostbackRouter');
-// ─── [v6.1.0] AdsSink — upload de conversões offline p/ Google Ads (micro via /api/track). Módulo já em produção, inerte até este require. ───
-const AdsSink = require('./AdsSink');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.1.0'; // [v6.1.0] era 6.0.4 (cosmetico; reportado em /api/version)
-const SERVER_DEPLOY_DATE = '2026-07-26'; // [v6.1.0] era 2025-11-13
+const SERVER_VERSION = '6.0.4'; // ATUALIZADO
+const SERVER_DEPLOY_DATE = '2025-11-13'; // ATUALIZADO
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
@@ -457,43 +455,6 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
 
         if (result.ok) {
             res.status(200).json({ ok: true, rid: req.traceId, doc_id: result.id, op: result.op || 'merged/set' });
-
-            // ═════════════ [v6.1.0] LIGAÇÃO MICRO → AdsSink — INÍCIO (bloco ADITIVO) ═════════════
-            // Aprovado em revisão dupla (ARCHITECT + Gemini) 2026-07-26. Fire-and-forget: NUNCA bloqueia /api/track.
-            // Só actua com PZ_ADSSINK_ENABLED==='true'. Colecção dedicada ads_micro_outbox (NÃO toca affiliate_transactions).
-            // Usa o crypto e o db JÁ existentes neste ficheiro. Não introduz dependências novas.
-            const MICRO_EVENTS = new Set(['page_view_type', 'checkout_click']);
-            if (process.env.PZ_ADSSINK_ENABLED === 'true' && MICRO_EVENTS.has(eventName) && payload?.gclid) {
-                const _pt = payload?.got?.page_type || payload?.page_type;
-                const _ts = payload?.ts;
-                const _rawKey = payload?.event_id
-                    ? `eid|${eventName}|${_pt || 'na'}|${payload.event_id}`
-                    : (_ts ? `syn|${payload?.anon_id || 'na'}|${eventName}|${_pt || 'na'}|${_ts}` : null);
-                if (!_rawKey) {
-                    console.warn(`[TRACK][AdsSink] micro sem event_id nem ts — skip. [Trace: ${req.traceId}]`);
-                } else {
-                    const _txid = crypto.createHash('sha1').update('web|' + _rawKey).digest('hex');
-                    const _docId = 'web_' + _txid; // == _docIdFor(canonical) no AdsSink (tx_id é hex puro)
-                    const _COLL = 'ads_micro_outbox';
-                    const _canonical = {
-                        platform: 'web', tx_id: _txid, gclid: payload.gclid,
-                        page_type: _pt, event_type: eventName,
-                        event_time_iso: _ts || new Date().toISOString(), raw_event_key: _rawKey,
-                    };
-                    setImmediate(async () => {
-                        try {
-                            await db.collection(_COLL).doc(_docId).set({
-                                platform: 'web', tx_id: _txid, gclid: payload.gclid, page_type: _pt || null,
-                                event_name: eventName, raw_event_key: _rawKey, source: 'micro_pageview', seed_at: new Date(),
-                            }, { merge: true });
-                            await AdsSink.sendConversion(_canonical, { event_name: eventName, page_type: _pt, collection: _COLL });
-                        } catch (e) {
-                            console.error(`[TRACK][AdsSink] micro erro: ${e?.message || e}`);
-                        }
-                    });
-                }
-            }
-            // ═════════════ [v6.1.0] LIGAÇÃO MICRO → AdsSink — FIM ═════════════
         } else if (result.error === 'DB_NOT_INITIALIZED') {
             res.locals.errorLog = 'firestore_not_initialized';
             res.status(200).json({ ok: true, rid: req.traceId, warning: 'db_not_initialized' });
