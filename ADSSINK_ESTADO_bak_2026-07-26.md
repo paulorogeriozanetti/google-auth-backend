@@ -8,12 +8,7 @@ Este código estava escrito e **duplamente aprovado (R1+R2)** mas existia apenas
 efémero do agente. Esta branch é a **persistência** desse trabalho — não é um pedido de merge
 e não representa nada que esteja em produção.
 
-~~**Nada aqui está deployed.** O Railway faz deploy de `main`; esta branch não o toca.~~
-**DESACTUALIZADO — 2026-07-26.** A branch foi **merged para `main`** e o Railway fez deploy
-(`google-auth-backend` · ACTIVE · *"Merge feat/adssink: AdsSink v2.2.0 + ConvMapLoaderCsv v2.1.0
-+ ConsentResolver v1.0.0 (codigo inerte, nenhum require, PZ_ADSSINK_ENABLED=false)"* ·
-Deployment successful). O código **está em produção mas continua inerte** — ver a secção
-*"Por que o merge para `main` é inerte"* no fim deste ficheiro. Estar deployed ≠ estar activo.
+**Nada aqui está deployed.** O Railway faz deploy de `main`; esta branch não o toca.
 
 ## Artefactos
 
@@ -22,7 +17,7 @@ Deployment successful). O código **está em produção mas continua inerte** �
 | `AdsSink.js` | **2.2.0** | ✅ R1 + R2 aprovado |
 | `ConvMapLoaderCsv.js` | **2.1.0** | ✅ R1 + R2 aprovado |
 | `ConsentResolver.js` | **1.0.0** | ✅ R1 + R2 aprovado |
-| `adssink_csv/pz_conversion_map.csv` | 14 col, sep `;` | ✅ **em produção** — attachment 14009, ver secção do gate |
+| `adssink_csv/pz_conversion_map.csv` | 14 col, sep `;` | desenhado, **não escrito em produção** |
 | `adssink_csv/pz_conversion_map_PROPOSTA*.csv` | — | proposta + backup |
 
 Os CSVs vivem aqui só para não se perderem. O CSV de produção é servido a partir do repo
@@ -43,20 +38,11 @@ Os CSVs vivem aqui só para não se perderem. O CSV de produção é servido a p
 > Lição: a versão de um ficheiro lê-se na constante que o runtime emite, não no comentário de
 > cabeçalho. Quando as duas discordam, isso é o defeito — não um detalhe cosmético.
 
-## Cobertura do bridge — divergência rascunho vs PROPOSTA
+## Cobertura do bridge — divergência produção vs PROPOSTA
 
-> ⚠️ **ERRO DE RÓTULO CORRIGIDO — 2026-07-26.** A coluna abaixo esteve rotulada **"Produção"**
-> e **não era produção**. Foi construída a partir do rascunho local
-> `out/adssink/pz_conversion_map.csv` (1574 b, 6 linhas), que **nunca esteve em produção** —
-> à data em que a tabela foi escrita **não existia qualquer CSV de conversões em produção**.
-> A coluna está agora rotulada **"Rascunho (1574 b)"**. Qualquer outro doc que ainda diga
-> "Produção" nesta tabela tem o mesmo defeito.
->
-> A produção real de hoje é o **v3** (5901 b, 8 linhas) — ver a tabela da decisão logo abaixo.
+O CSV de produção e a PROPOSTA não cobrem as mesmas páginas. Por `conversion_action_id`:
 
-O rascunho e a PROPOSTA não cobriam as mesmas páginas. Por `conversion_action_id`:
-
-| ctId | Rascunho (1574 b, **nunca em produção**) | PROPOSTA |
+| ctId | Produção | PROPOSTA |
 |---|---|---|
 | 7697484643 | purchase digistore24 | purchase digistore24 + clickbank + mediascalers |
 | 7697484646 | page view **presell** | page view **presell** *e* **lander-white** (colapsados) |
@@ -91,8 +77,7 @@ Zero ctIds órfãos. A separação lander/presell elimina o duplo disparo por jo
 Justificação: hoje as duas páginas têm a mesma função no funil, mas podem divergir — manter
 acções distintas custa nada e preserva a opção.
 
-✅ **Este ficheiro ESTÁ em produção desde 2026-07-26** — upload feito, verificado por sha256.
-Ver a secção do gate abaixo para o attachment_id, o URL e a variável do Railway.
+**Este ficheiro ainda NÃO está em produção.** Falta o upload — ver nota do `attachment_id` abaixo.
 
 ⚠️ `conversion_action_name` é **decorativo** — o loader indexa por `conversion_action_id`. As três
 fontes discordam nos nomes do mesmo ctId (ex.: `7697484646` = `pz_view_offer` no PROJECTS.md,
@@ -137,58 +122,14 @@ Todas as linhas nascem `consent_passthrough=disabled`. **O transporte não exist
 `ad_user_data` / `ad_personalization` nunca chegam ao backend. Activar uma linha sem transporte
 seria declarar ao Google um consentimento que não foi verificado.
 
-## Gate de produção do `pz_conversion_map.csv` — ✅ FECHADO (2026-07-26)
+## Gate de produção do `pz_conversion_map.csv` (2026-07-26)
 
-> ⚠️ **ERRO DO AGENTE, CORRIGIDO.** A versão anterior desta secção afirmava que *"o CSV de
-> produção é servido de `.../2026/07/pz_conversion_map.csv`"*. **Era falso quando foi escrito.**
-> Essa string não era prova de nada — era o **valor por omissão hardcoded** no
-> `ConvMapLoaderCsv.js` (linha 74), copiado para o doc como se fosse observação. Um `GET` ao
-> URL devolvia **404**, e uma varredura `HEAD` de todas as pastas de mês de 2025/2026 (incluindo
-> variantes `-1`) devolveu vazio: **o ficheiro não existia em lado nenhum.**
-> Mesmo padrão dos dois erros anteriores (a pendência inventada do `google-ads-api`; a
-> "correcção" de versões). Regra que daqui sai: **não se escreve um facto sobre um artefacto
-> sem o abrir.**
->
-> Consequência prática admitida: a instrução *"usar o procedimento de deploy como se fosse
-> existente"* **não era literalmente executável** — o Enable Media Replace exige um attachment
-> prévio. Foi necessariamente um primeiro upload. **A partir de agora É executável.**
-
-**Estado verificado em 2026-07-26 (medido, não presumido):**
-
-| Item | Valor |
-|---|---|
-| URL | `https://pzadvisors.com/wp-content/uploads/2026/07/pz_conversion_map.csv` → **HTTP 200** |
-| `attachment_id` | **14009** (slug `pz_conversion_map`, ficheiro `2026/07/pz_conversion_map.csv`) |
-| sha256 | `fe2e93c6e4b744a9222c91e6602b726fa393ecbc74304e37789f90216f135073` |
-| Bytes | 5901 — **byte-idêntico** ao `pz_conversion_map_v3.csv` revisto |
-| `last-modified` | `Sun, 26 Jul 2026 12:54:45 GMT` |
-| Renomeação | **nenhuma** — sem sufixo `-1`; a pasta `/2026/07/` bate com o default do loader |
-| GitHub | commit `21cd045` em `pza-frontend/csv/pz_conversion_map.csv`, sha256 idêntico |
-
-**Variável do Railway — aplicada 2026-07-26.** No serviço `google-auth-backend`, ambiente
-`production`: `PZ_CONVERSION_MAP_URL` = o URL acima. Header passou de **35 → 36 Service
-Variables**; o toast "Apply 1 change" desapareceu; o redeploy consequente concluiu
-**"Deployment successful"**. Precedência no `ConvMapLoaderCsv.js` (linhas 73-76):
-`csvPath` (arg do construtor) → `PZ_CONVERSION_MAP_URL` / `PZ_CONVERSION_MAP_PATH` (env) →
-default hardcoded. A variável é o que **retira a dependência do mês escrito no código**.
-
-⚠️ **Regra de manutenção que isto cria.** Se um upload futuro cair noutra pasta de mês
-(ex.: `/2026/09/`), o URL deixa de bater → o loader recebe **404** → `_invalidate('http_404')`
-(só quando não há cache) → `isValid() === false` → **AdsSink em no-op**: falha silenciosa mas
-segura. Nesse caso a variável **tem de ser ajustada**.
-**Como evitar de vez:** substituir sempre via **Enable Media Replace no attachment 14009**. O
-path e o nome mantêm-se, o URL nunca muda e a variável nunca precisa de ser tocada. Isto cumpre
-também a regra do Paulo: *"o nome deve ser `pz_conversion_map.csv`; versões e actualizações não
-devem alterar o nome."*
-
-⚠️ **Nota de leitura da UI do Railway.** A lista de variáveis é **virtualizada** — só as linhas
-visíveis existem no DOM. Um scan de `document.body.innerText` devolve **falso negativo**. Para
-confirmar que uma variável existe, usar sempre a caixa **"Filter variables"**.
-
-⚠️ **Duplicidade por investigar.** Coexistem no Railway `PZ_ADSSINK_ENABLED` (a que o código lê:
-`process.env.PZ_ADSSINK_ENABLED !== 'true'`) e `ADS_SINK_ENABLED` (sem leitor conhecido no
-código). Hoje inofensivo — ambas inertes. O risco é no dia da activação: mudar a errada e ficar
-convencido de que se ligou. Confirmar por `grep` no backend e apagar a órfã.
+O CSV de produção é servido de `pzadvisors.com/wp-content/uploads/2026/07/pz_conversion_map.csv`.
+Ao contrário dos 7 CSVs do CSV_GOVERNANCE, **este ficheiro não tem `attachment_id`**: nunca foi
+substituído via Enable Media Replace. Um primeiro upload cria um item de Media novo e o
+WordPress pode renomear (`pz_conversion_map-1.csv`) ou colocar noutra pasta de mês. Se o URL
+não bater certo, o loader recebe 404, marca o mapa inválido e o AdsSink fica no-op — **falha
+silenciosa mas segura**. Verificar o URL final depois do upload, antes de ligar seja o que for.
 
 ## Auditoria Fase 5 — CSV_GOVERNANCE (2026-07-26)
 
