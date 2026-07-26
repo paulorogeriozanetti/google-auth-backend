@@ -52,9 +52,23 @@ Três consequências, graduadas:
    jornada. Impacto contido ao *reporting*: só `pz_purchase` é Primary e os Gates lêem BigQuery,
    não o Ads. Ainda assim, **verificar a definição de contagem** (One vs Every) dessa acção.
 
-Decisão pendente do Paulo: (a) manter o modelo de produção — uma acção por page_type;
-(b) adoptar a PROPOSTA e aceitar perder cobertura do bridge; (c) adoptar a PROPOSTA e
-reintroduzir uma linha de bridge.
+**Decisão do Paulo, 2026-07-26 — opção (c) + separação das páginas.** Resolvida em
+`adssink_csv/pz_conversion_map_v3.csv` (8 linhas, 14 colunas, `isValid()===true` verificado
+por execução do `ConvMapLoaderCsv` real):
+
+| ctId | v3 |
+|---|---|
+| 7697484643 | purchase digistore24 + clickbank + **mediascalers (nasce activa)** |
+| 7697484646 | page view **presell** |
+| 7697484649 | page view **bridge** — reintroduzida |
+| 7697484652 | page view **lander-white** — separada da presell |
+| 7697484655 | checkout_click em **lander-white** e **presell** (bridge excluída, deliberado) |
+
+Zero ctIds órfãos. A separação lander/presell elimina o duplo disparo por jornada.
+Justificação: hoje as duas páginas têm a mesma função no funil, mas podem divergir — manter
+acções distintas custa nada e preserva a opção.
+
+**Este ficheiro ainda NÃO está em produção.** Falta o upload — ver nota do `attachment_id` abaixo.
 
 ⚠️ `conversion_action_name` é **decorativo** — o loader indexa por `conversion_action_id`. As três
 fontes discordam nos nomes do mesmo ctId (ex.: `7697484646` = `pz_view_offer` no PROJECTS.md,
@@ -94,3 +108,30 @@ mas **não bloqueia** — só passa a ser necessário acima de 2.880 ops/dia.
 Todas as linhas nascem `consent_passthrough=disabled`. **O transporte não existe**:
 `ad_user_data` / `ad_personalization` nunca chegam ao backend. Activar uma linha sem transporte
 seria declarar ao Google um consentimento que não foi verificado.
+
+## Gate de produção do `pz_conversion_map.csv` (2026-07-26)
+
+O CSV de produção é servido de `pzadvisors.com/wp-content/uploads/2026/07/pz_conversion_map.csv`.
+Ao contrário dos 7 CSVs do CSV_GOVERNANCE, **este ficheiro não tem `attachment_id`**: nunca foi
+substituído via Enable Media Replace. Um primeiro upload cria um item de Media novo e o
+WordPress pode renomear (`pz_conversion_map-1.csv`) ou colocar noutra pasta de mês. Se o URL
+não bater certo, o loader recebe 404, marca o mapa inválido e o AdsSink fica no-op — **falha
+silenciosa mas segura**. Verificar o URL final depois do upload, antes de ligar seja o que for.
+
+## Auditoria Fase 5 — CSV_GOVERNANCE (2026-07-26)
+
+Comparação por sha256 das 3 fontes dos 7 CSVs governados: **GitHub ≡ WordPress em 7/7**
+(as 2 divergências de 1 byte são só o `\n` final). A cópia local Windows estava desactualizada
+em 4 ficheiros — `pz_api_config`, `pz_pages_config`, `pz_solution_map`, `pz_offer_map` — todos
+parados antes do rollout Jetterix/MediaScalers.
+
+Double-check por data confirmou a causa: o commit `81153b6` (2026-07-24, *"backup byte-exacto
+da producao"*) mostra que o GitHub é espelho da produção, e os `last-modified` do WordPress
+mostram que exactamente esses 4 ficheiros foram alterados no lote de 19-07-2026 16:12–16:25 GMT.
+Os 3 que batiam localmente foram alterados antes (18-07, 26-06, 02-06). Reconciliados a partir
+da produção em 2026-07-26, com backups `_bak_2026-07-26` na pasta local.
+
+⚠️ **`CSV_GOVERNANCE.md` v4.0 está desactualizado:** documenta `pz_pages_config` com 9 colunas
+quando o ficheiro real tem 14 (`flow_mode` incluída) e omite `/dg/circo2-vsl`, `/norev-method`
+e `/jetterix-us`. Foi precisamente uma referência documental desactualizada que partiu o
+`/bridge` em 2026-05-12.
