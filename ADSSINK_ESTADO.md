@@ -14,14 +14,51 @@ e não representa nada que esteja em produção.
 
 | Ficheiro | Versão | Estado de revisão |
 |---|---|---|
-| `AdsSink.js` | 2.2.0 | ✅ R1 + R2 aprovado |
-| `ConvMapLoaderCsv.js` | 2.2.0 | ✅ R1 + R2 aprovado |
-| `ConsentResolver.js` | — | ✅ R1 + R2 aprovado |
+| `AdsSink.js` | **2.1.0** | ✅ R1 + R2 aprovado |
+| `ConvMapLoaderCsv.js` | **2.1.0** | ✅ R1 + R2 aprovado |
+| `ConsentResolver.js` | **1.0.0** | ✅ R1 + R2 aprovado |
 | `adssink_csv/pz_conversion_map.csv` | 14 col, sep `;` | desenhado, **não escrito em produção** |
 | `adssink_csv/pz_conversion_map_PROPOSTA*.csv` | — | proposta + backup |
 
 Os CSVs vivem aqui só para não se perderem. O CSV de produção é servido a partir do repo
 `pza-frontend` — ver `CSV_GOVERNANCE.md` no knowledge base.
+
+> **Correcção de versão — 2026-07-26.** Esta tabela declarava `2.2.0` para `AdsSink.js` e
+> `ConvMapLoaderCsv.js`, e `—` para `ConsentResolver.js`. Os números reais, lidos dos cabeçalhos
+> dos próprios ficheiros e confirmados em runtime (`[ConvMapLoaderCsv v2.1.0]`), são **2.1.0**,
+> **2.1.0** e **1.0.0**. O `2.2.0` nunca existiu — foi propagado pelos docs (e pelo agente).
+> Decisão do Paulo: **corrigir os docs, não fazer bump do ficheiro.** O código não mudou.
+
+## Cobertura do bridge — divergência produção vs PROPOSTA
+
+O CSV de produção e a PROPOSTA não cobrem as mesmas páginas. Por `conversion_action_id`:
+
+| ctId | Produção | PROPOSTA |
+|---|---|---|
+| 7697484643 | purchase digistore24 | purchase digistore24 + clickbank + mediascalers |
+| 7697484646 | page view **presell** | page view **presell** *e* **lander-white** (colapsados) |
+| 7697484649 | page view **bridge** | — sem linha (**órfão**) |
+| 7697484652 | page view **lander** (inactive) | — sem linha (**órfão**) |
+| 7697484655 | checkout_click em **qualquer** page_type (`*`) | checkout_click só em **presell** e **lander-white** |
+
+Três consequências, graduadas:
+
+1. **Exclusão do bridge no `checkout_click` — deliberada e documentada.** A própria linha da
+   PROPOSTA justifica: o checkout interno é mera passagem e dispara um segundo `checkout_click`;
+   sem a restrição havia duplo registo por utilizador. **Não é defeito.**
+2. **Remoção do page view do bridge — não documentada.** Órfã os ctIds `7697484649` e
+   `7697484652`, que ficam sem qualquer linha que os alimente. **É lacuna real.**
+3. **Colapso de `presell` + `lander-white` no mesmo ctId `7697484646`** — dispara duas vezes por
+   jornada. Impacto contido ao *reporting*: só `pz_purchase` é Primary e os Gates lêem BigQuery,
+   não o Ads. Ainda assim, **verificar a definição de contagem** (One vs Every) dessa acção.
+
+Decisão pendente do Paulo: (a) manter o modelo de produção — uma acção por page_type;
+(b) adoptar a PROPOSTA e aceitar perder cobertura do bridge; (c) adoptar a PROPOSTA e
+reintroduzir uma linha de bridge.
+
+⚠️ `conversion_action_name` é **decorativo** — o loader indexa por `conversion_action_id`. As três
+fontes discordam nos nomes do mesmo ctId (ex.: `7697484646` = `pz_view_offer` no PROJECTS.md,
+`pz_presell_view` em produção, `pz_view_item` na PROPOSTA). Inofensivo, mas enganador.
 
 ## O que falta antes de isto poder ir para `main`
 
