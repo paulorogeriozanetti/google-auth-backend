@@ -1,11 +1,16 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.1.0 (Ligacao Micro AdsSink) ---'); // [v6.1.0] era v6.0.4
+console.log('--- [BOOT CHECK] Loading server.js v6.2.1 (Reprocessador AdsSink + Data Manager) ---'); // [v6.2.1] era v6.1.0
 /**
- * PZ Auth+API Backend (v6.0.4 - S2S Parser Fix)
- * Versão: 6.0.4
- * Data: 2025-11-13
+ * PZ Auth+API Backend
+ * Versão: 6.2.1  (Reprocessador AdsSink + Data Manager API)
+ * Data: 2026-07-27
  * Autor: PZ Advisors
  *
- * Objetivo: Corrige o parser de body do ClickBank S2S para v6.0.0.
+ * ⚠️ VERSÃO: a verdade é a constante SERVER_VERSION (abaixo) + o boot log, NÃO este
+ *    cabeçalho. Histórico: 6.0.4 (S2S Parser Fix, 2025-11-13) -> 6.1.0 (ligação micro
+ *    AdsSink) -> 6.2.0 (reprocessador + seed create-only) -> 6.2.1 (bump de revisão).
+ *    Este bloco esteve preso em "6.0.4" durante o 6.1.0/6.2.0 — corrigido em 6.2.1.
+ *
+ * Objetivo original (v6.0.4): Corrige o parser de body do ClickBank S2S para v6.0.0.
  * - [CRÍTICO] Substitui app.all() por rotas GET e POST S2S separadas.
  * - [CRÍTICO] Rota POST /postback/clickbank agora aceita express.json() (principal)
  * e express.urlencoded() (fallback) para ler 'notification' e 'iv' [cite: Abaixo o feedback sobre os códigos gerados. Agora gerar nova versão v1.0.4 do PostbackRouter.js...].
@@ -30,8 +35,8 @@ const PostbackRouter = require('./PostbackRouter');
 const AdsSink = require('./AdsSink');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.1.0'; // [v6.1.0] era 6.0.4 (cosmetico; reportado em /api/version)
-const SERVER_DEPLOY_DATE = '2026-07-26'; // [v6.1.0] era 2025-11-13
+const SERVER_VERSION = '6.2.1'; // [v6.2.1] era 6.1.0. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
+const SERVER_DEPLOY_DATE = '2026-07-27'; // [v6.2.x] era 2026-07-26
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
@@ -482,10 +487,27 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
                     };
                     setImmediate(async () => {
                         try {
-                            await db.collection(_COLL).doc(_docId).set({
-                                platform: 'web', tx_id: _txid, gclid: payload.gclid, page_type: _pt || null,
-                                event_name: eventName, raw_event_key: _rawKey, source: 'micro_pageview', seed_at: new Date(),
-                            }, { merge: true });
+                            // [v6.2.0] Seed CREATE-ONLY: cria o doc já RECLAMÁVEL — ads_upload_status
+                            // 'pending' + ads_wake_at=now — atomicamente, com os campos crús para o
+                            // envelope imutável (event_time_iso/event_type congelados no 1º claim).
+                            // Se o doc JÁ existe, NÃO toca em nada: preserva todo o estado ads_*
+                            // (uploaded/validated/retry/submitted/submitting/polling/ads_envelope).
+                            // Sem isto, um crash entre o seed e o sendConversion deixaria o doc órfão
+                            // (sem estado nem ads_wake_at) e a query do reprocessador nunca o encontraria.
+                            const _ref = db.collection(_COLL).doc(_docId);
+                            try {
+                                await _ref.create({
+                                    platform: 'web', tx_id: _txid, gclid: payload.gclid, page_type: _pt || null,
+                                    event_name: eventName, event_type: eventName,
+                                    event_time_iso: _ts || new Date().toISOString(),
+                                    raw_event_key: _rawKey, source: 'micro_pageview', seed_at: new Date(),
+                                    ads_upload_status: 'pending', ads_wake_at: Timestamp.now(),
+                                });
+                            } catch (_ce) {
+                                // code 6 = ALREADY_EXISTS. Doc já existe -> não redefinir estado.
+                                const _already = _ce && (_ce.code === 6 || /already exists/i.test(_ce.message || ''));
+                                if (!_already) console.warn(`[TRACK][AdsSink] seed create falhou (nao ALREADY_EXISTS): ${_ce?.message || _ce}`);
+                            }
                             await AdsSink.sendConversion(_canonical, { event_name: eventName, page_type: _pt, collection: _COLL });
                         } catch (e) {
                             console.error(`[TRACK][AdsSink] micro erro: ${e?.message || e}`);
@@ -507,6 +529,31 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
         res.status(500).json({ ok: false, error: 'firestore_error', rid: req.traceId });
     }
 });
+
+// ═════════════ [v6.2.0] REPROCESSADOR AdsSink (fase POLL da Data Manager API) ═════════════
+// Conduz os docs em submitted/retry/pending/submitting/polling (via ads_wake_at). A fase
+// POLL do modelo submit->poll EXIGE isto: sem um driver periódico, `submitted` fica preso.
+// NUNCA lança (AdsSink.reprocessOnce é fail-safe). Autenticado por PZ_ADSSINK_REPROCESS_TOKEN.
+async function _runAdsReprocess() {
+    const micro = await AdsSink.reprocessOnce({ collection: 'ads_micro_outbox' });
+    const purchase = await AdsSink.reprocessOnce({ collection: process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions' });
+    return { micro, purchase };
+}
+
+app.post('/internal/ads-reprocess', express.json({ limit: '16kb' }), async (req, res) => {
+    const expected = process.env.PZ_ADSSINK_REPROCESS_TOKEN;
+    if (!expected) return res.status(503).json({ ok: false, error: 'reprocess_token_unset', rid: req.traceId });
+    const got = req.get('x-reprocess-token') || req.query.token;
+    if (got !== expected) return res.status(401).json({ ok: false, error: 'unauthorized', rid: req.traceId });
+    try {
+        const out = await _runAdsReprocess();
+        res.status(200).json({ ok: true, rid: req.traceId, ...out });
+    } catch (e) {
+        console.error(`[ads-reprocess] erro: ${e?.message || e}`);
+        res.status(500).json({ ok: false, error: 'reprocess_failed', rid: req.traceId });
+    }
+});
+// ═════════════ [v6.2.0] REPROCESSADOR AdsSink — FIM ═════════════
 
 // --- INÍCIO DA ALTERAÇÃO v6.0.3: (S2S Parsers Específicos) ---
 // Rota S2S (GET) - Usada pelo Digistore24 (sem body parser)
@@ -548,9 +595,20 @@ try {
     console.log(`   - Adapters     : ${ADAPTERS_LOADED ? '✅' : '❌'}`);
     console.log(`   - Guia URL Base: ${process.env.GUIDE_REDIRECT_BASE_URL || 'N/A'}`);
     console.log(`   - NODE_ENV     : ${process.env.NODE_ENV || 'undefined'}`);
+
+    // [v6.2.0] Scheduler in-process opcional do reprocessador AdsSink. Desligado
+    // por defeito (0). Alternativa ao endpoint /internal/ads-reprocess quando não
+    // há cron externo. Mínimo 30s. A lease do _claim protege contra corridas.
+    const _reprocessMs = parseInt(process.env.PZ_ADSSINK_REPROCESS_INTERVAL_MS || '0', 10);
+    if (Number.isFinite(_reprocessMs) && _reprocessMs >= 30000) {
+      setInterval(() => { _runAdsReprocess().catch((e) => console.error(`[ads-reprocess][interval] erro: ${e?.message || e}`)); }, _reprocessMs);
+      console.log(`   - AdsSink Poll : interval ${_reprocessMs}ms (in-process)`);
+    } else {
+      console.log(`   - AdsSink Poll : interval OFF (usar /internal/ads-reprocess)`);
+    }
     console.log('─'.repeat(60));
   });
 } catch (e) {
   console.error('[FATAL] Erro ao iniciar servidor:', e?.message || e);
   process.exit(1);
-}
+}
