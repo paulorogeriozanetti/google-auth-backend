@@ -1,4 +1,4 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.2.1 (Reprocessador AdsSink + Data Manager) ---'); // [v6.2.1] era v6.1.0
+console.log('--- [BOOT CHECK] Loading server.js v6.2.2 (Reprocessador AdsSink + Data Manager) ---'); // [v6.2.2] era v6.2.1
 /**
  * PZ Auth+API Backend
  * Versão: 6.2.2  (Reprocessador AdsSink + Data Manager API)
@@ -35,7 +35,7 @@ const PostbackRouter = require('./PostbackRouter');
 const AdsSink = require('./AdsSink');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.2.1'; // [v6.2.1] era 6.1.0. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
+const SERVER_VERSION = '6.2.2'; // [v6.2.2] era 6.1.0. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
 const SERVER_DEPLOY_DATE = '2026-07-27'; // [v6.2.x] era 2026-07-26
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
