@@ -1,8 +1,8 @@
-console.log('--- [BOOT CHECK] Loading server.js v6.2.2 (Reprocessador AdsSink + Data Manager) ---'); // [v6.2.2] era v6.2.1
+console.log('--- [BOOT CHECK] Loading server.js v6.2.3 (Reprocessador AdsSink + Data Manager) ---'); // [v6.2.3] era v6.2.2
 /**
  * PZ Auth+API Backend
- * Versão: 6.2.2  (Reprocessador AdsSink + Data Manager API)
- * Data: 2026-07-27
+ * Versão: 6.2.3  (Reprocessador AdsSink + Data Manager API)
+ * Data: 2026-07-28
  * Autor: PZ Advisors
  *
  * ⚠️ VERSÃO: a verdade é a constante SERVER_VERSION (abaixo) + o boot log, NÃO este
@@ -35,8 +35,8 @@ const PostbackRouter = require('./PostbackRouter');
 const AdsSink = require('./AdsSink');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.2.2'; // [v6.2.2] era 6.1.0. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
-const SERVER_DEPLOY_DATE = '2026-07-27'; // [v6.2.x] era 2026-07-26
+const SERVER_VERSION = '6.2.3'; // [v6.2.3] era 6.2.2. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
+const SERVER_DEPLOY_DATE = '2026-07-28'; // [v6.2.x] era 2026-07-26
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
 const USE_SECURE_COOKIES = process.env.NODE_ENV === 'production';
@@ -467,7 +467,7 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
             // Aprovado em revisão dupla (ARCHITECT + Gemini) 2026-07-26. Fire-and-forget: NUNCA bloqueia /api/track.
             // Só actua com PZ_ADSSINK_ENABLED==='true'. Colecção dedicada ads_micro_outbox (NÃO toca affiliate_transactions).
             // Usa o crypto e o db JÁ existentes neste ficheiro. Não introduz dependências novas.
-            const MICRO_EVENTS = new Set(['page_view_type', 'checkout_click', 'view_item']);
+            const MICRO_EVENTS = new Set(['page_view_type', 'begin_checkout', 'view_item']);
             if (process.env.PZ_ADSSINK_ENABLED === 'true' && MICRO_EVENTS.has(eventName) && payload?.gclid) {
                 const _pt = payload?.got?.page_type || payload?.page_type;
                 const _ts = payload?.ts;
