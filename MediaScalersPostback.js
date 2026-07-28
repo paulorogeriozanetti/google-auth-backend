@@ -1,13 +1,42 @@
 /**
  * MediaScalersPostback.js
- * Versão: v1.0.1
- * Data: 2026-07-17
+ * Versão: v1.0.3
+ * Data: 2026-07-28
  * Nome: MediaScalers (Everflow) S2S Postback Handler
  * Desc: Handler S2S (Server Postback GET) para a rede MediaScalers/Everflow.
  *
  * Alterações v1.0.1 (correções ditadas pelo ARCHITECT na revisão):
  * - Export renomeado para handleGet (contrato do PostbackRouter); handle mantido como alias.
  * - GA4 passa a ser aguardado (await) para capturar rejeições assíncronas (evita unhandledRejection).
+ *
+ * Alterações v1.0.2 (Fase 2 — Purchase→AdsSink, decisão 2026-07-28):
+ * - Mapeia commission_amount/commission_currency a partir de payout_amount/currency
+ *   já capturados (sem gap de dados — MediaScalers já entrega comissão e moeda no
+ *   próprio postback). Guard de valor > 0 (PEND-07) já é aplicado genericamente pelo
+ *   AdsSink._resolveValue (rejeita commission_amount <= 0 para qualquer plataforma) —
+ *   confirmado por leitura do código actual da v3.0.0, sem necessidade de duplicar
+ *   aqui.
+ * - Decisão do Paulo: o Conversion Point desta oferta ("Valid CC Submit", confirmado
+ *   na página da oferta 3736) é tratado como venda/comissão para efeitos do AdsSink —
+ *   é o próprio gatilho de pagamento da MediaScalers ao afiliado. Risco residual
+ *   registado (sem correção de código possível): a Everflow não tem macro de
+ *   refund/chargeback nesta oferta, logo uma submissão validada que falhe a cobrança
+ *   depois não tem mecanismo de correcção a jusante.
+ * - Adiciona Sink 4: AdsSink — chama AdsSink.sendConversion() para compras com gclid,
+ *   à imagem dos 3 sinks já existentes (best-effort, nunca bloqueia a resposta 200).
+ *
+ * Alterações v1.0.3 (Fase 2 — correção de bloqueador ARCHITECT, ronda 2):
+ * - Ao contrário de DS24 (status='test') e ClickBank (transactionType='test_sale'), não
+ *   foi identificado no payload actual da MediaScalers/Everflow um marcador explícito de
+ *   postback de TESTE (a Everflow "Postback Testing Tool" referida no BACKEND.md dispara
+ *   o mesmo tipo de conversão). Não se inventa aqui um nome de campo sem confirmação —
+ *   fica registado como risco residual aceite pelo ARCHITECT: com o payload actualmente
+ *   conhecido, teste e conversão real são indistinguíveis; controlo operacional
+ *   obrigatório é não usar gclid válido no Postback Testing Tool da Everflow até se
+ *   capturar um payload de teste real e confirmar um eventual discriminador. Passa a
+ *   calcular canonical.ads_eligible (purchase + gclid, sem exclusão de teste), lido
+ *   pelo Sink 4 e pela semente durável do FirebaseSink, para consistência com os
+ *   outros dois handlers.
  *
  * Contexto:
  * - O checkout MediaScalers é 100% FRONTEND (CTA da presell/lander -> tracking link
@@ -24,7 +53,7 @@
  *   sub9 = utm_campaign sub10 = utm_term
  *
  * Padrão de sinks: idêntico a DigistorePostback/ClickbankPostback (FirebaseSink,
- * DailyFactsSink, Ga4Sink — todos best-effort, nunca bloqueiam a resposta 200).
+ * DailyFactsSink, Ga4Sink, AdsSink — todos best-effort, nunca bloqueiam a resposta 200).
  *
  * NOTA (valor GA4): value_basis='affiliate_payout' e payout_amount/sale_amount ficam
  * explícitos no canônico. O Ga4Sink atual usa gross_amount; aqui gross_amount recebe o
@@ -35,6 +64,9 @@
 const FirebaseSink = require('./FirebaseSink');
 const Ga4Sink = require('./Ga4Sink');
 const DailyFactsSink = require('./DailyFactsSink');
+// --- Alteração v1.0.2: Importar AdsSink (Fase 2 — Purchase→AdsSink) ---
+const AdsSink = require('./AdsSink');
+// --- Fim da Alteração v1.0.2 ---
 
 // Segredo compartilhado configurado no Everflow (?ms_token=...) e no Railway.
 const EXPECTED_MS_TOKEN = process.env.MEDIASCALERS_S2S_TOKEN || '';
@@ -171,6 +203,11 @@ async function handleGet(req, res) {
     canonical.value_basis = 'affiliate_payout';
     canonical.currency = firstNonEmpty(query.offer_currency, query.currency, 'USD');
 
+    // --- Alteração v1.0.2: Comissão para o AdsSink (Fase 2 — Purchase→AdsSink) ---
+    canonical.commission_amount = canonical.payout_amount;
+    canonical.commission_currency = canonical.currency;
+    // --- Fim da Alteração v1.0.2 ---
+
     // Chaves de atribuição — Sub IDs (tolerantes a ausência).
     canonical.user_id = firstNonEmpty(query.sub1) || null;
     canonical.gclid = firstNonEmpty(query.sub2) || null;
@@ -182,6 +219,14 @@ async function handleGet(req, res) {
     canonical.utm_medium = firstNonEmpty(query.sub8) || null;
     canonical.utm_campaign = firstNonEmpty(query.sub9) || null;
     canonical.utm_term = firstNonEmpty(query.sub10) || null;
+
+    // --- Alteração v1.0.3: Elegibilidade para o AdsSink (correção de bloqueador ARCHITECT) ---
+    // Sem marcador de teste confirmado no payload actual (ver changelog acima) — risco
+    // residual aceite pelo ARCHITECT, com controlo operacional (não usar gclid real em
+    // testes na Everflow). Elegibilidade segue por agora apenas a regra já existente
+    // (purchase + gclid).
+    canonical.ads_eligible = canonical.event_type === 'purchase' && !!canonical.gclid;
+    // --- Fim da Alteração v1.0.3 ---
 
     canonical.event_time_iso = parseEverflowDate(
       firstNonEmpty(query.event_time, query.datetime, query.timestamp)
@@ -223,6 +268,17 @@ async function handleGet(req, res) {
   } catch (error) {
     console.error(`[MediaScalersPostback] Falha ao disparar o Ga4Sink (TX: ${canonical.tx_id}):`, error.message);
   }
+
+  // --- Alteração v1.0.3: Sink 4: AdsSink (Fase 2 — Purchase→AdsSink) ---
+  // Best-effort, nunca bloqueia a resposta 200. Gate: canonical.ads_eligible.
+  try {
+    if (canonical.ads_eligible) {
+      await AdsSink.sendConversion(canonical, { collection: 'affiliate_transactions' });
+    }
+  } catch (error) {
+    console.error(`[MediaScalersPostback] Falha ao disparar o AdsSink (TX: ${canonical.tx_id}):`, error.message);
+  }
+  // --- Fim da Alteração v1.0.3 ---
 
   // 5. Responder 200 OK
   return res.status(200).send('OK');

@@ -1,7 +1,7 @@
 /**
  * ClickbankPostback.js
- * Versão: v1.0.4
- * Data: 2026-03-25
+ * Versão: v1.2.0
+ * Data: 2026-07-28
  * Nome: ClickBank S2S Postback Handler
  * Desc: Handler S2S (webhook) para a plataforma ClickBank.
  *
@@ -12,12 +12,33 @@
  * - Adiciona fallback de anon_id e user_id via vendorVariables e trackingCodes.
  * - Adiciona captura opcional de dclid e click_timestamp.
  * - Mantém compatibilidade retroativa com tx_id, gross_amount e campos já usados pelos sinks.
+ *
+ * Alterações v1.1.0 (Fase 2 — Purchase→AdsSink, decisão 2026-07-28):
+ * - Corrige o cálculo da comissão: soma accountAmount de TODOS os lineItems (upsells
+ *   somam-se, regra de negócio), em vez de olhar só para lineItems[0] e priorizar
+ *   totalOrderAmount (bruto). accountAmount é "amount you received on this line item"
+ *   — já é a comissão do afiliado.
+ * - Fixa commission_currency='USD'. O campo currency do payload é exclusivo de
+ *   notificações role=vendor — nunca chega para afiliado — mas todos os valores
+ *   monetários do sistema ClickBank são sempre USD (confirmado:
+ *   support.clickbank.com/en/articles/10535147-instant-notification-service-ins).
+ * - Adiciona Sink 4: AdsSink — chama AdsSink.sendConversion() para compras com gclid,
+ *   à imagem dos 3 sinks já existentes (best-effort, nunca bloqueia a resposta 200).
+ *
+ * Alterações v1.2.0 (Fase 2 — correção de bloqueador ARCHITECT, ronda 2):
+ * - transactionType='test_sale' mapeia para event_type 'purchase' (mapEventType), mas
+ *   é um postback de TESTE do ClickBank — nunca deve gerar uma conversão real. Passa a
+ *   calcular canonical.ads_eligible (purchase + gclid + não-teste), lido pelo Sink 4 e
+ *   pela semente durável do FirebaseSink.
  */
 
 const crypto = require('crypto');
 const FirebaseSink = require('./FirebaseSink');
 const Ga4Sink = require('./Ga4Sink');
 const DailyFactsSink = require('./DailyFactsSink');
+// --- Alteração v1.1.0: Importar AdsSink (Fase 2 — Purchase→AdsSink) ---
+const AdsSink = require('./AdsSink');
+// --- Fim da Alteração v1.1.0 ---
 
 // Lê o segredo do .env
 const WEBHOOK_SECRET_KEY = process.env.CLICKBANK_WEBHOOK_SECRET_KEY || '';
@@ -191,7 +212,18 @@ async function handle(req, res) {
 
     const vv = toPlainObject(vendorVariables);
     const tracking = extractTrackingCodes(trackingCodes);
-    const firstItem = Array.isArray(lineItems) && lineItems.length ? lineItems[0] : {};
+    const items = Array.isArray(lineItems) ? lineItems : [];
+    const firstItem = items.length ? items[0] : {};
+
+    // --- Alteração v1.1.0: Comissão total a receber (Fase 2 — Purchase→AdsSink) ---
+    // Regra de negócio: soma accountAmount de TODOS os lineItems (upsells somam-se à
+    // comissão), nunca totalOrderAmount (bruto). accountAmount é "amount you received
+    // on this line item" — já é a comissão do afiliado, não o valor bruto da venda.
+    const commissionSum = items.reduce((sum, item) => {
+      const v = parseFloat(item && item.accountAmount);
+      return sum + (Number.isFinite(v) ? v : 0);
+    }, 0);
+    // --- Fim da Alteração v1.1.0 ---
 
     const vendorTid = firstNonEmpty(
       vv.user_id,
@@ -230,6 +262,11 @@ async function handle(req, res) {
     canonical.amount_gross = canonical.gross_amount; // alias adicional, sem remover gross_amount
     canonical.currency = currency || 'USD';
 
+    // --- Alteração v1.1.0: Comissão e moeda para o AdsSink (Fase 2) ---
+    canonical.commission_amount = commissionSum;
+    canonical.commission_currency = 'USD'; // ver nota no cabeçalho do ficheiro
+    // --- Fim da Alteração v1.1.0 ---
+
     // Chaves de Atribuição (essenciais para os Sinks)
     canonical.user_id = vendorTid || null; // O 'tid' do ClickBank continua compatível como user_id
     canonical.anon_id = canonicalAnonId || null;
@@ -244,6 +281,14 @@ async function handle(req, res) {
     canonical.utm_content = firstNonEmpty(vv.utm_content) || null;
     canonical.click_timestamp = firstNonEmpty(vv.click_timestamp, tracking.click_timestamp) || null;
     canonical.cid = firstNonEmpty(vv.cid, tracking.cid) || null; // v1.0.4 (item 9.3): alimenta Ga4Sink.client_id
+
+    // --- Alteração v1.2.0: Elegibilidade para o AdsSink (correção de bloqueador ARCHITECT) ---
+    // transactionType='test_sale' mapeia para event_type 'purchase' (mapEventType), mas
+    // é um postback de TESTE do ClickBank — nunca deve gerar uma conversão real, nem no
+    // disparo imediato (Sink 4) nem na semente durável do FirebaseSink.
+    const isTestTransaction = String(transactionType).toLowerCase() === 'test_sale';
+    canonical.ads_eligible = canonical.event_type === 'purchase' && !!canonical.gclid && !isTestTransaction;
+    // --- Fim da Alteração v1.2.0 ---
 
     // Parser de data robusto
     try {
@@ -289,6 +334,18 @@ async function handle(req, res) {
   } catch (error) {
     console.error(`[ClickbankPostback] Falha ao disparar o Ga4Sink (TX: ${canonical.tx_id}):`, error.message);
   }
+
+  // --- Alteração v1.2.0: Sink 4: AdsSink (Fase 2 — Purchase→AdsSink) ---
+  // Best-effort, nunca bloqueia a resposta 200. Gate: canonical.ads_eligible já inclui
+  // purchase + gclid + exclusão de teste (ver bloco acima).
+  try {
+    if (canonical.ads_eligible) {
+      await AdsSink.sendConversion(canonical, { collection: 'affiliate_transactions' });
+    }
+  } catch (error) {
+    console.error(`[ClickbankPostback] Falha ao disparar o AdsSink (TX: ${canonical.tx_id}):`, error.message);
+  }
+  // --- Fim da Alteração v1.2.0 ---
 
   // 4. Responder 200 OK
   return res.status(200).send('OK');
