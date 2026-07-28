@@ -1,6 +1,6 @@
 /**
  * DigistorePostback.js
- * Versão: v1.4.0
+ * Versão: v1.3.0
  * Data: 2026-07-28
  * Desc: Handler S2S (webhook) para a plataforma Digistore24.
  *
@@ -24,21 +24,6 @@
  *   disparo imediato (Sink 4), nem na semente durável que o FirebaseSink grava. Passa
  *   a calcular canonical.ads_eligible (purchase + gclid + não-teste), lido por ambos
  *   os caminhos para não haver duas implementações divergentes de "é teste?".
- *
- * Alterações v1.4.0 (correção de bloqueador identificado por verificação da doc oficial
- *   Digistore24, 2026-07-28 noite — aprovado ARCHITECT Ronda 2):
- * - {amount_affiliate_abs} NÃO é um placeholder real do Digistore24 (confirmado na doc oficial
- *   do S2S Postback — só existe {amount_affiliate}, "the amount you earn from the referred
- *   sale"). A leitura de código não muda (continua query.commission_amount); a correção é na
- *   URL do painel (aplicar DEPOIS deste deploy, por ordem do ARCHITECT).
- * - Adiciona leitura de query.is_test ({is_test} no painel — "Indicates whether this order is
- *   a test payment", placeholder dedicado, distinto de transaction_type/billing_status).
- *   isTestTransaction passa a usar este campo em vez de eventStatus==='test' — confirmado que
- *   {transaction_type} nunca emite o valor 'test' (só payment/refund/chargeback), logo a
- *   checagem anterior nunca disparava desde a v1.3.0. Formato exacto do valor de {is_test} NÃO
- *   está documentado publicamente pela Digistore24; a checagem aceita '1'/'true'/'yes'
- *   (case-insensitive) como risco residual documentado — a confirmar contra uma venda de teste
- *   real após o deploy. Requer também &is_test={is_test} na URL do painel (aplicar depois).
  */
 
 const FirebaseSink = require('./FirebaseSink');
@@ -109,9 +94,10 @@ async function handle(req, res) {
     canonical.currency = query.currency || 'USD';
 
     // --- Alteração v1.2.0: Comissão do afiliado (Fase 2 — Purchase→AdsSink) ---
-    // commission_amount vem de {amount_affiliate} (painel DS24 — ver changelog v1.4.0).
-    // commission_currency vem de {currency} (painel DS24 já configurado em USD). Sem fallback:
-    // se faltar, o AdsSink falha-fechado (permanent_error) em vez de adivinhar ou usar o bruto.
+    // commission_amount vem de {amount_affiliate_abs} (painel DS24, troca de parâmetro
+    // ainda pendente de autorização de escrita). commission_currency vem de {currency}
+    // (painel DS24 já configurado em USD). Sem fallback: se faltar, o AdsSink
+    // falha-fechado (permanent_error) em vez de adivinhar ou usar o bruto.
     const rawCommission = parseFloat(query.commission_amount || '0');
     canonical.commission_amount = Number.isFinite(rawCommission) ? rawCommission : 0;
     canonical.commission_currency = query.currency ? String(query.currency).toUpperCase() : null;
@@ -127,15 +113,15 @@ async function handle(req, res) {
     canonical.fbclid = query.fbclid || query.sid3 || null;
     canonical.campaignkey = query.campaign || query.campaignkey || null;
 
-    // --- Alteração v1.4.0: Elegibilidade para o AdsSink (correção de is_test) ---
-    // {transaction_type} nunca emite 'test' (confirmado: só payment/refund/chargeback) — a
-    // checagem anterior por eventStatus nunca disparava. is_test é o placeholder dedicado da
-    // Digistore24 para isto ("Indicates whether this order is a test payment"). Formato exacto
-    // do valor não documentado publicamente — aceita '1'/'true'/'yes' (case-insensitive) como
-    // risco residual, a confirmar contra uma venda de teste real.
-    const isTestTransaction = ['1', 'true', 'yes'].includes(String(query.is_test || '').toLowerCase());
+    // --- Alteração v1.3.0: Elegibilidade para o AdsSink (correção de bloqueador ARCHITECT) ---
+    // Um postback de TESTE (eventStatus/status literal 'test') mapeia para event_type
+    // 'purchase' (mapEventType), mas nunca deve ser tratado como venda real — nem no
+    // disparo imediato (Sink 4), nem na semente durável que o FirebaseSink grava (senão
+    // o reprocessador apanha-o mais tarde e envia-o na mesma). Um único campo, lido por
+    // ambos os caminhos, evita duas implementações divergentes de "é teste?".
+    const isTestTransaction = String(eventStatus).toLowerCase() === 'test';
     canonical.ads_eligible = canonical.event_type === 'purchase' && !!canonical.gclid && !isTestTransaction;
-    // --- Fim da Alteração v1.4.0 ---
+    // --- Fim da Alteração v1.3.0 ---
 
     canonical.event_time_iso = query.timestamp ? new Date(query.timestamp.replace(' ', 'T') + 'Z').toISOString() : new Date().toISOString();
 
