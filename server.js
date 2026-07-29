@@ -467,7 +467,7 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
             // Aprovado em revisão dupla (ARCHITECT + Gemini) 2026-07-26. Fire-and-forget: NUNCA bloqueia /api/track.
             // Só actua com PZ_ADSSINK_ENABLED==='true'. Colecção dedicada ads_micro_outbox (NÃO toca affiliate_transactions).
             // Usa o crypto e o db JÁ existentes neste ficheiro. Não introduz dependências novas.
-            const MICRO_EVENTS = new Set(['page_view_type', 'begin_checkout', 'view_item']);
+            const MICRO_EVENTS = new Set(['begin_checkout', 'view_item']);
             if (process.env.PZ_ADSSINK_ENABLED === 'true' && MICRO_EVENTS.has(eventName) && payload?.gclid) {
                 const _pt = payload?.got?.page_type || payload?.page_type;
                 const _ts = payload?.ts;
