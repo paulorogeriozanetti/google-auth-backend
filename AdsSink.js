@@ -1,119 +1,42 @@
 /**
  * PZ Advisors — AdsSink
- * Versão: v2.2.0
- * Data: 2026-07-25
+ * Versão: v3.0.1
+ * Data: 2026-07-28
  *
- * MUDANÇA v1.0.0 -> v2.0.0 (plano v8.2, aprovado por ARCHITECT + Gemini):
+ * MIGRAÇÃO v2.3.0 -> v3.0.0 — Google Ads UploadClickConversions (BLOQUEADO a novas
+ * integrações desde 15/jun/2026) -> **Data Manager API** (events:ingest +
+ * requestStatus:retrieve). Plano APROVADO por ARCHITECT (v3.1). Ver docs de projecto.
  *
- * 1. MÁQUINA DE ESTADOS DURÁVEL re-hospedada em `affiliate_transactions`
- *    (sem colecção outbox separada). O v1 tinha um "stale lock" de 10 minutos,
- *    sem backoff, sem limite de tentativas e sem classe de erro — foi REJEITADO.
+ * Modelo submit->poll (events:ingest é ASSÍNCRONO: devolve só {requestId}; só
+ * requestStatus:retrieve confirma SUCCESS/FAILED). Envelope imutável write-once.
+ * Estados submitting/polling com fase recuperável. Reprocessador conduz a fase poll.
  *
- * 2. PREDICADO DE CLAIM (aprovado, verbatim):
- *      elegível =
- *        ( (status ausente OU status=pending)
- *          E (ads_next_attempt_at ausente OU ads_next_attempt_at <= now) )
- *        OU ( status=retry     E ads_next_attempt_at <= now )
- *        OU ( status=in_flight E ads_lease_until     <  now )
+ * CORREÇÕES da revisão de código completo (ARCHITECT, fase 2):
+ *  1. `validated` volta ao envio real: mantém ads_wake_at e entra na query do
+ *     reprocessador; ao desligar o dry-run é promovido a submit.
+ *  2. FENCING TOKEN: o claim gera ads_lease_token; toda a transição de fase é um
+ *     CAS transacional (_markGuarded) que exige o token corrente. Um worker cuja
+ *     lease expirou não sobrescreve o estado escrito por um worker mais recente.
+ *  3. DEADLINE também em falhas de transporte no poll: timeout/5xx durante o
+ *     retrieve incrementa ads_poll_attempts e respeita ads_poll_deadline (24h).
  *
- *    NÃO elegível, explicitamente:
- *      - uploaded         -> idempotência
- *      - permanent_error  -> terminal
- *      - retry     com ads_next_attempt_at > now  -> backoff por cumprir
- *      - in_flight com ads_lease_until    >= now  -> lease válida de outro worker
+ * Alterações v3.0.1 (Fase 2 — Purchase→AdsSink, correção estrutural ARCHITECT,
+ * 2026-07-28): _ensureEnvelope() passa a construir o envelope a partir de
+ * data.ads_envelope_src (snapshot congelado gravado pelo FirebaseSink v1.5.0 no
+ * momento do seed) quando existir, com fallback para o documento completo (data)
+ * quando não existir — preserva byte-a-byte o comportamento anterior para o caminho
+ * micro (ads_micro_outbox, seed próprio do server.js) e para documentos legados sem
+ * snapshot. Motivo: sem este snapshot, um refund/chargeback com o mesmo tx_id da
+ * compra (mesmo docId) alterava os campos de topo do documento (event_type, gclid,
+ * comissão) depois do seed mas antes do 1º claim, contaminando o envelope da compra.
+ * Nenhuma outra função deste ficheiro foi alterada.
  *
- *    Na recuperação de lease expirada, `ads_attempts` TAMBÉM é incrementado:
- *    uma lease perdida conta como tentativa e consome o limite. Sem isto, um
- *    worker que morre em loop reclama para sempre.
- *
- * 3. partial_failure — semântica corrigida (erro meu na v8.1, apanhado em revisão):
- *      - `partial_failure` é campo do REQUEST e é OBRIGATÓRIO a true.
- *      - `partial_failure_error` é campo da RESPONSE, do tipo google.rpc.Status.
- *      - HTTP 200 NÃO é sucesso. Só se marca `uploaded` quando a operação
- *        correspondente aparece em `results` SEM erro no seu índice.
- *      - `validate_only` é uma flag SEPARADA do request (fase F4).
- *
- * 4. Invariante merge-only: qualquer escrita neste documento usa merge:true.
- *    Nenhum caminho fora do AdsSink escreve campos `ads_*`.
- *
- * MUDANÇA v2.1.0 -> v2.2.0 (2ª revisão ARCHITECT — 3 defeitos):
- *
- * 1. CUSTOMER DO UPLOAD. O endpoint usava PZ_ADS_CUSTOMER_ID (conta operacional)
- *    enquanto o resource name da acção usava a MCC proprietária. Em cross-account
- *    conversion tracking o upload tem de ir para o conversion tracking customer.
- *    Verificado na documentação: google_ads_conversion_customer "indicates the
- *    Google Ads account that creates and manages conversions for this customer.
- *    For customers using cross-account conversion tracking, this is the ID of a
- *    manager account." Implementado _resolveConversionCustomerId(), com o
- *    preflight GAQL que o plano v5 declarava e nunca existiu, mais uma invariante
- *    dura: endpoint != dono do resource name => EC_CONFIG.
- *
- * 2. ALLOWLIST DE DUPLICADOS. Era `.some()`: um código "already exists" ao lado
- *    de um erro real dava o request inteiro como sucesso e o erro desaparecia.
- *    Passa a `codes.length > 0 && codes.every(...)`.
- *
- * 3. _mark() ENGOLIA FALHAS DO FIRESTORE. O Google aceitava, a escrita falhava em
- *    silêncio e sendConversion() devolvia sent:true. Agora propaga; contadores e
- *    confirmação ao chamador só depois de persistência bem-sucedida; o log do erro
- *    passa a vir antes da escrita.
- *
- * MUDANÇA v2.0.0 -> v2.1.0 (revisão de código ARCHITECT — 4 bloqueadores):
- *
- * A. DUPLICADOS. A allowlist da v2.0.0 estava errada. DUPLICATE_ORDER_ID e
- *    DUPLICATE_CLICK_CONVERSION_IN_REQUEST descrevem colisões DENTRO do mesmo
- *    request e o evento NÃO é processado — marcá-los `uploaded` perdia a
- *    conversão em silêncio. Os códigos que significam "o Google já tem" são
- *    CLICK_CONVERSION_ALREADY_EXISTS e ORDER_ID_ALREADY_IN_USE (este último
- *    acrescentado por mim: é exactamente o que uma repetição por lease expirada
- *    produz num sistema que envia orderId, como o nosso). Os dois DUPLICATE_*
- *    passam a erro de configuração — são impossíveis com 1 conversão/request.
- *
- * B. VALOR. `from_transaction` lia gross_amount e degradava ausência para 0.
- *    Somos afiliados: a receita é a COMISSÃO. Passa a commission_amount +
- *    commission_currency, fail-closed. Ver _resolveValue().
- *
- * C. validate_only já não devolve o documento a `pending`. Estado novo
- *    `validated`, não reclamável enquanto o dry-run estiver ligado; ao desligar,
- *    o documento é libertado e ads_attempts é ZERADO. Antes, cada ciclo de
- *    dry-run gastava uma tentativa até matar o documento em permanent_error.
- *
- * D. (no ConvMapLoaderCsv) duplicados de chave e fixed_value/currency.
- *
- * Princípios (não negociáveis, herdados da v1):
- * 1. NUNCA lança para o chamador. O postback responde 200 ao DS24 mesmo com o
- *    Google Ads em baixo. Falha do AdsSink != falha do postback.
- * 2. FAIL-CLOSED. Mapa inválido, flag off, sem gclid, sem acção → no-op registado.
- * 3. IDEMPOTENTE. Estado no próprio documento, reservado por transacção Firestore.
- *    Redundância: `orderId` enviado ao Google, que também deduplica do lado dele.
- * 4. SEM REGRA DE NEGÓCIO NO CÓDIGO. Acção, valor e consentimento vêm do CSV.
- *
- * Implementação HTTP: REST + google-auth-library + axios, ambos JÁ dependências
- * do backend. Deliberadamente NÃO se adiciona google-ads-api (~40 MB + gerador
- * gRPC para uma única chamada).
- *
- * Variáveis de ambiente (NOMES; valores só no Railway):
- *   PZ_ADSSINK_ENABLED                   'true' liga o envio. Default: desligado.
- *   PZ_ADSSINK_VALIDATE_ONLY             'true' → validateOnly (dry-run, F4).
- *   PZ_ADS_CUSTOMER_ID                   conta operacional, só dígitos. NÃO é o
- *                                        alvo do upload; serve para o preflight.
- *   PZ_ADS_LOGIN_CUSTOMER_ID             MCC, só dígitos (header login-customer-id).
- *   PZ_ADS_CONVERSION_ACTION_CUSTOMER_ID conversion tracking customer / dono das
- *                                        acções (MCC 440-410-8297). É ESTE que vai
- *                                        no endpoint E no resource name. Sem fallback.
- *   PZ_ADSSINK_SKIP_CONV_CUSTOMER_PREFLIGHT  'true' salta a confirmação via API.
- *   PZ_ADS_DEVELOPER_TOKEN
- *   PZ_ADS_CLIENT_ID
- *   PZ_ADS_CLIENT_SECRET
- *   PZ_ADS_REFRESH_TOKEN
- *   PZ_ADS_API_VERSION                   default 'v21'
- *   PZ_ADS_ACCOUNT_TZ_OFFSET             ex.: '+00:00'. Deve IGUALAR o fuso da conta.
- *   PZ_ADSSINK_HTTP_TIMEOUT_MS           default 10000
- *   PZ_ADSSINK_MAX_ATTEMPTS              default 6. Excedido → permanent_error + alarme.
- *   PZ_ADSSINK_LEASE_MS                  default 120000 (2 min).
- *   PZ_ADSSINK_BACKOFF_BASE_MS           default 60000 (1 min).
- *   PZ_ADSSINK_BACKOFF_MAX_MS            default 3600000 (1 h).
+ * Env: ver secção no fundo do plano. NÃO usa developer token nem google-ads-api.
  */
 
+'use strict';
+
+const crypto = require('crypto');
 const axios = require('axios');
 const { UserRefreshClient } = require('google-auth-library');
 const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestore');
@@ -121,39 +44,40 @@ const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestor
 const ConvMapLoaderCsv = require('./ConvMapLoaderCsv');
 const ConsentResolver = require('./ConsentResolver');
 
-const VERSION = '2.3.0';
+const VERSION = '3.0.1';
 const LOG = `[AdsSink v${VERSION}]`;
 const COLLECTION_NAME = process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions';
+const PAYLOAD_VERSION = 'dm-v1';
 
-// Estados da máquina durável.
+const DM_BASE = 'https://datamanager.googleapis.com/v1';
+const DM_INGEST_URL = `${DM_BASE}/events:ingest`;
+const DM_STATUS_URL = `${DM_BASE}/requestStatus:retrieve`;
+
 const ST_PENDING = 'pending';
-const ST_IN_FLIGHT = 'in_flight';
+const ST_SUBMITTING = 'submitting';
+const ST_SUBMITTED = 'submitted';
+const ST_POLLING = 'polling';
 const ST_UPLOADED = 'uploaded';
-// CORRECÇÃO v2.1.0: estado terminal ENQUANTO o dry-run estiver ligado. Ver _claim().
 const ST_VALIDATED = 'validated';
 const ST_RETRY = 'retry';
 const ST_PERMANENT = 'permanent_error';
 
-// Classes de erro.
 const EC_TRANSIENT = 'transient';
 const EC_PERMANENT = 'permanent';
 const EC_CONFIG = 'config';
 
-// Contadores de observabilidade — o risco maior desta fase é o silêncio.
+// Estados-base reclamáveis pelo reprocessador. ST_VALIDATED é acrescentado à query
+// DINAMICAMENTE, e SÓ com o dry-run DESLIGADO (ver reprocessOnce): enquanto o dry-run
+// está ligado, _claim recusa validated sem mexer no ads_wake_at, logo se estivesse na
+// query os mesmos docs reapareceriam em cada ciclo e ocupariam o `limit`, esfomeando
+// pending/retry/submitted.
+const REPROCESS_STATES_BASE = [ST_PENDING, ST_RETRY, ST_SUBMITTED, ST_SUBMITTING, ST_POLLING];
+
 const counters = {
-  claimed: 0,
-  uploaded: 0,
-  retry_scheduled: 0,
-  permanent_errors: 0,
-  lease_recovered: 0,
-  attempts_exhausted: 0,
-  partial_failures: 0,
-  duplicate_ignored: 0,
-  validate_only_runs: 0,
-  // v2.2.0
-  state_write_failures: 0,
-  conv_customer_preflights: 0,
-  conv_customer_mismatch: 0,
+  claimed: 0, submitted: 0, uploaded: 0, polled: 0, still_processing: 0,
+  retry_scheduled: 0, permanent_errors: 0, lease_recovered: 0, attempts_exhausted: 0,
+  poll_deadline_exceeded: 0, duplicate_ignored: 0, validate_only_runs: 0,
+  state_write_failures: 0, reprocess_runs: 0, stale_lease_discarded: 0,
 };
 
 // ---------------------------------------------------------------- OAuth cache
@@ -172,21 +96,10 @@ function _getOAuthClient() {
 async function _getAccessToken() {
   const now = Date.now();
   if (_accessToken && now < _accessTokenExpiry - 60_000) return _accessToken;
-
   const client = _getOAuthClient();
-  if (!client) {
-    const e = new Error('oauth_credentials_missing');
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
+  if (!client) { const e = new Error('oauth_credentials_missing'); e.errorClass = EC_CONFIG; throw e; }
   const { token, res } = await client.getAccessToken();
-  if (!token) {
-    const e = new Error('oauth_no_token');
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
+  if (!token) { const e = new Error('oauth_no_token'); e.errorClass = EC_CONFIG; throw e; }
   _accessToken = token;
   const expiresIn = Number(res?.data?.expires_in || 3300);
   _accessTokenExpiry = now + expiresIn * 1000;
@@ -194,795 +107,509 @@ async function _getAccessToken() {
 }
 
 // ------------------------------------------------------------------- Helpers
+function _digits(v) { return String(v ?? '').replace(/\D+/g, ''); }
+function _envInt(name, dflt) { const n = parseInt(process.env[name] ?? '', 10); return Number.isFinite(n) && n > 0 ? n : dflt; }
+function _toRfc3339(iso) { const d = new Date(iso); if (!Number.isFinite(d.getTime())) throw new Error(`event_time_invalido: "${iso}"`); return d.toISOString(); }
+function _docIdFor(tx) { return `${String(tx.platform).replace(/[^\w\-]+/g, '_')}_${String(tx.tx_id).replace(/[^\w\-]+/g, '_')}`; }
+function _millis(ts) { if (!ts) return null; if (typeof ts.toMillis === 'function') return ts.toMillis(); if (ts instanceof Date) return ts.getTime(); const n = Number(ts); return Number.isFinite(n) ? n : null; }
+function _backoffMs(a) { const b = _envInt('PZ_ADSSINK_BACKOFF_BASE_MS', 60_000); const m = _envInt('PZ_ADSSINK_BACKOFF_MAX_MS', 3_600_000); return Math.min(b * Math.pow(2, Math.max(1, Number(a) || 1) - 1), m); }
+function _pollBackoffMs(a) { const b = _envInt('PZ_ADSSINK_POLL_BASE_MS', 30_000); const m = _envInt('PZ_ADSSINK_POLL_MAX_MS', 1_800_000); return Math.min(b * Math.pow(2, Math.max(1, Number(a) || 1) - 1), m); }
 
-function _digits(v) {
-  return String(v ?? '').replace(/\D+/g, '');
+function _dmConsent(v) {
+  const s = String(v || '').toUpperCase();
+  if (s === 'GRANTED' || s === 'CONSENT_GRANTED') return 'CONSENT_GRANTED';
+  if (s === 'DENIED' || s === 'CONSENT_DENIED') return 'CONSENT_DENIED';
+  return 'CONSENT_STATUS_UNSPECIFIED';
 }
 
-function _envInt(name, dflt) {
-  const n = parseInt(process.env[name] ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : dflt;
-}
-
-/**
- * Converte ISO-8601 para o formato exigido pelo Google Ads:
- *   'yyyy-mm-dd HH:mm:ss+|-HH:mm'
- * O offset NÃO é derivado do servidor (lição do DailyFactsSink, que gravava
- * tz_offset: 0 e deslocava a data). Vem de PZ_ADS_ACCOUNT_TZ_OFFSET e deve
- * igualar o fuso configurado na conta Google Ads.
- */
-function _toAdsDateTime(isoString) {
-  const offset = String(process.env.PZ_ADS_ACCOUNT_TZ_OFFSET || '+00:00').trim();
-  if (!/^[+-]\d{2}:\d{2}$/.test(offset)) throw new Error(`tz_offset_invalido: "${offset}"`);
-
-  const d = new Date(isoString);
-  if (!Number.isFinite(d.getTime())) throw new Error(`event_time_invalido: "${isoString}"`);
-
-  const sign = offset[0] === '-' ? -1 : 1;
-  const offMin = sign * (parseInt(offset.slice(1, 3), 10) * 60 + parseInt(offset.slice(4, 6), 10));
-
-  const shifted = new Date(d.getTime() + offMin * 60_000);
-  const p = (n) => String(n).padStart(2, '0');
-
-  return (
-    `${shifted.getUTCFullYear()}-${p(shifted.getUTCMonth() + 1)}-${p(shifted.getUTCDate())} ` +
-    `${p(shifted.getUTCHours())}:${p(shifted.getUTCMinutes())}:${p(shifted.getUTCSeconds())}${offset}`
-  );
-}
-
-function _docIdFor(tx) {
-  const safePlatform = String(tx.platform).replace(/[^\w\-]+/g, '_');
-  const safeTxId = String(tx.tx_id).replace(/[^\w\-]+/g, '_');
-  return `${safePlatform}_${safeTxId}`;
-}
-
-/**
- * Resolve o valor a enviar no ClickConversion.
- *
- * CORRECÇÃO v2.1.0 (revisão ARCHITECT). A versão anterior lia tx.gross_amount e
- * degradava ausência para 0. Duas coisas erradas de uma vez:
- *   1. O bruto NÃO é a nossa receita. Somos afiliados: a receita é a COMISSÃO.
- *      Alimentar o Smart Bidding com o bruto infla o ROAS por um factor igual à
- *      taxa de comissão e faz o motor licitar sobre um número que não existe.
- *   2. Degradar para 0 é pior do que falhar: uma conversão de valor 0 ensina
- *      activamente o modelo que aquele clique não vale nada.
- *
- * Regra nova: fail-closed sempre. Sem comissão válida não há envio — erro de
- * configuração, não de dados. Fica visível no ads_last_error e no alarme.
- *
- * NOTA DE SEQUÊNCIA: o DigistorePostback NÃO grava hoje commission_amount
- * (verificado em código — só grava gross_amount na linha 72). Enquanto o passo 4
- * do plano não o acrescentar, toda a linha com value_mode=from_transaction cai
- * em permanent_error. É deliberado: é preferível não enviar nada a enviar o bruto.
- *
- * @throws {Error & {errorClass:string}}
- */
 function _resolveValue(tx, mapRow) {
-  const fail = (msg) => { const e = new Error(msg); e.errorClass = EC_CONFIG; throw e; };
-
+  const fail = (m) => { const e = new Error(m); e.errorClass = EC_CONFIG; throw e; };
   if (mapRow.value_mode === 'none') return { value: null, currency: null };
-
   if (mapRow.value_mode === 'fixed') {
     const v = Number(mapRow.fixed_value);
-    if (!Number.isFinite(v) || v <= 0) {
-      fail(`value_mode=fixed com fixed_value inválido ("${mapRow.fixed_value}"): exige-se > 0`);
-    }
+    if (!Number.isFinite(v) || v <= 0) fail(`value_mode=fixed com fixed_value inválido ("${mapRow.fixed_value}")`);
     const cur = String(mapRow.currency || '').toUpperCase();
-    if (!/^[A-Z]{3}$/.test(cur)) {
-      fail(`value_mode=fixed sem currency explícita no CSV (recebido "${mapRow.currency}")`);
-    }
+    if (!/^[A-Z]{3}$/.test(cur)) fail(`value_mode=fixed sem currency ("${mapRow.currency}")`);
     return { value: v, currency: cur };
   }
-
-  // from_transaction → COMISSÃO do afiliado. Nunca o bruto, nunca um fallback.
   const v = Number(tx.commission_amount);
-  if (!Number.isFinite(v) || v <= 0) {
-    fail(
-      `value_mode=from_transaction mas commission_amount ausente/inválido ` +
-      `("${tx.commission_amount}"). Proibido substituir por gross_amount.`
-    );
-  }
+  if (!Number.isFinite(v) || v <= 0) fail(`value_mode=from_transaction sem commission_amount ("${tx.commission_amount}")`);
   const cur = String(tx.commission_currency || '').toUpperCase();
-  if (!/^[A-Z]{3}$/.test(cur)) {
-    fail(
-      `value_mode=from_transaction mas commission_currency ausente/inválida ` +
-      `("${tx.commission_currency}"). Moeda não é adivinhável.`
-    );
-  }
+  if (!/^[A-Z]{3}$/.test(cur)) fail(`value_mode=from_transaction sem commission_currency ("${tx.commission_currency}")`);
   return { value: v, currency: cur };
 }
 
-/** Backoff exponencial truncado: BASE * 2^(attempts-1), limitado a MAX. */
-function _backoffMs(attempts) {
-  const base = _envInt('PZ_ADSSINK_BACKOFF_BASE_MS', 60_000);
-  const max = _envInt('PZ_ADSSINK_BACKOFF_MAX_MS', 3_600_000);
-  const n = Math.max(1, Number(attempts) || 1);
-  const raw = base * Math.pow(2, n - 1);
-  return Math.min(raw, max);
+// -------------------------------------------------- Envelope imutável (write-once)
+function _buildEnvelope(src, mapRow, consent) {
+  const gclid = String(src.gclid || '').trim();
+  if (!gclid) { const e = new Error('envelope_sem_gclid'); e.errorClass = EC_CONFIG; throw e; }
+  const eventTimeIso = src.event_time_iso || src.event_time || null;
+  if (!eventTimeIso) { const e = new Error('envelope_sem_event_time_iso'); e.errorClass = EC_CONFIG; throw e; }
+  const eventTimestamp = _toRfc3339(eventTimeIso);
+  const transactionId = String(src.order_id || src.tx_id || '');
+  if (!transactionId) { const e = new Error('envelope_sem_transaction_id'); e.errorClass = EC_CONFIG; throw e; }
+  const operating = _digits(process.env.PZ_DM_OPERATING_ACCOUNT_ID || process.env.PZ_ADS_CONVERSION_ACTION_CUSTOMER_ID);
+  const login = _digits(process.env.PZ_DM_LOGIN_ACCOUNT_ID || process.env.PZ_ADS_LOGIN_CUSTOMER_ID);
+  if (!operating) { const e = new Error('PZ_DM_OPERATING_ACCOUNT_ID em falta'); e.errorClass = EC_CONFIG; throw e; }
+  if (!login) { const e = new Error('PZ_DM_LOGIN_ACCOUNT_ID em falta'); e.errorClass = EC_CONFIG; throw e; }
+  const cad = _digits(mapRow.conversion_action_id);
+  if (!cad) { const e = new Error(`conversion_action_id inválido ("${mapRow.conversion_action_id}")`); e.errorClass = EC_CONFIG; throw e; }
+  const { value, currency } = _resolveValue(src, mapRow);
+  const env = {
+    payload_version: PAYLOAD_VERSION, eventTimestamp, transactionId, gclid,
+    conversion_action_id: cad, operating_account_id: operating, login_account_id: login,
+    consent: { adUserData: _dmConsent(consent.adUserData), adPersonalization: _dmConsent(consent.adPersonalization) },
+  };
+  if (value !== null) { env.conversionValue = value; env.currency = currency; }
+  return env;
 }
 
-function _millis(ts) {
-  if (!ts) return null;
-  if (typeof ts.toMillis === 'function') return ts.toMillis();
-  if (ts instanceof Date) return ts.getTime();
-  const n = Number(ts);
-  return Number.isFinite(n) ? n : null;
+function _ingestBody(env, validateOnly) {
+  const event = { eventTimestamp: env.eventTimestamp, transactionId: env.transactionId, eventSource: 'WEB', adIdentifiers: { gclid: env.gclid } };
+  if (typeof env.conversionValue === 'number') { event.conversionValue = env.conversionValue; event.currency = env.currency; }
+  return {
+    destinations: [{
+      operatingAccount: { accountType: 'GOOGLE_ADS', accountId: env.operating_account_id },
+      loginAccount: { accountType: 'GOOGLE_ADS', accountId: env.login_account_id },
+      productDestinationId: env.conversion_action_id,
+    }],
+    events: [event], consent: env.consent, validateOnly: !!validateOnly,
+  };
 }
 
-// ---------------------------------------------- Claim (transacção Firestore)
+// --------------------------------------------------- Classificação de erros
+function _classifyHttp(status) { if (status === 429 || status >= 500) return EC_TRANSIENT; if (status === 401 || status === 403) return EC_CONFIG; return EC_PERMANENT; }
 
-/**
- * Reserva o direito de enviar esta transacção, aplicando o predicado aprovado.
- * Toda a decisão corre DENTRO da transacção Firestore — nunca lida fora e
- * escrita depois.
- *
- * @returns {Promise<{ok:boolean, reason?:string, attempts?:number, data?:object, recoveredLease?:boolean}>}
- */
+const PR_DUPLICATE = new Set(['PROCESSING_ERROR_REASON_DUPLICATE_TRANSACTION_ID', 'PROCESSING_ERROR_REASON_DUPLICATE_GCLID']);
+const PR_TRANSIENT = new Set(['PROCESSING_ERROR_REASON_INTERNAL_ERROR', 'PROCESSING_ERROR_REASON_UNSPECIFIED']);
+
+function _classifyReasons(reasons) {
+  const list = Array.isArray(reasons) ? reasons.filter(Boolean) : [];
+  if (list.length === 0) return 'permanent';
+  if (list.every((r) => PR_DUPLICATE.has(r))) return 'uploaded';
+  if (list.some((r) => !PR_DUPLICATE.has(r) && !PR_TRANSIENT.has(r))) return 'permanent';
+  if (list.some((r) => PR_TRANSIENT.has(r))) return 'retry';
+  return 'permanent';
+}
+
+// ------------------------------------------------------------- HTTP: ingest/poll
+async function _ingestEvent(env, validateOnly) {
+  const token = await _getAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const timeout = _envInt('PZ_ADSSINK_HTTP_TIMEOUT_MS', 10_000);
+  let res;
+  try { res = await axios.post(DM_INGEST_URL, _ingestBody(env, validateOnly), { headers, timeout, validateStatus: () => true }); }
+  catch (netErr) { const e = new Error(`network_error: ${netErr?.code || netErr?.message || netErr}`); e.errorClass = EC_TRANSIENT; throw e; }
+  if (res.status !== 200) {
+    const detail = typeof res.data === 'object' ? JSON.stringify(res.data).slice(0, 800) : String(res.data).slice(0, 800);
+    const e = new Error(`ingest_http_${res.status}: ${detail}`); e.errorClass = _classifyHttp(res.status); throw e;
+  }
+  const requestId = res.data?.requestId || null;
+  if (validateOnly) return { validateOnly: true, requestId };
+  if (!requestId) { const e = new Error('ingest_200_sem_requestId'); e.errorClass = EC_TRANSIENT; throw e; }
+  return { validateOnly: false, requestId };
+}
+
+async function _retrieveStatus(requestId) {
+  const token = await _getAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const timeout = _envInt('PZ_ADSSINK_HTTP_TIMEOUT_MS', 10_000);
+  let res;
+  try { res = await axios.get(DM_STATUS_URL, { headers, timeout, params: { requestId }, validateStatus: () => true }); }
+  catch (netErr) { const e = new Error(`status_network_error: ${netErr?.code || netErr?.message || netErr}`); e.errorClass = EC_TRANSIENT; throw e; }
+  if (res.status !== 200) {
+    const detail = typeof res.data === 'object' ? JSON.stringify(res.data).slice(0, 800) : String(res.data).slice(0, 800);
+    const e = new Error(`status_http_${res.status}: ${detail}`); e.errorClass = _classifyHttp(res.status); throw e;
+  }
+  const per = Array.isArray(res.data?.requestStatusPerDestination) ? res.data.requestStatusPerDestination : [];
+  const d0 = per[0] || {};
+  const status = d0.requestStatus || 'REQUEST_STATUS_UNKNOWN';
+  const reasons = [];
+  const ec = d0.errorInfo?.errorCounts;
+  if (Array.isArray(ec)) for (const c of ec) if (c?.reason) reasons.push(c.reason);
+  return { status, reasons };
+}
+
+// ---------------------------------------------- Claim (transacção + fencing token)
 async function _claim(docRef) {
   const db = getFirestore();
   const leaseMs = _envInt('PZ_ADSSINK_LEASE_MS', 120_000);
   const maxAttempts = _envInt('PZ_ADSSINK_MAX_ATTEMPTS', 6);
+  const leaseToken = crypto.randomBytes(16).toString('hex'); // FENCING TOKEN (correção #2)
 
   return db.runTransaction(async (t) => {
     const snap = await t.get(docRef);
     if (!snap.exists) return { ok: false, reason: 'doc_inexistente' };
-
     const data = snap.data() || {};
-    const status = data.ads_upload_status || null;
+    const status = data.ads_upload_status || ST_PENDING;
     const now = Date.now();
-
-    const nextAttemptMs = _millis(data.ads_next_attempt_at);
-    const leaseUntilMs = _millis(data.ads_lease_until);
-
-    let eligible = false;
-    let recoveredLease = false;
-    let resetAttempts = false;
     const validateOnlyNow = process.env.PZ_ADSSINK_VALIDATE_ONLY === 'true';
+    const hasRequestId = !!data.ads_dm_request_id;
 
-    if (!status || status === ST_PENDING) {
-      eligible = nextAttemptMs === null || nextAttemptMs <= now;
-      if (!eligible) return { ok: false, reason: 'backoff_por_cumprir' };
-    } else if (status === ST_RETRY) {
-      eligible = nextAttemptMs !== null && nextAttemptMs <= now;
-      if (!eligible) return { ok: false, reason: 'backoff_por_cumprir' };
-    } else if (status === ST_IN_FLIGHT) {
-      // Lease ausente é tratada como expirada: documento escrito por uma versão
-      // anterior do sink, ou escrita parcial. Não se assume lease infinita.
-      eligible = leaseUntilMs === null || leaseUntilMs < now;
-      if (!eligible) return { ok: false, reason: 'lease_valida_noutro_worker' };
-      recoveredLease = true;
-    } else if (status === ST_UPLOADED) {
-      return { ok: false, reason: 'ja_enviado' };
-    } else if (status === ST_VALIDATED) {
-      // CORRECÇÃO v2.1.0 (revisão ARCHITECT). Antes, o dry-run devolvia o
-      // documento a `pending` mantendo o ads_attempts incrementado — o
-      // reprocessador reclamava-o outra vez a cada ciclo até esgotar o limite e
-      // marcar permanent_error um documento que nunca teve problema nenhum.
-      //
-      // Agora: validado com dry-run LIGADO → não reclamável (nada mais há a
-      // aprender de o revalidar). Dry-run DESLIGADO → reclamável, e o contador
-      // de tentativas é ZERADO, porque as tentativas gastas foram validações,
-      // não envios. O envio real começa com o orçamento intacto.
-      if (validateOnlyNow) return { ok: false, reason: 'ja_validado_em_dry_run' };
-      resetAttempts = true;
-    } else if (status === ST_PERMANENT) {
-      return { ok: false, reason: 'erro_permanente_terminal' };
+    if (status === ST_UPLOADED) return { ok: false, reason: 'ja_enviado' };
+    if (status === ST_PERMANENT) return { ok: false, reason: 'erro_permanente_terminal' };
+    if (status === ST_VALIDATED && validateOnlyNow) return { ok: false, reason: 'ja_validado_em_dry_run' };
+
+    const wakeMs = _millis(data.ads_wake_at);
+    const leaseUntilMs = _millis(data.ads_lease_until);
+    let phase = null, recoveredLease = false, resetAttempts = false;
+
+    if (status === ST_PENDING || status === ST_RETRY) {
+      if (wakeMs !== null && wakeMs > now) return { ok: false, reason: 'backoff_por_cumprir' };
+      phase = 'submit';
+    } else if (status === ST_VALIDATED) { // só chega aqui com dry-run OFF -> envio real
+      resetAttempts = true; phase = 'submit';
+    } else if (status === ST_SUBMITTED) {
+      if (wakeMs !== null && wakeMs > now) return { ok: false, reason: 'poll_por_cumprir' };
+      phase = 'poll';
+    } else if (status === ST_SUBMITTING) {
+      if (leaseUntilMs !== null && leaseUntilMs >= now) return { ok: false, reason: 'lease_valida_noutro_worker' };
+      recoveredLease = true; phase = hasRequestId ? 'poll' : 'submit';
+    } else if (status === ST_POLLING) {
+      if (leaseUntilMs !== null && leaseUntilMs >= now) return { ok: false, reason: 'lease_valida_noutro_worker' };
+      recoveredLease = true; phase = 'poll';
     } else {
       return { ok: false, reason: `status_desconhecido:${status}` };
     }
 
-    // Lease perdida CONSOME tentativa — igual a qualquer outra tentativa.
-    // Excepção: transição validated → envio real reinicia o orçamento (ver acima).
-    const attempts = resetAttempts ? 1 : Number(data.ads_attempts || 0) + 1;
-
-    if (attempts > maxAttempts) {
-      t.set(docRef, {
-        ads_upload_status: ST_PERMANENT,
-        ads_attempts: attempts,
-        ads_error_class: EC_PERMANENT,
-        ads_last_error: `max_attempts_excedido (${attempts} > ${maxAttempts})`,
-        ads_lease_until: FieldValue.delete(),
-        ads_next_attempt_at: FieldValue.delete(),
-        ads_sink_version: VERSION,
-      }, { merge: true });
-      return { ok: false, reason: 'max_attempts_excedido', attempts };
+    const leaseUntil = Timestamp.fromMillis(now + leaseMs);
+    if (phase === 'submit') {
+      const attempts = resetAttempts ? 1 : Number(data.ads_attempts || 0) + 1;
+      if (attempts > maxAttempts) {
+        t.set(docRef, {
+          ads_upload_status: ST_PERMANENT, ads_attempts: attempts, ads_error_class: EC_PERMANENT,
+          ads_last_error: `max_attempts_excedido (${attempts} > ${maxAttempts})`,
+          ads_lease_until: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+          ads_wake_at: FieldValue.delete(), ads_lease_token: FieldValue.delete(), ads_sink_version: VERSION,
+        }, { merge: true });
+        return { ok: false, reason: 'max_attempts_excedido', attempts };
+      }
+      const patch = {
+        ads_upload_status: ST_SUBMITTING, ads_attempts: attempts, ads_lease_until: leaseUntil,
+        ads_wake_at: leaseUntil, ads_lease_token: leaseToken, ads_sink_version: VERSION,
+      };
+      if (resetAttempts) { // validated -> envio real: recomeça limpo
+        patch.ads_dm_request_id = FieldValue.delete(); patch.ads_poll_attempts = FieldValue.delete(); patch.ads_poll_deadline = FieldValue.delete();
+      }
+      t.set(docRef, patch, { merge: true });
+      return { ok: true, phase, attempts, data, recoveredLease, leaseToken };
     }
 
-    t.set(docRef, {
-      ads_upload_status: ST_IN_FLIGHT,
-      ads_attempts: attempts,
-      ads_lease_until: Timestamp.fromMillis(now + leaseMs),
-      ads_sink_version: VERSION,
-    }, { merge: true });
-
-    return { ok: true, attempts, data, recoveredLease };
+    // poll — não consome tentativa de ingest; limitado por ads_poll_deadline.
+    t.set(docRef, { ads_upload_status: ST_POLLING, ads_lease_until: leaseUntil, ads_wake_at: leaseUntil, ads_lease_token: leaseToken, ads_sink_version: VERSION }, { merge: true });
+    return { ok: true, phase, attempts: Number(data.ads_attempts || 0), data, recoveredLease, leaseToken };
   });
 }
 
 /**
- * Escrita de estado. SEMPRE merge:true — invariante merge-only do plano v8.2.
- *
- * CORRECÇÃO v2.2.0 (revisão ARCHITECT, defeito 3). Esta função ENGOLIA a falha
- * do Firestore. Consequência: o Google aceitava a conversão, a escrita de
- * `uploaded` falhava em silêncio e sendConversion() devolvia sent:true — a
- * máquina durável ficava a mentir e o documento permanecia in_flight sem que
- * ninguém soubesse. Agora propaga.
- *
- * Propagar é seguro e auto-curativo: o throw sobe ao catch externo, que
- * deliberadamente não escreve; a lease expira, o item é reclamado outra vez e o
- * reenvio devolve ORDER_ID_ALREADY_IN_USE, tratado como duplicado/uploaded.
- * Nunca se confirma `uploaded`/`validated` ao chamador sem persistência.
+ * Escrita de estado com FENCING (correção #2): CAS transacional. Só escreve se o
+ * ads_lease_token do doc ainda for o do worker. Se outro worker (mais recente)
+ * reclamou o doc, a escrita é DESCARTADA (throw isStale) — o worker antigo não
+ * corrompe o estado do novo. Falha do Firestore propaga (isStateWriteFailure).
  */
-async function _mark(docRef, patch) {
+async function _markGuarded(docRef, leaseToken, patch) {
+  const db = getFirestore();
+  let stale = false;
   try {
-    await docRef.set({ ...patch, ads_state_updated_at: FieldValue.serverTimestamp() }, { merge: true });
+    await db.runTransaction(async (t) => {
+      const snap = await t.get(docRef);
+      if (!snap.exists) { const e = new Error('doc_desapareceu'); e.errorClass = EC_TRANSIENT; throw e; }
+      if ((snap.data() || {}).ads_lease_token !== leaseToken) { stale = true; return; }
+      t.set(docRef, { ...patch, ads_state_updated_at: FieldValue.serverTimestamp() }, { merge: true });
+    });
   } catch (e) {
     counters.state_write_failures++;
-    console.error(`${LOG} ALARME: falha ao persistir estado no Firestore:`, e?.message || e);
+    console.error(`${LOG} ALARME: falha ao persistir estado (guarded):`, e?.message || e);
     const err = new Error(`firestore_state_write_failed: ${e?.message || e}`);
-    err.errorClass = EC_TRANSIENT;
-    err.isStateWriteFailure = true;
-    throw err;
+    err.errorClass = EC_TRANSIENT; err.isStateWriteFailure = true; throw err;
   }
+  if (stale) {
+    counters.stale_lease_discarded++;
+    console.warn(`${LOG} escrita DESCARTADA por fencing (lease reclamada por worker mais recente). doc=${docRef.id || docRef._key || '?'}`);
+    const e = new Error('lease_roubada'); e.isStale = true; e.errorClass = EC_TRANSIENT; throw e;
+  }
+  return { stale: false };
 }
 
-// --------------------------------------------------- Classificação de erros
-
-// Códigos de erro da Google Ads API que valem repetição. Tudo o resto que chega
-// como partial failure é problema de dados/configuração: repetir só queima quota.
-const TRANSIENT_CODES = new Set([
-  'INTERNAL_ERROR',
-  'TRANSIENT_ERROR',
-  'DEADLINE_EXCEEDED',
-  'RESOURCE_TEMPORARILY_EXHAUSTED',
-  'RESOURCE_EXHAUSTED',
-  'CONCURRENT_MODIFICATION',
-]);
-
-// CORRECÇÃO v2.1.0 (revisão ARCHITECT). A allowlist anterior estava errada:
-// DUPLICATE_ORDER_ID e DUPLICATE_CLICK_CONVERSION_IN_REQUEST descrevem colisões
-// DENTRO DO MESMO REQUEST e o evento NÃO é processado — tratá-los como sucesso
-// perdia a conversão em silêncio.
-//
-// Verificado na documentação da API (ConversionUploadError):
-//   CLICK_CONVERSION_ALREADY_EXISTS (23) — "same click and conversion_date_time
-//     as an existing conversion" → o Google JÁ TEM. Idempotência a funcionar.
-//   ORDER_ID_ALREADY_IN_USE (15) — "order ID that was previously recorded, so the
-//     event was not processed" → o Google JÁ TEM (de um envio anterior nosso).
-//     É EXACTAMENTE o que uma repetição por lease expirada produz.
-//   DUPLICATE_ORDER_ID (16) — "multiple conversions with the same order ID [no
-//     mesmo request] and were not processed" → bug de implementação.
-//   DUPLICATE_CLICK_CONVERSION_IN_REQUEST (25) — idem → bug de implementação.
-//
-// Enviamos UMA conversão por request, portanto os dois últimos são impossíveis
-// por construção: se aparecerem, é defeito nosso e tem de gritar, não passar.
-const ALREADY_EXISTS_CODES = new Set([
-  'CLICK_CONVERSION_ALREADY_EXISTS',
-  'ORDER_ID_ALREADY_IN_USE',
-]);
-
-const IN_REQUEST_DUPLICATE_CODES = new Set([
-  'DUPLICATE_ORDER_ID',
-  'DUPLICATE_CLICK_CONVERSION_IN_REQUEST',
-]);
-
-/**
- * Extrai os códigos de erro de um google.rpc.Status vindo em partialFailureError.
- * Estrutura: status.details[] -> GoogleAdsFailure -> errors[] -> errorCode{...}
- */
-function _extractGoogleAdsErrorCodes(partialFailureError) {
-  const out = [];
-  const details = Array.isArray(partialFailureError?.details) ? partialFailureError.details : [];
-  for (const d of details) {
-    const errs = Array.isArray(d?.errors) ? d.errors : [];
-    for (const e of errs) {
-      const codeObj = e?.errorCode || {};
-      for (const k of Object.keys(codeObj)) {
-        const v = codeObj[k];
-        if (typeof v === 'string' && v) out.push(v);
-      }
-      if (!Object.keys(codeObj).length && e?.message) out.push(String(e.message).slice(0, 120));
-    }
-  }
-  return out;
-}
-
-function _classifyHttp(status) {
-  if (status === 429 || status >= 500) return EC_TRANSIENT;
-  if (status === 401 || status === 403) return EC_CONFIG;
-  return EC_PERMANENT;
-}
-
-// ------------------------------------------------------------------- Upload
-
-/**
- * Envia UMA ClickConversion.
- *
- * partial_failure=true é OBRIGATÓRIO no request — a API rejeita o request se for
- * false quando há operações que podem falhar individualmente.
- *
- * @returns {Promise<{validateOnly:boolean, uploaded:boolean, duplicate:boolean, result?:object}>}
- * @throws  {Error & {errorClass:string}}
- */
-// ------------------------------------------- Conversion tracking customer (v2.2.0)
-
-// Cache do preflight. TTL longo: a definição de cross-account tracking muda em
-// escala de meses, não de minutos.
-let _convCustomer = { id: null, at: 0 };
-const CONV_CUSTOMER_TTL_MS = 6 * 60 * 60 * 1000;
-
-/**
- * Resolve o cliente ao qual o upload tem de ser dirigido.
- *
- * Documentado pela Google: `customer.conversion_tracking_setting.
- * google_ads_conversion_customer` "indicates the Google Ads account that creates
- * and manages conversions for this customer. For customers using cross-account
- * conversion tracking, this is the ID of a manager account." É esse ID — e não o
- * da conta operacional — que vai no endpoint E no resource name da acção.
- *
- * O preflight (declarado no plano v5 e nunca implementado até aqui) confirma
- * contra a API que o valor configurado é de facto o conversion customer da conta
- * operacional. Divergência é EC_CONFIG: fail-closed, não se adivinha.
- *
- * @returns {Promise<string>} só dígitos
- */
-async function _resolveConversionCustomerId() {
-  const configured = _digits(process.env.PZ_ADS_CONVERSION_ACTION_CUSTOMER_ID);
-  if (!configured) {
-    const e = new Error(
-      'PZ_ADS_CONVERSION_ACTION_CUSTOMER_ID em falta. É o conversion tracking ' +
-      'customer (MCC proprietária das acções) e não tem fallback: usar a conta ' +
-      'operacional devolveria NOT_FOUND ou escreveria na conta errada.'
-    );
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
-  if (process.env.PZ_ADSSINK_SKIP_CONV_CUSTOMER_PREFLIGHT === 'true') return configured;
-  if (_convCustomer.id === configured && Date.now() - _convCustomer.at < CONV_CUSTOMER_TTL_MS) {
-    return configured;
-  }
-
-  const operating = _digits(process.env.PZ_ADS_CUSTOMER_ID);
-  if (!operating) {
-    const e = new Error('PZ_ADS_CUSTOMER_ID em falta (necessário para o preflight do conversion customer)');
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
-  const version = process.env.PZ_ADS_API_VERSION || 'v21';
-  const devToken = process.env.PZ_ADS_DEVELOPER_TOKEN;
-  if (!devToken) { const e = new Error('PZ_ADS_DEVELOPER_TOKEN em falta'); e.errorClass = EC_CONFIG; throw e; }
-
-  const token = await _getAccessToken();
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    'developer-token': devToken,
-    'Content-Type': 'application/json',
+// ------------------------------------------------------- Fases (submit/poll)
+async function _ensureEnvelope(docRef, data, leaseToken) {
+  if (data.ads_envelope && data.ads_envelope.payload_version) return data.ads_envelope;
+  // Correcção de revisão (v3.0.0): o 1º envelope é construído EXCLUSIVAMENTE a partir
+  // do documento persistido (o seed create-only), NUNCA do canonical em memória.
+  // v3.0.1: quando o seed gravou ads_envelope_src (FirebaseSink v1.5.0), é ESSE
+  // snapshot congelado que alimenta o envelope — os campos de topo do documento podem
+  // entretanto ter avançado no ciclo de vida (refund/chargeback com o mesmo tx_id) sem
+  // afectar o envelope decidido no seed. Fallback para o documento completo preserva
+  // compatibilidade com docs sem snapshot (ads_micro_outbox seeded pelo server.js,
+  // docs legados).
+  const base = (data.ads_envelope_src && typeof data.ads_envelope_src === 'object') ? data.ads_envelope_src : data;
+  const eventName = base.event_type || base.event_name || 'purchase';
+  const map = ConvMapLoaderCsv.getInstance();
+  if (!map.isValid()) { const e = new Error('mapa_invalido_no_envelope'); e.errorClass = EC_CONFIG; throw e; }
+  const src = {
+    gclid: base.gclid, event_time_iso: base.event_time_iso, order_id: base.order_id, tx_id: base.tx_id,
+    platform: base.platform, commission_amount: base.commission_amount, commission_currency: base.commission_currency,
   };
-  const loginCustomerId = _digits(process.env.PZ_ADS_LOGIN_CUSTOMER_ID);
-  if (loginCustomerId) headers['login-customer-id'] = loginCustomerId;
-
-  const url = `https://googleads.googleapis.com/${version}/customers/${operating}/googleAds:search`;
-  const body = {
-    query:
-      'SELECT customer.id, ' +
-      'customer.conversion_tracking_setting.google_ads_conversion_customer ' +
-      'FROM customer LIMIT 1',
-  };
-
-  counters.conv_customer_preflights++;
-
-  let res;
-  try {
-    res = await axios.post(url, body, {
-      headers,
-      timeout: _envInt('PZ_ADSSINK_HTTP_TIMEOUT_MS', 10_000),
-      validateStatus: () => true,
-    });
-  } catch (netErr) {
-    // Rede: transiente. Não se degrada para "assume o configurado" — isso
-    // reintroduziria em silêncio o defeito que este preflight existe para apanhar.
-    const e = new Error(`preflight_network_error: ${netErr?.code || netErr?.message || netErr}`);
-    e.errorClass = EC_TRANSIENT;
-    throw e;
-  }
-
-  if (res.status !== 200) {
-    const detail = typeof res.data === 'object'
-      ? JSON.stringify(res.data).slice(0, 600)
-      : String(res.data).slice(0, 600);
-    const e = new Error(`preflight_http_${res.status}: ${detail}`);
-    e.errorClass = _classifyHttp(res.status);
-    throw e;
-  }
-
-  const rows = Array.isArray(res.data?.results) ? res.data.results : [];
-  const raw = rows[0]?.customer?.conversionTrackingSetting?.googleAdsConversionCustomer;
-  const live = _digits(String(raw || '').split('/').pop());
-
-  if (!live) {
-    const e = new Error(
-      'preflight: conversion_tracking_setting.google_ads_conversion_customer ausente ' +
-      'na resposta. Sem confirmação, não se envia.'
-    );
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
-  if (live !== configured) {
-    counters.conv_customer_mismatch++;
-    const e = new Error(
-      `preflight_divergencia: a conta ${operating} declara conversion customer ${live}, ` +
-      `mas PZ_ADS_CONVERSION_ACTION_CUSTOMER_ID=${configured}. Corrigir a variável ` +
-      `(ou o cross-account tracking) antes de enviar seja o que for.`
-    );
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
-  _convCustomer = { id: configured, at: Date.now() };
-  console.log(`${LOG} preflight OK: conversion customer ${configured} confirmado pela API.`);
-  return configured;
+  const mapRow = map.resolve({ platform: src.platform, event_name: eventName, product_id: base.product_id, page_type: base.page_type });
+  if (!mapRow) { const e = new Error('sem_linha_no_mapa_no_envelope'); e.errorClass = EC_CONFIG; throw e; }
+  const consent = ConsentResolver.resolve({ tx: base, mapRow });
+  const env = _buildEnvelope(src, mapRow, consent);
+  env.event_name = eventName; env.map_kind = mapRow.map_kind;
+  await _markGuarded(docRef, leaseToken, { ads_envelope: env }); // write-once, guarded
+  return env;
 }
 
-async function _uploadClickConversion(clickConversion, conversionCustomerId) {
-  const version = process.env.PZ_ADS_API_VERSION || 'v21';
-  const loginCustomerId = _digits(process.env.PZ_ADS_LOGIN_CUSTOMER_ID);
-  const devToken = process.env.PZ_ADS_DEVELOPER_TOKEN;
-
-  // CORRECÇÃO v2.2.0 (revisão ARCHITECT, defeito 1). O endpoint usava
-  // PZ_ADS_CUSTOMER_ID (conta operacional 105-791-2552) enquanto o resource name
-  // da acção usava a MCC proprietária. Em cross-account conversion tracking o
-  // upload tem de ser dirigido ao CONVERSION TRACKING CUSTOMER — o mesmo ID nos
-  // dois sítios. Ver _resolveConversionCustomerId().
-  if (!conversionCustomerId) {
-    const e = new Error('conversionCustomerId não resolvido (defeito interno)');
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-  if (!devToken) { const e = new Error('PZ_ADS_DEVELOPER_TOKEN em falta'); e.errorClass = EC_CONFIG; throw e; }
-
-  // Invariante dura: o resource name e o endpoint TÊM de referir o mesmo cliente.
-  const owner = String(clickConversion.conversionAction || '').split('/')[1];
-  if (owner !== conversionCustomerId) {
-    const e = new Error(
-      `divergencia_customer: endpoint=${conversionCustomerId} mas conversionAction pertence a ${owner}`
-    );
-    e.errorClass = EC_CONFIG;
-    throw e;
-  }
-
-  const token = await _getAccessToken();
-  const url = `https://googleads.googleapis.com/${version}/customers/${conversionCustomerId}:uploadClickConversions`;
-
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    'developer-token': devToken,
-    'Content-Type': 'application/json',
-  };
-  if (loginCustomerId) headers['login-customer-id'] = loginCustomerId;
-
+async function _doSubmit(docRef, claim) {
+  const env = await _ensureEnvelope(docRef, claim.data, claim.leaseToken);
   const validateOnly = process.env.PZ_ADSSINK_VALIDATE_ONLY === 'true';
+  const out = await _ingestEvent(env, validateOnly);
 
-  const body = {
-    conversions: [clickConversion],
-    // REQUEST: obrigatório true. Sem isto a API rejeita o request inteiro.
-    partialFailure: true,
-    // Flag SEPARADA. Fase F4 (staging) corre com true.
-    validateOnly,
-  };
+  if (out.validateOnly) {
+    // correção #1: mantém ads_wake_at=now para o reprocessador o promover quando o dry-run desligar.
+    await _markGuarded(docRef, claim.leaseToken, {
+      ads_upload_status: ST_VALIDATED, ads_wake_at: Timestamp.now(),
+      ads_lease_until: FieldValue.delete(), ads_last_validated_at: FieldValue.serverTimestamp(),
+      ads_last_error: FieldValue.delete(), ads_error_class: FieldValue.delete(),
+    });
+    counters.validate_only_runs++;
+    console.log(`${LOG} VALIDADO (dry-run) tx=${env.transactionId}`);
+    return { sent: false, reason: 'validate_only' };
+  }
 
-  const timeout = _envInt('PZ_ADSSINK_HTTP_TIMEOUT_MS', 10_000);
+  const pollDelay = _pollBackoffMs(1);
+  await _markGuarded(docRef, claim.leaseToken, {
+    ads_upload_status: ST_SUBMITTED, ads_dm_request_id: out.requestId, ads_poll_attempts: 0,
+    ads_submitted_at: FieldValue.serverTimestamp(),
+    ads_poll_deadline: Timestamp.fromMillis(Date.now() + _envInt('PZ_ADSSINK_POLL_DEADLINE_MS', 86_400_000)),
+    ads_next_attempt_at: Timestamp.fromMillis(Date.now() + pollDelay),
+    ads_wake_at: Timestamp.fromMillis(Date.now() + pollDelay),
+    ads_lease_until: FieldValue.delete(), ads_last_error: FieldValue.delete(), ads_error_class: FieldValue.delete(),
+  });
+  counters.submitted++;
+  console.log(`${LOG} SUBMETIDO tx=${env.transactionId} requestId=${out.requestId}`);
+  return { sent: false, reason: 'submitted' };
+}
 
-  let res;
+/**
+ * Correção #3: reagenda o poll OU expira, SEMPRE respeitando ads_poll_deadline e
+ * incrementando ads_poll_attempts. Usado tanto no PROCESSING como em falhas de
+ * transporte (timeout/5xx) durante o retrieve.
+ */
+async function _pollRescheduleOrExpire(docRef, leaseToken, data, note) {
+  const deadlineMs = _millis(data.ads_poll_deadline);
+  if (deadlineMs !== null && Date.now() > deadlineMs) {
+    counters.poll_deadline_exceeded++; counters.permanent_errors++;
+    console.error(`${LOG} ALARME: poll deadline (24h) excedido — permanent. ${note}`);
+    await _markGuarded(docRef, leaseToken, {
+      ads_upload_status: ST_PERMANENT, ads_error_class: EC_PERMANENT, ads_last_error: `poll_deadline_excedido: ${note}`,
+      ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+    });
+    return { sent: false, reason: 'poll_deadline_excedido' };
+  }
+  const pollAttempts = Number(data.ads_poll_attempts || 0) + 1;
+  const delay = _pollBackoffMs(pollAttempts);
+  counters.still_processing++;
+  await _markGuarded(docRef, leaseToken, {
+    ads_upload_status: ST_SUBMITTED, ads_poll_attempts: pollAttempts,
+    ads_next_attempt_at: Timestamp.fromMillis(Date.now() + delay), ads_wake_at: Timestamp.fromMillis(Date.now() + delay),
+    ads_lease_until: FieldValue.delete(),
+  });
+  return { sent: false, reason: 'processing' };
+}
+
+async function _doPoll(docRef, claim) {
+  const data = claim.data;
+  const requestId = data.ads_dm_request_id;
+  const env = data.ads_envelope || {};
+  if (!requestId) {
+    await _markGuarded(docRef, claim.leaseToken, {
+      ads_upload_status: ST_RETRY, ads_lease_until: FieldValue.delete(),
+      ads_next_attempt_at: Timestamp.fromMillis(Date.now()), ads_wake_at: Timestamp.fromMillis(Date.now()),
+      ads_last_error: 'polling_sem_requestId', ads_error_class: EC_TRANSIENT,
+    });
+    return { sent: false, reason: 'polling_sem_requestId' };
+  }
+
+  const { status, reasons } = await _retrieveStatus(requestId);
+  counters.polled++;
+
+  if (status === 'SUCCESS') {
+    await _markGuarded(docRef, claim.leaseToken, {
+      ads_upload_status: ST_UPLOADED, ads_uploaded_at: FieldValue.serverTimestamp(),
+      ads_conversion_action_id: env.conversion_action_id, ads_event_name: env.event_name, ads_map_kind: env.map_kind,
+      ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+      ads_last_error: FieldValue.delete(), ads_error_class: FieldValue.delete(),
+    });
+    counters.uploaded++;
+    console.log(`${LOG} CONFIRMADO (SUCCESS) tx=${env.transactionId}`);
+    return { sent: true, reason: 'ok' };
+  }
+
+  if (status === 'PROCESSING' || status === 'REQUEST_STATUS_UNKNOWN') {
+    return await _pollRescheduleOrExpire(docRef, claim.leaseToken, data, `status=${status}`);
+  }
+
+  // FAILED / PARTIAL_SUCCESS
+  const verdict = _classifyReasons(reasons);
+  if (verdict === 'uploaded') {
+    counters.duplicate_ignored++;
+    await _markGuarded(docRef, claim.leaseToken, {
+      ads_upload_status: ST_UPLOADED, ads_uploaded_at: FieldValue.serverTimestamp(), ads_duplicate_at_google: true,
+      ads_conversion_action_id: env.conversion_action_id, ads_event_name: env.event_name, ads_map_kind: env.map_kind,
+      ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+      ads_last_error: FieldValue.delete(), ads_error_class: FieldValue.delete(),
+    });
+    counters.uploaded++;
+    console.log(`${LOG} CONFIRMADO (duplicado ${reasons.join(',')}) tx=${env.transactionId}`);
+    return { sent: true, reason: 'ok_duplicado' };
+  }
+  if (verdict === 'retry') {
+    const delay = _backoffMs(Number(data.ads_attempts || 0));
+    counters.retry_scheduled++;
+    console.warn(`${LOG} FAILED transiente [${reasons.join(',')}] tx=${env.transactionId} — re-ingest em ${Math.round(delay / 1000)}s`);
+    await _markGuarded(docRef, claim.leaseToken, {
+      ads_upload_status: ST_RETRY, ads_dm_request_id: FieldValue.delete(), ads_poll_attempts: FieldValue.delete(),
+      ads_next_attempt_at: Timestamp.fromMillis(Date.now() + delay), ads_wake_at: Timestamp.fromMillis(Date.now() + delay),
+      ads_lease_until: FieldValue.delete(), ads_last_error: `failed_transiente [${reasons.join(',')}]`, ads_error_class: EC_TRANSIENT,
+    });
+    return { sent: false, reason: 'retry_failed' };
+  }
+  counters.permanent_errors++;
+  console.error(`${LOG} ALARME: FAILED permanente [${reasons.join(',')}] tx=${env.transactionId}`);
+  await _markGuarded(docRef, claim.leaseToken, {
+    ads_upload_status: ST_PERMANENT, ads_error_class: EC_PERMANENT,
+    ads_last_error: `failed_permanente [${reasons.join(',') || 'sem_motivo'}]`,
+    ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+  });
+  return { sent: false, reason: 'failed_permanente' };
+}
+
+async function _runClaimed(docRef, claim, txLabel) {
   try {
-    res = await axios.post(url, body, { headers, timeout, validateStatus: () => true });
-  } catch (netErr) {
-    // Timeout / DNS / socket: transiente por definição.
-    const e = new Error(`network_error: ${netErr?.code || netErr?.message || netErr}`);
-    e.errorClass = EC_TRANSIENT;
-    throw e;
-  }
+    if (claim.phase === 'submit') return await _doSubmit(docRef, claim);
+    return await _doPoll(docRef, claim);
+  } catch (err) {
+    // Falha de persistência ou lease roubada: não escrever aqui (o novo dono decide;
+    // a lease expira e recupera-se).
+    if (err.isStateWriteFailure || err.isStale) throw err;
+    const errorClass = err.errorClass || EC_PERMANENT;
+    const message = String(err.message || err).slice(0, 900);
 
-  if (res.status !== 200) {
-    const detail = typeof res.data === 'object'
-      ? JSON.stringify(res.data).slice(0, 800)
-      : String(res.data).slice(0, 800);
-    const e = new Error(`http_${res.status}: ${detail}`);
-    e.errorClass = _classifyHttp(res.status);
-    throw e;
-  }
-
-  // ---- HTTP 200 NÃO É SUCESSO. Inspecção obrigatória. ----
-  const partial = res.data?.partialFailureError || null;
-  const results = Array.isArray(res.data?.results) ? res.data.results : [];
-
-  if (partial) {
-    counters.partial_failures++;
-    const codes = _extractGoogleAdsErrorCodes(partial);
-
-    // Bug de implementação: um request nosso leva exactamente uma conversão.
-    // Verificado ANTES da allowlist para nunca ser mascarado por ela.
-    if (codes.some((c) => IN_REQUEST_DUPLICATE_CODES.has(c))) {
-      const e = new Error(
-        `duplicado_dentro_do_request [${codes.join(',')}] — impossível por construção ` +
-        `(1 conversão por request). Defeito de implementação, evento NÃO processado.`
-      );
-      e.errorClass = EC_CONFIG;
-      throw e;
+    if (claim.phase === 'poll') {
+      if (errorClass === EC_TRANSIENT) {
+        // correção #3: falha de transporte no poll respeita o deadline.
+        return await _pollRescheduleOrExpire(docRef, claim.leaseToken, claim.data, `transporte: ${message}`);
+      }
+      counters.permanent_errors++;
+      console.error(`${LOG} ALARME: erro ${errorClass} no poll (tx=${txLabel}). Terminal. ${message}`);
+      await _markGuarded(docRef, claim.leaseToken, {
+        ads_upload_status: ST_PERMANENT, ads_last_error: message, ads_error_class: errorClass,
+        ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+      });
+      return { sent: false, reason: 'erro_fase', detail: { errorClass, message } };
     }
 
-    // CORRECÇÃO v2.2.0 (revisão ARCHITECT, defeito 2). Era `.some()`: bastava um
-    // código "already exists" ao lado de um erro real para o request inteiro ser
-    // dado como sucesso e o erro real desaparecer. Passa a `.every()` com guarda
-    // de lista não vazia — só é duplicado se TUDO o que voltou for duplicado.
-    if (codes.length > 0 && codes.every((c) => ALREADY_EXISTS_CODES.has(c))) {
-      // O Google já tem esta conversão de um envio anterior. Idempotência a funcionar.
-      counters.duplicate_ignored++;
-      return { validateOnly, uploaded: true, duplicate: true, result: null };
+    // submit phase
+    if (errorClass === EC_TRANSIENT) {
+      const delay = _backoffMs(claim.attempts);
+      counters.retry_scheduled++;
+      console.warn(`${LOG} Erro transiente (submit, tx=${txLabel}). Retoma em ${Math.round(delay / 1000)}s. ${message}`);
+      await _markGuarded(docRef, claim.leaseToken, {
+        ads_upload_status: ST_RETRY, ads_next_attempt_at: Timestamp.fromMillis(Date.now() + delay), ads_wake_at: Timestamp.fromMillis(Date.now() + delay),
+        ads_lease_until: FieldValue.delete(), ads_last_error: message, ads_error_class: errorClass,
+      });
+    } else {
+      counters.permanent_errors++;
+      console.error(`${LOG} ALARME: erro ${errorClass} (submit, tx=${txLabel}). Terminal. ${message}`);
+      await _markGuarded(docRef, claim.leaseToken, {
+        ads_upload_status: ST_PERMANENT, ads_last_error: message, ads_error_class: errorClass,
+        ads_lease_until: FieldValue.delete(), ads_wake_at: FieldValue.delete(), ads_next_attempt_at: FieldValue.delete(),
+      });
     }
-
-    const transient = codes.length > 0 && codes.every((c) => TRANSIENT_CODES.has(c));
-    const e = new Error(
-      `partial_failure_error [${codes.join(',') || 'sem_codigo'}]: ` +
-      `${JSON.stringify(partial).slice(0, 700)}`
-    );
-    e.errorClass = transient ? EC_TRANSIENT : EC_PERMANENT;
-    throw e;
+    return { sent: false, reason: 'erro_fase', detail: { errorClass, message } };
   }
-
-  // Sem partialFailureError, mas a operação tem de estar presente em results.
-  // Em validateOnly a API NÃO devolve results — é o único caso em que a ausência
-  // é legítima.
-  const r0 = results[0];
-  const hasResult = !!r0 && typeof r0 === 'object' && Object.keys(r0).length > 0;
-
-  if (!validateOnly && !hasResult) {
-    const e = new Error('resposta_200_sem_result: operação não confirmada pelo Google');
-    e.errorClass = EC_TRANSIENT; // ambíguo → repetir é mais seguro que descartar
-    throw e;
-  }
-
-  return { validateOnly, uploaded: !validateOnly, duplicate: false, result: r0 || null };
 }
 
 // --------------------------------------------------------------- API Pública
-
-/**
- * Envia uma conversão para o Google Ads a partir do evento canónico.
- * NUNCA lança. Devolve sempre um objecto de resultado.
- *
- * @param {object} canonical  evento canónico (mesmo objecto do FirebaseSink)
- * @param {{event_name?:string, page_type?:string}} [opts]
- * @returns {Promise<{sent:boolean, reason:string, detail?:object}>}
- */
 async function sendConversion(canonical, opts = {}) {
-  const eventName = opts.event_name || canonical?.event_type || 'purchase';
   let docRef = null;
-
   try {
-    // --- Guarda 1: feature-flag ---
-    if (process.env.PZ_ADSSINK_ENABLED !== 'true') {
-      return { sent: false, reason: 'disabled_by_flag' };
-    }
-
-    // --- Guarda 2: evento utilizável ---
-    if (!canonical || !canonical.platform || !canonical.tx_id) {
-      console.warn(`${LOG} Evento canónico sem platform/tx_id. Ignorado.`);
-      return { sent: false, reason: 'evento_invalido' };
-    }
-
-    // --- Guarda 3: gclid. Sem gclid não há conversão offline por clique. ---
-    const gclid = String(canonical.gclid || '').trim();
-    if (!gclid) {
-      return { sent: false, reason: 'sem_gclid' };
-    }
-
-    // --- Guarda 4: mapa válido (fail-closed) ---
+    if (process.env.PZ_ADSSINK_ENABLED !== 'true') return { sent: false, reason: 'disabled_by_flag' };
+    if (!canonical || !canonical.platform || !canonical.tx_id) return { sent: false, reason: 'evento_invalido' };
+    if (!String(canonical.gclid || '').trim()) return { sent: false, reason: 'sem_gclid' };
     const map = ConvMapLoaderCsv.getInstance();
-    if (!map.isValid()) {
-      console.error(`${LOG} pz_conversion_map inválido — no-op. Erros: ${map.getErrors().slice(0, 3).join(' | ')}`);
-      return { sent: false, reason: 'mapa_invalido' };
-    }
+    if (!map.isValid()) { console.error(`${LOG} pz_conversion_map inválido — no-op. ${map.getErrors().slice(0, 3).join(' | ')}`); return { sent: false, reason: 'mapa_invalido' }; }
 
-    const mapRow = map.resolve({
-      platform: canonical.platform,
-      event_name: eventName,
-      product_id: canonical.sku || canonical.product_id,
-      page_type: opts.page_type || canonical.page_type,
-    });
-    if (!mapRow) {
-      return { sent: false, reason: 'sem_linha_no_mapa' };
-    }
-
-    // --- Claim (predicado v8.2) ---
     const db = getFirestore();
     docRef = db.collection(opts.collection || COLLECTION_NAME).doc(_docIdFor(canonical));
     const claim = await _claim(docRef);
     if (!claim.ok) {
-      if (claim.reason === 'max_attempts_excedido') {
-        counters.attempts_exhausted++;
-        counters.permanent_errors++;
-        console.error(
-          `${LOG} ALARME: tentativas esgotadas para tx=${canonical.tx_id} ` +
-          `(${claim.attempts}). Documento marcado permanent_error. Requer intervenção.`
-        );
-      }
+      if (claim.reason === 'max_attempts_excedido') { counters.attempts_exhausted++; counters.permanent_errors++; console.error(`${LOG} ALARME: tentativas esgotadas tx=${canonical.tx_id} (${claim.attempts}).`); }
       return { sent: false, reason: claim.reason };
     }
-
     counters.claimed++;
-    if (claim.recoveredLease) {
-      counters.lease_recovered++;
-      console.warn(
-        `${LOG} Lease expirada recuperada para tx=${canonical.tx_id} ` +
-        `(tentativa ${claim.attempts}). Worker anterior provavelmente morreu.`
-      );
-    }
-
-    // --- Consentimento (costura isolada; hoje degenera em fallback) ---
-    const consent = ConsentResolver.resolve({ tx: { ...claim.data, ...canonical }, mapRow });
-
-    // --- Envio (a construção entra no try porque _resolveValue e _toAdsDateTime
-    //     lançam erros de configuração que TÊM de ser classificados e escritos no
-    //     documento; no catch externo perdiam-se e o item ficava a repetir às cegas
-    //     até esgotar tentativas) ---
-    try {
-    // --- Construção do ClickConversion ---
-    const { value, currency } = _resolveValue(canonical, mapRow);
-
-    // ATENÇÃO: o resource name da acção de conversão usa o cliente que a POSSUI.
-    // Na auditoria de 2026-07-24 todas as acções desta conta são propriedade da
-    // MCC 440-410-8297, não da conta operacional 105-791-2552. Usar o customerId
-    // errado devolve NOT_FOUND.
-    // v2.2.0: resolvido UMA vez, com preflight contra a API, e usado tanto aqui
-    // como no endpoint. Sem fallback silencioso para a conta operacional.
-    const actionOwnerId = await _resolveConversionCustomerId();
-
-    const clickConversion = {
-      gclid,
-      conversionAction: `customers/${actionOwnerId}/conversionActions/${mapRow.conversion_action_id}`,
-      conversionDateTime: _toAdsDateTime(canonical.event_time_iso || new Date().toISOString()),
-      // orderId é a segunda linha de defesa contra duplicados, do lado do Google.
-      orderId: String(canonical.order_id || canonical.tx_id),
-      consent: {
-        adUserData: consent.adUserData,
-        adPersonalization: consent.adPersonalization,
-      },
-    };
-    if (value !== null) {
-      clickConversion.conversionValue = value;
-      clickConversion.currencyCode = currency;
-    }
-
-      const out = await _uploadClickConversion(clickConversion, actionOwnerId);
-
-      if (out.validateOnly) {
-        // CORRECÇÃO v2.1.0: estado `validated`, não `pending`. Com `pending` o
-        // documento era reclamável de imediato no ciclo seguinte, gastando uma
-        // tentativa por ciclo até morrer em permanent_error sem nunca ter falhado.
-        // `validated` é terminal enquanto o dry-run estiver ligado; ao desligar,
-        // _claim() liberta-o e ZERA ads_attempts.
-        // v2.2.0: o contador só sobe DEPOIS da persistência confirmada.
-        await _mark(docRef, {
-          ads_upload_status: ST_VALIDATED,
-          ads_lease_until: FieldValue.delete(),
-          ads_next_attempt_at: FieldValue.delete(),
-          ads_last_validated_at: FieldValue.serverTimestamp(),
-          ads_last_error: FieldValue.delete(),
-          ads_error_class: FieldValue.delete(),
-        });
-        counters.validate_only_runs++;
-        console.log(`${LOG} VALIDADO (dry-run) tx=${canonical.tx_id} event=${eventName}`);
-        return { sent: false, reason: 'validate_only' };
-      }
-
-      // v2.2.0: `uploaded` só é contado e confirmado ao chamador DEPOIS de a
-      // escrita de estado ter sido persistida com sucesso.
-      await _mark(docRef, {
-        ads_upload_status: ST_UPLOADED,
-        ads_uploaded_at: FieldValue.serverTimestamp(),
-        ads_conversion_action_id: mapRow.conversion_action_id,
-        ads_event_name: eventName,
-        ads_map_kind: mapRow.map_kind,
-        ads_duplicate_at_google: !!out.duplicate,
-        ads_consent_ad_user_data: consent.adUserData,
-        ads_consent_ad_personalization: consent.adPersonalization,
-        ads_consent_source: consent.source,
-        ads_consent_signal_present: consent.signalPresent,
-        ads_lease_until: FieldValue.delete(),
-        ads_next_attempt_at: FieldValue.delete(),
-        ads_last_error: FieldValue.delete(),
-        ads_error_class: FieldValue.delete(),
-      });
-
-      counters.uploaded++;
-      console.log(
-        `${LOG} ENVIADO tx=${canonical.tx_id} event=${eventName} ` +
-        `action=${mapRow.conversion_action_id} consent=${consent.source}` +
-        (out.duplicate ? ' (duplicado do lado do Google — tratado como sucesso)' : '')
-      );
-
-      return { sent: true, reason: out.duplicate ? 'ok_duplicado' : 'ok' };
-
-    } catch (uploadError) {
-      const errorClass = uploadError.errorClass || EC_PERMANENT;
-      const message = String(uploadError.message || uploadError).slice(0, 900);
-      const attempts = claim.attempts;
-
-      // v2.2.0: o log vem ANTES da escrita. Como _mark() já propaga falhas do
-      // Firestore, escrever primeiro faria perder o diagnóstico do erro original
-      // exactamente no cenário em que ele é mais necessário.
-      if (errorClass === EC_TRANSIENT) {
-        const delay = _backoffMs(attempts);
-        counters.retry_scheduled++;
-        console.warn(
-          `${LOG} Erro transiente (tx=${canonical.tx_id}, tentativa ${attempts}). ` +
-          `Novo envio em ${Math.round(delay / 1000)}s. ${message}`
-        );
-        await _mark(docRef, {
-          ads_upload_status: ST_RETRY,
-          ads_next_attempt_at: Timestamp.fromMillis(Date.now() + delay),
-          ads_lease_until: FieldValue.delete(),
-          ads_last_error: message,
-          ads_error_class: errorClass,
-        });
-      } else {
-        // Permanente ou de configuração: terminal IMEDIATO, sem consumir backoff.
-        counters.permanent_errors++;
-        console.error(
-          `${LOG} ALARME: erro ${errorClass} (tx=${canonical.tx_id}). ` +
-          `Documento terminal. Requer intervenção. ${message}`
-        );
-        await _mark(docRef, {
-          ads_upload_status: ST_PERMANENT,
-          ads_next_attempt_at: FieldValue.delete(),
-          ads_lease_until: FieldValue.delete(),
-          ads_last_error: message,
-          ads_error_class: errorClass,
-        });
-      }
-
-      return { sent: false, reason: 'erro_upload', detail: { errorClass, message } };
-    }
-
+    if (claim.recoveredLease) { counters.lease_recovered++; console.warn(`${LOG} Lease recuperada tx=${canonical.tx_id} fase=${claim.phase}.`); }
+    return await _runClaimed(docRef, claim, canonical.tx_id);
   } catch (fatal) {
-    // Rede de segurança final: o postback nunca pode cair por causa do AdsSink.
-    // Se já havia claim, a lease expira sozinha e o item é recuperado — não se
-    // tenta escrever aqui, porque este ramo cobre justamente falhas do Firestore.
-    //
-    // v2.2.0: é também aqui que aterram as falhas de persistência propagadas por
-    // _mark(). Correcto e auto-curativo: nada é confirmado ao chamador, o
-    // documento fica in_flight, a lease expira e o reenvio devolve
-    // ORDER_ID_ALREADY_IN_USE — tratado como duplicado/uploaded.
-    if (fatal?.isStateWriteFailure) {
-      console.error(
-        `${LOG} ALARME: conversão possivelmente aceite pelo Google mas estado NÃO ` +
-        `persistido. Recuperação por lease expirada + idempotência do orderId.`
-      );
-    }
+    if (fatal?.isStale) { console.warn(`${LOG} lease roubada durante o envio (tx=${canonical?.tx_id}) — outro worker assume.`); return { sent: false, reason: 'lease_roubada' }; }
+    if (fatal?.isStateWriteFailure) console.error(`${LOG} ALARME: estado não persistido. Recuperação por lease + idempotência do transactionId.`);
     console.error(`${LOG} Erro não tratado:`, fatal?.message || fatal);
     return { sent: false, reason: 'erro_interno', detail: { message: String(fatal?.message || fatal) } };
   }
 }
 
-/** Estado do sink para healthcheck / relatório diário. */
+async function reprocessOnce(opts = {}) {
+  counters.reprocess_runs++;
+  const out = { scanned: 0, processed: 0, results: {} };
+  if (process.env.PZ_ADSSINK_ENABLED !== 'true') { out.reason = 'disabled_by_flag'; return out; }
+  try {
+    const db = getFirestore();
+    const coll = opts.collection || COLLECTION_NAME;
+    const limit = opts.limit || _envInt('PZ_ADSSINK_REPROCESS_BATCH', 50);
+    // Estados da query: validated só entra com o dry-run DESLIGADO (evita starvation).
+    const validateOnly = process.env.PZ_ADSSINK_VALIDATE_ONLY === 'true';
+    const states = validateOnly ? REPROCESS_STATES_BASE : [...REPROCESS_STATES_BASE, ST_VALIDATED];
+    const nowTs = Timestamp.fromMillis(Date.now());
+    const snap = await db.collection(coll)
+      .where('ads_upload_status', 'in', states)
+      .where('ads_wake_at', '<=', nowTs)
+      .orderBy('ads_wake_at', 'asc')
+      .limit(limit)
+      .get();
+    out.scanned = snap.size;
+    for (const doc of snap.docs) {
+      const docRef = doc.ref;
+      let claim;
+      try { claim = await _claim(docRef); } catch (e) { console.error(`${LOG} claim falhou ${doc.id}:`, e?.message || e); continue; }
+      if (!claim.ok) { out.results[claim.reason] = (out.results[claim.reason] || 0) + 1; continue; }
+      counters.claimed++;
+      if (claim.recoveredLease) counters.lease_recovered++;
+      try {
+        const r = await _runClaimed(docRef, claim, doc.id);
+        out.processed++; out.results[r.reason] = (out.results[r.reason] || 0) + 1;
+      } catch (e) {
+        // isStale/isStateWriteFailure/fatal: não escreve; lease expira e recupera.
+        out.results[e?.isStale ? 'lease_roubada' : 'erro'] = (out.results[e?.isStale ? 'lease_roubada' : 'erro'] || 0) + 1;
+        if (!e?.isStale) console.error(`${LOG} fase falhou ${doc.id}:`, e?.message || e);
+      }
+    }
+    return out;
+  } catch (fatal) {
+    console.error(`${LOG} reprocessOnce erro:`, fatal?.message || fatal);
+    out.error = String(fatal?.message || fatal);
+    return out;
+  }
+}
+
 function getHealth() {
   const map = ConvMapLoaderCsv.getInstance();
   return {
-    version: VERSION,
-    enabled: process.env.PZ_ADSSINK_ENABLED === 'true',
-    validate_only: process.env.PZ_ADSSINK_VALIDATE_ONLY === 'true',
-    max_attempts: _envInt('PZ_ADSSINK_MAX_ATTEMPTS', 6),
-    lease_ms: _envInt('PZ_ADSSINK_LEASE_MS', 120_000),
-    map_valid: map.isValid(),
-    map_errors: map.getErrors().slice(0, 10),
-    map_index: map.getIndexStats(),
-    counters: { ...counters },
-    consent: ConsentResolver.getCounters(),
-    consent_signal_flow_dead: ConsentResolver.isSignalFlowDead(),
+    version: VERSION, api: 'data_manager',
+    enabled: process.env.PZ_ADSSINK_ENABLED === 'true', validate_only: process.env.PZ_ADSSINK_VALIDATE_ONLY === 'true',
+    max_attempts: _envInt('PZ_ADSSINK_MAX_ATTEMPTS', 6), poll_deadline_ms: _envInt('PZ_ADSSINK_POLL_DEADLINE_MS', 86_400_000),
+    map_valid: map.isValid(), map_errors: map.getErrors().slice(0, 10), map_index: map.getIndexStats(),
+    counters: { ...counters }, consent: ConsentResolver.getCounters(), consent_signal_flow_dead: ConsentResolver.isSignalFlowDead(),
   };
 }
 
-module.exports = { sendConversion, getHealth, _toAdsDateTime, _backoffMs, VERSION };
+module.exports = { sendConversion, reprocessOnce, getHealth, _toRfc3339, _backoffMs, _classifyReasons, _markGuarded, VERSION };
