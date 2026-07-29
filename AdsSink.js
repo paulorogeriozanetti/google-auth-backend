@@ -1,7 +1,7 @@
 /**
  * PZ Advisors — AdsSink
  * Versão: v3.0.1
- * Data: 2026-07-28
+ * Data: 2026-07-29
  *
  * MIGRAÇÃO v2.3.0 -> v3.0.0 — Google Ads UploadClickConversions (BLOQUEADO a novas
  * integrações desde 15/jun/2026) -> **Data Manager API** (events:ingest +
@@ -31,6 +31,13 @@
  * comissão) depois do seed mas antes do 1º claim, contaminando o envelope da compra.
  * Nenhuma outra função deste ficheiro foi alterada.
  *
+ * Alterações v3.0.2 (hotfix de integração):
+ * - sendConversion deixa de rejeitar pelo gclid do canonical transitório. O Firestore
+ *   é a SSoT do envelope; após localizar o doc por platform+tx_id, _ensureEnvelope
+ *   valida o gclid persistido em ads_envelope_src/data.
+ * - Isto permite que FirebaseSink v1.5.1 acione o sink depois do commit mesmo quando
+ *   um handler antigo fornece um canonical parcial, sem enfraquecer o fail-closed.
+ *
  * Env: ver secção no fundo do plano. NÃO usa developer token nem google-ads-api.
  */
 
@@ -44,7 +51,7 @@ const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestor
 const ConvMapLoaderCsv = require('./ConvMapLoaderCsv');
 const ConsentResolver = require('./ConsentResolver');
 
-const VERSION = '3.0.1';
+const VERSION = '3.0.2';
 const LOG = `[AdsSink v${VERSION}]`;
 const COLLECTION_NAME = process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions';
 const PAYLOAD_VERSION = 'dm-v1';
@@ -536,7 +543,6 @@ async function sendConversion(canonical, opts = {}) {
   try {
     if (process.env.PZ_ADSSINK_ENABLED !== 'true') return { sent: false, reason: 'disabled_by_flag' };
     if (!canonical || !canonical.platform || !canonical.tx_id) return { sent: false, reason: 'evento_invalido' };
-    if (!String(canonical.gclid || '').trim()) return { sent: false, reason: 'sem_gclid' };
     const map = ConvMapLoaderCsv.getInstance();
     if (!map.isValid()) { console.error(`${LOG} pz_conversion_map inválido — no-op. ${map.getErrors().slice(0, 3).join(' | ')}`); return { sent: false, reason: 'mapa_invalido' }; }
 

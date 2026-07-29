@@ -1,7 +1,7 @@
 /**
  * FirebaseSink.js
- * Versão: v1.5.0
- * Data: 2026-07-28
+ * Versão: v1.6.0
+ * Data: 2026-07-29
  * Desc: Módulo "Sink" (destino) responsável por gravar
  * eventos S2S canônicos no Firestore.
  *
@@ -39,9 +39,32 @@
  *   chega completo a saveS2SEvent; a semente e o snapshot vão na mesma transacção).
  *   Nenhum caminho pode "completar" o snapshot depois — ausências no seed são
  *   definitivas (o AdsSink falha-fechado sobre elas, por desenho).
+ *
+ * Alterações v1.5.1 (hotfix de integração):
+ * - Resolve ads_eligible de forma compatível quando handlers antigos não enviam o
+ *   campo: apenas purchase + gclid + ausência de marcador de teste.
+ * - Persiste o valor efetivo de ads_eligible e mantém a semente pending +
+ *   ads_envelope_src na mesma transação.
+ * - Após commit, aciona AdsSink.sendConversion em fire-and-forget. O documento já
+ *   está duravelmente reclamável; se o processo cair, o reprocessador assume.
+ * - Compatível com handlers novos que já chamam AdsSink: o claim/lease torna a
+ *   segunda chamada idempotente.
+ *
+ * Alterações v1.6.0 (desacoplamento Analytics / AdsSink):
+ * - Restaura para analytics o caminho simples e abrangente da v1.0.2:
+ *   docRef.get() + docRef.set(..., { merge:true }). A captura canónica deixa de
+ *   depender de uma transação Firestore.
+ * - A semente do AdsSink passa para uma SEGUNDA etapa, transacional e isolada,
+ *   executada apenas para eventos elegíveis.
+ * - Uma falha/abort/timeout na semente Ads é registada, mas NÃO rejeita nem desfaz
+ *   a gravação de analytics já concluída.
+ * - AdsSink.sendConversion só é acionado quando a semente existe ou já existia.
+ * - created_at, updated_at, docId e semântica last-delivery-wins permanecem iguais
+ *   ao backup v1.0.2 para os campos canónicos.
  */
 
 const { getFirestore, FieldValue, Timestamp } = require('firebase-admin/firestore');
+const AdsSink = require('./AdsSink');
 
 // Usa a mesma variável de ambiente do server.js
 const COLLECTION_NAME = process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions';
@@ -79,6 +102,61 @@ function _pickEnvelopeSrc(canonicalEvent) {
   return out;
 }
 
+const TEST_MARKERS = new Set([
+  '1', 'true', 'yes', 'y', 'test', 'test_sale', 'test-sale', 'sandbox',
+]);
+
+function _isPositiveTestMarker(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0 || value === null || value === undefined) return false;
+  return TEST_MARKERS.has(String(value).trim().toLowerCase());
+}
+
+function _isTestEvent(canonicalEvent) {
+  const raw = canonicalEvent && typeof canonicalEvent.raw === 'object'
+    ? canonicalEvent.raw
+    : {};
+  const candidates = [
+    canonicalEvent?.is_test,
+    canonicalEvent?.isTest,
+    canonicalEvent?.test,
+    canonicalEvent?.test_mode,
+    canonicalEvent?.status,
+    canonicalEvent?.event_status,
+    raw?.is_test,
+    raw?.isTest,
+    raw?.test,
+    raw?.test_mode,
+    raw?.status,
+    raw?.event,
+    raw?.event_type,
+    raw?.transaction_type,
+  ];
+  return candidates.some(_isPositiveTestMarker);
+}
+
+/**
+ * Compatibilidade com handlers de versões diferentes.
+ * - Um boolean explícito continua soberano.
+ * - Sem valor explícito, só inferimos elegibilidade para purchase com gclid e sem
+ *   marcador de teste conhecido. Qualquer outro evento falha fechado.
+ */
+function _resolveAdsEligible(canonicalEvent) {
+  if (canonicalEvent?.ads_eligible === true) return true;
+  if (canonicalEvent?.ads_eligible === false) return false;
+
+  const explicit = String(canonicalEvent?.ads_eligible ?? '').trim().toLowerCase();
+  if (explicit === 'true' || explicit === '1' || explicit === 'yes') return true;
+  if (explicit === 'false' || explicit === '0' || explicit === 'no') return false;
+
+  const eventType = String(
+    canonicalEvent?.event_type || canonicalEvent?.event_name || canonicalEvent?.event || ''
+  ).trim().toLowerCase();
+  const hasGclid = !!String(canonicalEvent?.gclid || '').trim();
+
+  return eventType === 'purchase' && hasGclid && !_isTestEvent(canonicalEvent);
+}
+
 /**
  * Salva um evento S2S canônico no Firestore.
  * Assume que o app Firebase já foi inicializado (pelo server.js).
@@ -97,56 +175,131 @@ async function saveS2SEvent(canonicalEvent) {
   const safeTxId = String(canonicalEvent.tx_id).replace(/[^\w\-]+/g, '_');
   const docId = `${safePlatform}_${safeTxId}`;
   const docRef = db.collection(COLLECTION_NAME).doc(docId);
+  const adsEligible = _resolveAdsEligible(canonicalEvent);
 
+  // ---------------------------------------------------------------------------
+  // ETAPA 1 — ANALYTICS (prioridade máxima, sem transação)
+  //
+  // Mantém o comportamento comprovado da v1.0.2: captura o maior volume possível
+  // com get()+set(merge:true). O pipeline Ads não participa desta escrita.
+  // ---------------------------------------------------------------------------
   try {
-    await db.runTransaction(async (t) => {
-      const existingDoc = await t.get(docRef);
-      const exists = existingDoc.exists;
-      const existingData = exists ? (existingDoc.data() || {}) : {};
+    const existingDoc = await docRef.get();
 
-      // Preserva created_at imutável (lógica v1.0.1, agora dentro da transacção)
-      const baseData = exists ? {} : { created_at: FieldValue.serverTimestamp() };
+    const baseData = existingDoc.exists
+      ? {}
+      : { created_at: FieldValue.serverTimestamp() };
 
-      // v1.5.0: semente durável do AdsSink + snapshot congelado do envelope, juntos e
-      // create-once (a guarda !existingData.ads_upload_status cobre ambos). Só compras
-      // elegíveis (ads_eligible calculado pelo handler: purchase + gclid + não-teste).
-      const adsSeed = (canonicalEvent.ads_eligible && !existingData.ads_upload_status)
-        ? {
-            ads_upload_status: ADS_STATUS_PENDING,
-            ads_wake_at: Timestamp.now(),
-            ads_envelope_src: _pickEnvelopeSrc(canonicalEvent),
-          }
-        : {};
+    await docRef.set({
+      ...baseData,
+      ...canonicalEvent,
+      ads_eligible: adsEligible,
+      updated_at: FieldValue.serverTimestamp(),
+    }, { merge: true });
 
-      // v1.5.0: campos de topo com semântica v1.0.2 integral — última entrega vence,
-      // sem excepções. A imutabilidade do envelope vive em ads_envelope_src, não aqui.
-      // Ordem do spread: adsSeed DEPOIS de canonicalEvent (defesa explícita — nenhum
-      // handler produz chaves ads_* hoje, mas esta ordem não depende disso).
-      const dataToSave = {
-        ...baseData,
-        ...canonicalEvent,
-        ...adsSeed,
-        // updated_at é sempre atualizado
-        updated_at: FieldValue.serverTimestamp(),
-      };
-
-      t.set(docRef, dataToSave, { merge: true });
-    });
-
-    // Log menos verboso (removido em produção, ativado em debug)
     if (process.env.NODE_ENV !== 'production') {
       console.log(`[FirebaseSink] Evento S2S salvo com sucesso: ${docId}`);
     }
-
-    return { ok: true, docId: docId };
-
   } catch (error) {
-    console.error(`[FirebaseSink] Falha ao salvar evento S2S (${canonicalEvent.tx_id}):`, error.message);
-    // Propaga o erro para o Router/Handler poder logar, mas não travar
+    console.error(`[FirebaseSink] Falha ao salvar analytics (${canonicalEvent.tx_id}):`, error.message);
+    // Apenas a falha da própria gravação de analytics rejeita saveS2SEvent.
     throw error;
   }
+
+  // Eventos não elegíveis terminam aqui. Analytics já está persistido.
+  if (!adsEligible) {
+    return {
+      ok: true,
+      docId,
+      adsEligible: false,
+      adsSeeded: false,
+      adsReason: 'not_eligible',
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // ETAPA 2 — ADS SEED (transação isolada, best-effort)
+  //
+  // A transação protege somente o snapshot create-once e o estado pending.
+  // Falhas nesta etapa nunca apagam nem tornam inválida a captura de analytics.
+  // ---------------------------------------------------------------------------
+  let adsSeeded = false;
+  let adsSeedExists = false;
+  let adsSeedError = null;
+
+  try {
+    const seedResult = await db.runTransaction(async (t) => {
+      const snap = await t.get(docRef);
+
+      if (!snap.exists) {
+        // Muito improvável após a etapa 1; tratamos como falha recuperável do Ads.
+        throw new Error('analytics_doc_missing_before_ads_seed');
+      }
+
+      const data = snap.data() || {};
+
+      // Create-once: qualquer estado Ads já presente significa que outro worker ou
+      // entrega já semeou/reclamou este documento. Não substituir o snapshot.
+      if (data.ads_upload_status) {
+        return { seeded: false, exists: true, status: data.ads_upload_status };
+      }
+
+      t.set(docRef, {
+        ads_upload_status: ADS_STATUS_PENDING,
+        ads_wake_at: Timestamp.now(),
+        ads_envelope_src: _pickEnvelopeSrc(canonicalEvent),
+        ads_state_updated_at: FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      return { seeded: true, exists: true, status: ADS_STATUS_PENDING };
+    });
+
+    adsSeeded = !!seedResult?.seeded;
+    adsSeedExists = !!seedResult?.exists;
+  } catch (error) {
+    adsSeedError = String(error?.message || error);
+    console.error(
+      `[FirebaseSink] ALARME: analytics salvo, mas falhou a semente Ads (${docId}):`,
+      adsSeedError
+    );
+  }
+
+  // Só aciona inline quando há uma semente reclamável. Se a semente falhou, uma
+  // reentrega futura pode tentar novamente sem comprometer o evento de analytics.
+  if (
+    adsSeedExists &&
+    process.env.PZ_ADSSINK_ENABLED === 'true'
+  ) {
+    setImmediate(() => {
+      AdsSink.sendConversion(canonicalEvent)
+        .then((result) => {
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(
+              `[FirebaseSink] AdsSink acionado ${docId}: ${result?.reason || 'sem_resultado'}`
+            );
+          }
+        })
+        .catch((error) => {
+          // sendConversion é never-throw, mas esta guarda evita unhandled rejection.
+          console.error(
+            `[FirebaseSink] Falha ao acionar AdsSink (${docId}):`,
+            error?.message || error
+          );
+        });
+    });
+  }
+
+  return {
+    ok: true,
+    docId,
+    adsEligible: true,
+    adsSeeded,
+    adsSeedExists,
+    adsSeedError,
+  };
 }
 
 module.exports = {
-  saveS2SEvent
+  saveS2SEvent,
+  _resolveAdsEligible,
 };
