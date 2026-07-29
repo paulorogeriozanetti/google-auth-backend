@@ -1,7 +1,7 @@
 /**
  * PZ Advisors — AdsSink
- * Versão: v3.0.1
- * Data: 2026-07-29
+ * Versão: v3.0.0
+ * Data: 2026-07-27
  *
  * MIGRAÇÃO v2.3.0 -> v3.0.0 — Google Ads UploadClickConversions (BLOQUEADO a novas
  * integrações desde 15/jun/2026) -> **Data Manager API** (events:ingest +
@@ -20,24 +20,6 @@
  *  3. DEADLINE também em falhas de transporte no poll: timeout/5xx durante o
  *     retrieve incrementa ads_poll_attempts e respeita ads_poll_deadline (24h).
  *
- * Alterações v3.0.1 (Fase 2 — Purchase→AdsSink, correção estrutural ARCHITECT,
- * 2026-07-28): _ensureEnvelope() passa a construir o envelope a partir de
- * data.ads_envelope_src (snapshot congelado gravado pelo FirebaseSink v1.5.0 no
- * momento do seed) quando existir, com fallback para o documento completo (data)
- * quando não existir — preserva byte-a-byte o comportamento anterior para o caminho
- * micro (ads_micro_outbox, seed próprio do server.js) e para documentos legados sem
- * snapshot. Motivo: sem este snapshot, um refund/chargeback com o mesmo tx_id da
- * compra (mesmo docId) alterava os campos de topo do documento (event_type, gclid,
- * comissão) depois do seed mas antes do 1º claim, contaminando o envelope da compra.
- * Nenhuma outra função deste ficheiro foi alterada.
- *
- * Alterações v3.0.2 (hotfix de integração):
- * - sendConversion deixa de rejeitar pelo gclid do canonical transitório. O Firestore
- *   é a SSoT do envelope; após localizar o doc por platform+tx_id, _ensureEnvelope
- *   valida o gclid persistido em ads_envelope_src/data.
- * - Isto permite que FirebaseSink v1.5.1 acione o sink depois do commit mesmo quando
- *   um handler antigo fornece um canonical parcial, sem enfraquecer o fail-closed.
- *
  * Env: ver secção no fundo do plano. NÃO usa developer token nem google-ads-api.
  */
 
@@ -51,7 +33,7 @@ const { getFirestore, Timestamp, FieldValue } = require('firebase-admin/firestor
 const ConvMapLoaderCsv = require('./ConvMapLoaderCsv');
 const ConsentResolver = require('./ConsentResolver');
 
-const VERSION = '3.0.2';
+const VERSION = '3.0.0';
 const LOG = `[AdsSink v${VERSION}]`;
 const COLLECTION_NAME = process.env.FIRESTORE_TRANSACTIONS_COLLECTION || 'affiliate_transactions';
 const PAYLOAD_VERSION = 'dm-v1';
@@ -341,25 +323,21 @@ async function _markGuarded(docRef, leaseToken, patch) {
 // ------------------------------------------------------- Fases (submit/poll)
 async function _ensureEnvelope(docRef, data, leaseToken) {
   if (data.ads_envelope && data.ads_envelope.payload_version) return data.ads_envelope;
-  // Correcção de revisão (v3.0.0): o 1º envelope é construído EXCLUSIVAMENTE a partir
-  // do documento persistido (o seed create-only), NUNCA do canonical em memória.
-  // v3.0.1: quando o seed gravou ads_envelope_src (FirebaseSink v1.5.0), é ESSE
-  // snapshot congelado que alimenta o envelope — os campos de topo do documento podem
-  // entretanto ter avançado no ciclo de vida (refund/chargeback com o mesmo tx_id) sem
-  // afectar o envelope decidido no seed. Fallback para o documento completo preserva
-  // compatibilidade com docs sem snapshot (ads_micro_outbox seeded pelo server.js,
-  // docs legados).
-  const base = (data.ads_envelope_src && typeof data.ads_envelope_src === 'object') ? data.ads_envelope_src : data;
-  const eventName = base.event_type || base.event_name || 'purchase';
+  // Correcção de revisão: o 1º envelope é construído EXCLUSIVAMENTE a partir do
+  // documento persistido (o seed create-only), NUNCA do canonical em memória. Assim,
+  // uma 2ª chamada com o mesmo event_id (e possivelmente gclid/page_type/event_time_iso
+  // diferentes) não pode alterar o envelope do 1º seed antes de ads_envelope existir.
+  // Efeito colateral: inline e reprocessador constroem envelopes idênticos (ambos do doc).
+  const eventName = data.event_type || data.event_name || 'purchase';
   const map = ConvMapLoaderCsv.getInstance();
   if (!map.isValid()) { const e = new Error('mapa_invalido_no_envelope'); e.errorClass = EC_CONFIG; throw e; }
   const src = {
-    gclid: base.gclid, event_time_iso: base.event_time_iso, order_id: base.order_id, tx_id: base.tx_id,
-    platform: base.platform, commission_amount: base.commission_amount, commission_currency: base.commission_currency,
+    gclid: data.gclid, event_time_iso: data.event_time_iso, order_id: data.order_id, tx_id: data.tx_id,
+    platform: data.platform, commission_amount: data.commission_amount, commission_currency: data.commission_currency,
   };
-  const mapRow = map.resolve({ platform: src.platform, event_name: eventName, product_id: base.product_id, page_type: base.page_type });
+  const mapRow = map.resolve({ platform: src.platform, event_name: eventName, product_id: data.product_id, page_type: data.page_type });
   if (!mapRow) { const e = new Error('sem_linha_no_mapa_no_envelope'); e.errorClass = EC_CONFIG; throw e; }
-  const consent = ConsentResolver.resolve({ tx: base, mapRow });
+  const consent = ConsentResolver.resolve({ tx: data, mapRow });
   const env = _buildEnvelope(src, mapRow, consent);
   env.event_name = eventName; env.map_kind = mapRow.map_kind;
   await _markGuarded(docRef, leaseToken, { ads_envelope: env }); // write-once, guarded
@@ -543,6 +521,7 @@ async function sendConversion(canonical, opts = {}) {
   try {
     if (process.env.PZ_ADSSINK_ENABLED !== 'true') return { sent: false, reason: 'disabled_by_flag' };
     if (!canonical || !canonical.platform || !canonical.tx_id) return { sent: false, reason: 'evento_invalido' };
+    if (!String(canonical.gclid || '').trim()) return { sent: false, reason: 'sem_gclid' };
     const map = ConvMapLoaderCsv.getInstance();
     if (!map.isValid()) { console.error(`${LOG} pz_conversion_map inválido — no-op. ${map.getErrors().slice(0, 3).join(' | ')}`); return { sent: false, reason: 'mapa_invalido' }; }
 
