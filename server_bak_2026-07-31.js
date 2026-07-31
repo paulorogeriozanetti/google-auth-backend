@@ -35,7 +35,7 @@ const PostbackRouter = require('./PostbackRouter');
 const AdsSink = require('./AdsSink');
 
 // 2) Constantes e Configuração do Servidor
-const SERVER_VERSION = '6.2.4'; // [v6.2.4] era 6.2.3. B+C identidade analytics: remove delete p.event_id (DailyFactsService v1.0.0 passa a hoistar o event_id real do browser) + seed do ads_micro_outbox grava event_id/anon_id/user_id/cid (inertes p/ envelope). Aprovado Architect 2026-07-31. [v6.2.3] era 6.2.2. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
+const SERVER_VERSION = '6.2.3'; // [v6.2.3] era 6.2.2. 6.2.1 = 6.2.0 + seed create-only (correcao de revisao). Reportado em /api/version
 const SERVER_DEPLOY_DATE = '2026-07-28'; // [v6.2.x] era 2026-07-26
 const PORT = process.env.PORT || 8080;
 const TRACE_ID_HEADER = 'x-request-trace-id';
@@ -454,6 +454,7 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
                 delete p.ts; delete p.tz_offset; delete p.page; delete p.session_id; 
                 delete p.user_id; delete p.anon_id; delete p.context;
                 delete p.auth; 
+                delete p.event_id; 
                 return toPlainJSON(p); 
             })(),
             tsISO: payload?.ts || new Date().toISOString()
@@ -500,11 +501,6 @@ app.post('/api/track', express.json({ limit: '256kb' }), async (req, res) => {
                                     event_name: eventName, event_type: eventName,
                                     event_time_iso: _ts || new Date().toISOString(),
                                     raw_event_key: _rawKey, source: 'micro_pageview', seed_at: new Date(),
-                                    // [v6.2.4] chaves de analise — INERTES para o envelope (lista fixa no _ensureEnvelope do AdsSink)
-                                    event_id: payload?.event_id || null,
-                                    anon_id: payload?.anon_id || null,
-                                    user_id: payload?.user_id || null,
-                                    cid: payload?.cid || null,
                                     ads_upload_status: 'pending', ads_wake_at: Timestamp.now(),
                                 });
                             } catch (_ce) {
